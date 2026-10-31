@@ -7,7 +7,8 @@ Do not treat a documentation-only plan or synthetic fixture as a deployed integr
 - [x] Select product name **Foundry** and narrow repository ownership.
 - [x] Prepare a single safe Compose **candidate** with an existing SR service; no invented MI/Kernel/Console daemons.
 - [x] Document current functionality, external dependencies and trust boundaries.
-- [ ] Create `Creatidy/foundry` on canonical Forgejo, then publish reviewed integration changes.
+- [x] Create `Creatidy/foundry` on canonical Forgejo and publish the bootstrap.
+- [ ] Publish reviewed integration changes.
 - [ ] Verify rendered Compose using Docker from an inspected exact SR image and a publicly trusted certificate.
 - [ ] Verify first-run admin onboarding, denied unauthorized calls, native Windows/WSL access, and actual authenticated execution with an authorized resource.
 - [ ] Resolve zero-touch TLS / standard Docker Desktop UX, without changing global Docker settings behind the owner's back. The M0 Compose is not yet an installer.

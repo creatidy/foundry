@@ -1,0 +1,10 @@
+.env
+.env.*
+!.env.example
+.tls/
+certs/
+secrets/
+*.key
+*.pem
+__pycache__/
+.pytest_cache/

@@ -28,7 +28,9 @@ The provisional [`compose.yaml`](compose.yaml) requires **an existing SR image a
 2. Provide an existing certificate chain and private key readable by SR's non-root container identity. Set `FOUNDRY_TLS_DIR` to the absolute directory containing `server.crt` and `server.key`. Do not add secrets to Git.
 3. Set `FOUNDRY_ROUTER_HOST` to the certificate's validated DNS hostname. Inside the container this name is mapped to loopback solely for its HTTPS health probe. External clients still need valid DNS and trust.
 4. The M0 verified TLS health probe uses platform trust roots. Do not assume arbitrary clients trust a private CA; that bootstrap is future work.
-5. Run `make config` to verify the rendered Compose definition. `make up` is an **explicit deployment action** and requires Docker; do not run it against existing production environments without operator approval.
+5. Run `make config` to verify the Compose definition. Use `make up` as the supported startup path: it checks Compose's interpolated TLS bind source is an existing absolute directory with readable `server.crt` and `server.key` before invoking Compose. Direct `docker compose up` bypasses this guard. `make up` is an **explicit deployment action** and requires Docker; do not run it against existing production environments without operator approval.
+
+The preflight checks host-side file presence and readability only. It does not validate certificate trust or hostname, container read access, or authenticated SR startup. The source can also change between the check and Docker mounting it; protect the directory from concurrent modification.
 
 The host port is bound to loopback, but this does not by itself prove the Docker/container port cannot be reached through another network. TLS plus authentication remain mandatory for the composed listener.
 

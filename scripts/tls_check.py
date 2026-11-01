@@ -20,13 +20,18 @@ def router_identity(config):
     command = router["command"]
     if not isinstance(command, list) or not all(isinstance(arg, str) for arg in command):
         raise ValueError("invalid command")
+    # SR's argparse accepts abbreviated long options and split values.  Only
+    # accept the complete, equals-form options in Foundry's known command;
+    # otherwise an alias or a consumed value can change SR's effective args.
+    allowed = {"--host", "--port", "--data-dir", "--tls-reload-hostname",
+               "--tls-certfile", "--tls-keyfile"}
     values = {}
-    for name in ("--tls-reload-hostname", "--tls-certfile", "--tls-keyfile"):
-        matches = [arg for arg in command if arg == name or arg.startswith(name + "=")]
-        if len(matches) != 1 or not matches[0].startswith(name + "="):
+    for arg in command:
+        name, separator, value = arg.partition("=")
+        if not separator or name not in allowed or name in values or not value:
             raise ValueError("ambiguous TLS argument")
-        values[name] = matches[0][len(name) + 1:]
-    if (not values["--tls-reload-hostname"] or
+        values[name] = value
+    if (values.keys() != allowed or
             values["--tls-certfile"] != "/run/foundry/tls/server.crt" or
             values["--tls-keyfile"] != "/run/foundry/tls/server.key"):
         raise ValueError("invalid TLS identity")

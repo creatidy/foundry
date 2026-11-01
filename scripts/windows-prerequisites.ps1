@@ -1,8 +1,9 @@
 # Read-only prerequisites diagnostic, not an installer or startup command.
+param([switch]$CheckEngine)
 $ErrorActionPreference = 'Stop'
 
 function Invoke-BoundedProbe {
-    param([string]$Program, [string]$Arguments)
+    param([string]$Program, [string]$Arguments, [int]$TimeoutMilliseconds = 10000)
     $process = $null
     try {
         $info = New-Object System.Diagnostics.ProcessStartInfo
@@ -18,8 +19,11 @@ function Invoke-BoundedProbe {
         # Drain both streams concurrently without displaying potentially sensitive diagnostics.
         $stdout = $process.StandardOutput.ReadToEndAsync()
         $stderr = $process.StandardError.ReadToEndAsync()
-        if (-not $process.WaitForExit(10000)) {
-            try { $process.Kill() } catch { }
+        if (-not $process.WaitForExit($TimeoutMilliseconds)) {
+            try {
+                $process.Kill()
+                [void]$process.WaitForExit(2000)
+            } catch { }
             return $false
         }
         return ($process.ExitCode -eq 0)
@@ -42,7 +46,7 @@ function Start-PrerequisiteCheck {
     if (Invoke-BoundedProbe $wsl '--status') {
         Write-Host 'WSL status command succeeded. This does not verify a working WSL 2 distribution.'
     } else {
-        Write-Host 'WSL status unavailable or timed out. Check Windows WSL installation and status manually.'
+        Write-Host 'WSL status unavailable or timed out. Check WSL installation and status; retry after first-run initialization completes.'
         $failed = $true
     }
     if (Invoke-BoundedProbe $wsl '--version') {
@@ -51,16 +55,23 @@ function Start-PrerequisiteCheck {
         Write-Host 'WSL version unavailable or timed out. Check the installed WSL version manually; older WSL may not support --version.'
         $failed = $true
     }
-    if (Invoke-BoundedProbe 'docker.exe' 'version --format {{.Server.Os}}') {
-        Write-Host 'Docker engine responded to the configured Docker CLI context. Engine OS and Docker Desktop identity were not verified.'
+    if ($CheckEngine) {
+        Write-Host 'Checking the configured Docker engine: its selected context may be remote. The request can contact that endpoint; no endpoint is displayed.'
+        if (Invoke-BoundedProbe 'docker.exe' 'version --format {{.Server.Os}}') {
+            Write-Host 'Configured Docker engine responded. Its identity, location and operating system were not verified.'
+        } else {
+            Write-Host 'Docker engine unavailable or timed out. Check docker.exe, the selected context and engine access; retry after initialization completes.'
+            $failed = $true
+        }
     } else {
-        Write-Host 'Docker engine unavailable or timed out. Check Docker Desktop, the selected Docker context, and engine access manually.'
+        Write-Host 'Docker engine probe skipped. Review the selected context before explicitly using -CheckEngine; it may be remote.'
         $failed = $true
     }
+    Write-Host 'Checking the local Docker Compose CLI only; a trusted Docker executable and plugin are required.'
     if (Invoke-BoundedProbe 'docker.exe' 'compose version') {
         Write-Host 'Docker Compose version command succeeded.'
     } else {
-        Write-Host 'Docker Compose unavailable or timed out. Check Docker Desktop and its Compose installation manually.'
+        Write-Host 'Docker Compose unavailable or timed out. Check that docker.exe is on PATH and Compose is installed; retry after initialization completes.'
         $failed = $true
     }
     Write-Host 'No certificate trust, image provenance, Linux integration, admin onboarding, or product functionality was verified. See README for the advanced workflow.'

@@ -6,7 +6,7 @@
 
 Foundry is the public **deployment and integration product**. It does not own routing, public model facts, task orchestration, or operator decisions. Each source product must keep a usable standalone installation and its own contracts, state, release process, and authority.
 
-**Status: M0 bootstrap — NOT a completed or production-ready integrated installation.** The current Compose file describes only the existing Scarcity Router server, with explicit pre-provisioned TLS and an explicitly supplied image. This repository does **not** yet implement certificate issuance/renewal, a MI update job, a Kernel runner, or a connected Console. No integrated end-to-end operation has been established.
+**Status: M0 bootstrap — NOT a completed or production-ready integrated installation.** The current Compose file describes only the existing Scarcity Router server, with explicit pre-provisioned TLS and an explicitly supplied image. Apart from the separate local test leaf generator below, this repository does **not** implement certificate issuance or renewal, a MI update job, a Kernel runner, or a connected Console. No integrated end-to-end operation has been established.
 
 ## Repositories and ownership
 
@@ -33,6 +33,16 @@ The provisional [`compose.yaml`](compose.yaml) requires **an existing SR image a
 The preflight checks host-side file presence and readability only. It does not validate certificate trust or hostname, container read access, or authenticated SR startup. The source can also change between the check and Docker mounting it; protect the directory from concurrent modification.
 
 The host port is bound to loopback, but this does not by itself prove the Docker/container port cannot be reached through another network. TLS plus authentication remain mandatory for the composed listener.
+
+## Local test leaf
+
+On Linux, an operator can explicitly run `make local-tls-init TLS_DEST=/absolute/private-parent/new-directory`. The existing parent must be operator-owned with mode `0700`; the destination must not exist. Directory ancestry is checked, symlinks and unsupported filesystem ACLs are rejected. The command requires Python 3, OpenSSL and `/proc/self/fd`, and creates `server.crt` and `server.key` with mode `0640` in a new mode `0750` directory, owned by the operator's primary group. The private parent prevents traversal by other host users. It prints the certificate's SHA-256 fingerprint. Verify that fingerprint through a trusted channel; **do not trust an unverified certificate**. The local filesystem and operator are assumed trusted, not an unauthenticated network.
+
+This is a 30-day self-signed leaf for the numeric IP `127.0.0.1`, not a CA. Direct leaf trust is only for explicitly configured test clients; browser support is not claimed. Generation does not install trust, configure Compose, start a server, or renew certificates.
+
+For an explicit Linux test runtime, configure `.env` as above, but set `FOUNDRY_ROUTER_HOST=127.0.0.1` and `FOUNDRY_TLS_DIR` to the generated directory. Then run `make local-tls-up TLS_DEST=/absolute/private-parent/new-directory`. This validates the protected directory and leaf and invokes the canonical Compose file with a temporary override: SR receives the operator's numeric primary GID and the leaf as `--tls-reload-ca-cert`; only its healthcheck receives `SR_HEALTHCHECK_CA`. The image must support both settings. No system trust store is changed, and other clients need their own explicit leaf trust. Use `make down` to stop the same Compose project. This command does not authorize a first admin, perform authenticated onboarding, or satisfy other M0 integration gates. The normal `make up` public-CA path is unchanged.
+
+The SR container can read the key through the read-only mount; processes with the operator's group *inside that container* can also read it. Host root, Docker administrators, and other privileged actors are outside this isolation boundary. The check and Docker mount are not atomic, so protect the files from concurrent modification. Docker user-namespace remapping or a remote daemon may prevent access and are not validated. No automatic renewal or Windows/browser support is provided.
 
 The main HTTP listener serves the admin/control and inference surfaces together. Plain HTTP to a non-loopback container listener is not enabled. Authenticated onboarding and real inference must be validated separately. There is no automatic certificate bootstrap or background renewal in M0.
 

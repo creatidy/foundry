@@ -1,0 +1,20 @@
+# Opt-in image: the inspected SR source and its own exact MI extra.
+FROM python:3.12-slim AS build
+RUN apt-get update && apt-get install -y --no-install-recommends git ca-certificates && rm -rf /var/lib/apt/lists/*
+RUN git clone https://forgejo.creatidy.com/Creatidy/scarcity-router.git /src && \
+    git -C /src checkout --detach f96d58e6d7d0fffdbe70476850d824efa5de2fb5 && \
+    test "$(git -C /src rev-parse HEAD)" = f96d58e6d7d0fffdbe70476850d824efa5de2fb5
+RUN python -m venv /opt/sr && /opt/sr/bin/pip install '/src[mi]' && \
+    /opt/sr/bin/python -c "import json, importlib.metadata as m; d=json.loads(m.distribution('model-intelligence').read_text('direct_url.json')); assert d['url']=='https://forgejo.creatidy.com/Creatidy/model-intelligence.git' and d['vcs_info']['commit_id']=='d65891668b7e79f7b666c021f02a1b4bf8c4ca9c'"
+
+FROM python:3.12-slim
+RUN groupadd --gid 10001 scarcity && useradd --uid 10001 --gid scarcity --create-home --home-dir /var/lib/scarcity-router --shell /usr/sbin/nologin scarcity && mkdir -p /data && chown scarcity:scarcity /data /var/lib/scarcity-router
+COPY --from=build /opt/sr /opt/sr
+ENV PATH="/opt/sr/bin:$PATH" PYTHONUNBUFFERED=1
+USER scarcity
+WORKDIR /var/lib/scarcity-router
+VOLUME ["/data"]
+EXPOSE 8787
+ENTRYPOINT ["python", "-m", "scarcity_router.control_server"]
+CMD ["--host", "127.0.0.1", "--port", "8787", "--data-dir", "/data"]
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 CMD ["python", "-c", "import os, ssl, urllib.request; url = os.environ.get('SR_HEALTHCHECK_URL', 'http://127.0.0.1:8787/healthz'); ca = os.environ.get('SR_HEALTHCHECK_CA'); context = ssl.create_default_context(cafile=ca) if ca else None; response = urllib.request.urlopen(url, timeout=4, context=context); raise SystemExit(0 if response.status == 200 else 1)"]

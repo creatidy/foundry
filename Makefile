@@ -3,7 +3,7 @@ COMPOSE := docker compose --env-file .env -f compose.yaml
 
 .PHONY: config preflight up down ps logs local-tls-init local-tls-up
 
-export TLS_DEST
+export TLS_DEST LOCAL_TLS_PROJECT LOCAL_TLS_ADOPT_PROJECT
 
 local-tls-init:
 	@python3 scripts/local_tls_init.py

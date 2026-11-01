@@ -77,6 +77,24 @@ class LocalTLSTests(unittest.TestCase):
         self.assertFalse(self.dest.exists())
         self.assertNotIn("PRIVATE KEY", result.stdout + result.stderr)
 
+    def test_fifo_files_are_rejected_without_blocking(self):
+        for name in ("server.crt", "server.key"):
+            with self.subTest(name=name):
+                result = self.run_init()
+                self.assertEqual(result.returncode, 0, result.stderr)
+                path = self.dest / name
+                path.unlink()
+                os.mkfifo(path, 0o640)
+                env = os.environ.copy()
+                env.update(TLS_DEST=str(self.dest), LOCAL_TLS_PROJECT="fifo-regression")
+                result = subprocess.run(["python3", str(ROOT / "scripts/local_tls_up.py")],
+                                        env=env, capture_output=True, text=True, timeout=3)
+                self.assertNotEqual(result.returncode, 0)
+                path.unlink()
+                for remaining in self.dest.iterdir():
+                    remaining.unlink()
+                self.dest.rmdir()
+
 
 if __name__ == "__main__":
     unittest.main()

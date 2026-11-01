@@ -31,6 +31,7 @@ class LocalTLSRuntimeTests(unittest.TestCase):
                         FOUNDRY_ROUTER_HOST="127.0.0.1", FOUNDRY_ROUTER_PORT="0",
                         FOUNDRY_TLS_DIR=str(self.dest), TLS_DEST=str(self.dest),
                         COMPOSE_PROJECT_NAME="foundry-runtime-" + uuid.uuid4().hex[:12])
+        self.env["LOCAL_TLS_PROJECT"] = self.env["COMPOSE_PROJECT_NAME"]
         self.addCleanup(self.cleanup_compose)
         result = self.run_cmd("make", "local-tls-init")
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -86,6 +87,50 @@ class LocalTLSRuntimeTests(unittest.TestCase):
                                   "-verify_return_error", *options, input="")
             self.assertEqual(client.returncode == 0, expected == 0, client.stderr)
         self.assertNotIn((self.dest / "server.key").read_text(), result.stdout + result.stderr)
+        self.assertNotEqual(self.run_cmd("make", "local-tls-up").returncode, 0)
+        adopt = self.env.copy()
+        adopt["LOCAL_TLS_ADOPT_PROJECT"] = self.env["LOCAL_TLS_PROJECT"]
+        self.assertEqual(self.run_cmd("make", "local-tls-up", env=adopt).returncode, 0)
+
+    def test_existing_resources_are_not_adopted(self):
+        project = self.env["LOCAL_TLS_PROJECT"]
+        image = os.environ["FOUNDRY_TEST_SR_IMAGE"]
+        fixtures = [
+            ("container", ["create", "--name", project + "-orphan", "--label", "com.docker.compose.project=" + project, image], project + "-orphan"),
+            ("network", ["create", "--label", "com.docker.compose.project=" + project, project + "-orphan"], project + "-orphan"),
+            ("volume", ["create", "--label", "com.docker.compose.project=" + project, project + "-orphan"], project + "-orphan"),
+            ("network", ["create", project + "_backend"], project + "_backend"),
+            ("volume", ["create", project + "_router-data"], project + "_router-data"),
+        ]
+        for kind, create, name in fixtures:
+            with self.subTest(kind=kind, name=name):
+                self.assertNotEqual(self.run_cmd("docker", kind, "inspect", name).returncode, 0)
+                created = self.run_cmd("docker", kind, *create)
+                self.assertEqual(created.returncode, 0, created.stderr)
+                try:
+                    before = self.run_cmd("docker", kind, "inspect", name)
+                    result = self.run_cmd("make", "local-tls-up")
+                    self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                    after = self.run_cmd("docker", kind, "inspect", name)
+                    self.assertEqual(before.returncode, 0, before.stderr)
+                    self.assertEqual(after.returncode, 0, after.stderr)
+                    self.assertEqual(json.loads(before.stdout), json.loads(after.stdout))
+                    self.assertEqual(self.run_cmd("docker", "ps", "-aq", "--filter", "label=com.docker.compose.project=" + project,
+                                                  "--filter", "label=com.docker.compose.service=router").stdout.strip(), "")
+                finally:
+                    removed = self.run_cmd("docker", kind, "rm", name)
+                    self.assertEqual(removed.returncode, 0, removed.stderr)
+
+    def test_project_required_and_daemon_failure(self):
+        missing = self.env.copy()
+        missing.pop("LOCAL_TLS_PROJECT")
+        self.assertNotEqual(self.run_cmd("make", "local-tls-up", env=missing).returncode, 0)
+        mismatch = self.env.copy()
+        mismatch["LOCAL_TLS_ADOPT_PROJECT"] = "another-project"
+        self.assertNotEqual(self.run_cmd("make", "local-tls-up", env=mismatch).returncode, 0)
+        unavailable = self.env.copy()
+        unavailable["DOCKER_HOST"] = "unix:///nonexistent/foundry-test-docker.sock"
+        self.assertNotEqual(self.run_cmd("make", "local-tls-up", env=unavailable).returncode, 0)
 
     def test_public_default_has_no_leaf_override(self):
         result = self.run_cmd("docker", "compose", "--env-file", ".env", "-f", "compose.yaml", "config", "--format", "json")

@@ -3,6 +3,7 @@
 
 import json
 import os
+import re
 import stat
 import subprocess
 import sys
@@ -22,7 +23,7 @@ def validate(destination):
             raise ValueError("invalid TLS directory ownership or mode")
         no_acl(directory)
         for name in ("server.crt", "server.key"):
-            fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=directory)
+            fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory)
             files.append(fd)
             info = os.fstat(fd)
             if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or
@@ -51,14 +52,39 @@ def validate(destination):
         os.close(parent)
 
 
+def check_project(project, config):
+    label = "label=com.docker.compose.project=" + project
+    existing = False
+    for kind, args in (("container", ["container", "ls", "--all"]),
+                       ("network", ["network", "ls"]),
+                       ("volume", ["volume", "ls"])):
+        result = subprocess.run(["docker", *args, "--filter", label, "--quiet"],
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
+        existing |= bool(result.stdout.strip())
+    for kind, section in (("network", "networks"), ("volume", "volumes")):
+        names = {entry["name"] for entry in config.get(section, {}).values()}
+        result = subprocess.run(["docker", kind, "ls", "--format", "{{.Name}}"],
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True, text=True)
+        existing |= bool(names.intersection(result.stdout.splitlines()))
+    return existing
+
+
 def main():
     try:
+        project = os.environ.get("LOCAL_TLS_PROJECT", "")
+        if not re.fullmatch(r"[a-z0-9][a-z0-9_-]*", project):
+            raise ValueError("explicit valid local TLS project is required")
+        adoption = os.environ.get("LOCAL_TLS_ADOPT_PROJECT", "")
+        if adoption and adoption != project:
+            raise ValueError("adoption acknowledgement does not match project")
         destination = os.environ.get("TLS_DEST", "")
         validate(destination)
-        base = ["docker", "compose", "--env-file", ".env", "-f", "compose.yaml"]
+        base = ["docker", "compose", "-p", project, "--env-file", ".env", "-f", "compose.yaml"]
         result = subprocess.run(base + ["config", "--format", "json", "--no-path-resolution"],
                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
         config = json.loads(result.stdout)
+        if config["name"] != project:
+            raise ValueError("unexpected Compose project")
         router = config["services"]["router"]
         mounts = [m for m in router["volumes"] if m.get("target") == "/run/foundry/tls"]
         if (len(mounts) != 1 or mounts[0].get("type") != "bind" or
@@ -80,9 +106,11 @@ def main():
                 json.dump(override, stream)
             # Reject a changed directory immediately before asking Docker to mount it.
             validate(destination)
+            if check_project(project, config) and not adoption:
+                raise ValueError("project resources already exist")
             return subprocess.run(base + ["-f", path, "up", "-d", "--no-build", "--pull", "never"]).returncode
     except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError):
-        print("Local TLS startup refused: check the protected leaf, Compose configuration and Docker.", file=sys.stderr)
+        print("Local TLS startup refused: check the explicit project, existing resources, protected leaf, Compose configuration and Docker.", file=sys.stderr)
         return 1
 
 

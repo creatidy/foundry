@@ -1,7 +1,7 @@
 # Foundry M0: only existing Compose commands; do not hide extra infrastructure.
 COMPOSE := docker compose --env-file .env -f compose.yaml
 
-.PHONY: config preflight up down ps logs local-tls-init local-tls-up
+.PHONY: config preflight tls-check up down ps logs local-tls-init local-tls-up
 
 export TLS_DEST LOCAL_TLS_PROJECT LOCAL_TLS_ADOPT_PROJECT
 
@@ -16,6 +16,9 @@ config:
 
 preflight:
 	python3 scripts/tls_preflight.py
+
+tls-check:
+	@python3 scripts/tls_check.py
 
 up: preflight
 	$(COMPOSE) up -d --no-build --pull never

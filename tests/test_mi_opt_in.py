@@ -57,6 +57,21 @@ class MIOptInTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 self.check()
 
+    def test_hard_linked_publication_rejected(self):
+        self.check()
+        os.link(self.publication, Path(self.temp.name) / "publication-link")
+        with self.assertRaises(ValueError):
+            self.check()
+
+    def test_trust_size_limit(self):
+        body = self.trust.read_bytes()
+        self.trust.write_bytes(body + b" " * (256 * 1024 - len(body)))
+        self.check()
+        with self.trust.open("ab") as stream:
+            stream.write(b" ")
+        with self.assertRaises(ValueError):
+            self.check()
+
     def test_opt_in_override_only_and_default_unchanged(self):
         config = {"name": "test", "services": {"router": {
             "volumes": [{"type": "bind", "source": "/tls", "target": "/run/foundry/tls", "read_only": True}],

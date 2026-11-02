@@ -88,6 +88,40 @@ def verify_bind_source(source, tls, distribution):
             os.close(fd)
 
 
+def verify_container_user(container_id, image_user):
+    if not re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_.-]*(?::[A-Za-z0-9_][A-Za-z0-9_.-]*)?", image_user):
+        raise ValueError("invalid image user")
+    code = ("import grp,json,os,pwd; "
+            "print(json.dumps({'users':[[p.pw_name,p.pw_uid,p.pw_gid] for p in pwd.getpwall()],"
+            "'groups':[[g.gr_name,g.gr_gid] for g in grp.getgrall()],"
+            "'uids':os.getresuid(),'gids':os.getresgid(),'supplementary':os.getgroups(),"
+            "'pid1':open('/proc/1/status',encoding='ascii').read()}))")
+    identity = json.loads(run("docker", "exec", container_id, "python", "-c", code))
+    user, _, group = image_user.partition(":")
+    users = identity["users"]
+    matches = [row for row in users if (str(row[1]) == user if user.isdecimal() else row[0] == user)]
+    if len(matches) != 1:
+        raise ValueError("image user is missing or ambiguous")
+    _, uid, default_gid = matches[0]
+    if type(uid) is not int or uid <= 0 or sum(row[1] == uid for row in users) != 1:
+        raise ValueError("image user is root or ambiguous")
+    groups = identity["groups"]
+    matches = [row for row in groups if (str(row[1]) == group if group.isdecimal() else row[0] == group)] if group else [row for row in groups if row[1] == default_gid]
+    if len(matches) != 1:
+        raise ValueError("image group is missing or ambiguous")
+    gid = matches[0][1]
+    if type(gid) is not int or gid <= 0 or sum(row[1] == gid for row in groups) != 1:
+        raise ValueError("image group is root or ambiguous")
+    status = dict(line.split(":", 1) for line in identity["pid1"].splitlines() if ":" in line)
+    pid_groups = status.get("Groups", "").split()
+    if (identity["uids"] != [uid] * 3 or identity["gids"] != [gid] * 3 or
+            os.getegid() == 0 or 0 in identity["supplementary"] or "0" in pid_groups or
+            os.getegid() not in identity["supplementary"] or str(os.getegid()) not in pid_groups or
+            status.get("Uid", "").split() != [str(uid)] * 4 or
+            status.get("Gid", "").split() != [str(gid)] * 4):
+        raise ValueError("running container user identity mismatch")
+
+
 def verify_project(project, image, tls, config, image_config, fingerprint, distribution):
     label = "label=com.docker.compose.project=" + project
     ids = run("docker", "container", "ls", "--all", "--filter", label, "--quiet").splitlines()
@@ -120,7 +154,6 @@ def verify_project(project, image, tls, config, image_config, fingerprint, distr
             labels.get("com.docker.compose.container-number") != "1" or
             c["Config"]["Cmd"] != expected_command or len(mounts) != 2 or
             c["Config"].get("Entrypoint") != image_config.get("Entrypoint") or
-            not re.fullmatch(r"[1-9][0-9]*(?::[0-9]+)?", image_user) or
             c["Config"].get("User") != image_user or
             len(actual_env) != len(expected_env) or
             dict(value.split("=", 1) for value in actual_env) != expected_env or
@@ -154,6 +187,7 @@ def verify_project(project, image, tls, config, image_config, fingerprint, distr
             network[0].get("Labels", {}).get("com.docker.compose.network") != "backend" or
             set(network[0].get("Containers", {})) != {c["Id"]}):
         raise ValueError("network identity or membership mismatch")
+    verify_container_user(ids[0], image_user)
     attest_container_certificate(ids[0], fingerprint)
     return ids[0]
 

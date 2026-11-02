@@ -162,6 +162,40 @@ class FirstRunTests(unittest.TestCase):
         self.assertEqual(run.call_args.args[:4], ("docker", "exec", "c" * 64, "python"))
         self.assertNotIn("server.key", run.call_args.args[-1])
 
+    def test_named_user_requires_unambiguous_nonroot_runtime_identity(self):
+        identity = {"users": [["scarcity", 10001, 10001]], "groups": [["scarcity", 10001]],
+                    "uids": [10001] * 3, "gids": [10001] * 3, "supplementary": [10001, first_run.os.getegid()],
+                    "pid1": "Name:\tpython\nUid:\t10001\t10001\t10001\t10001\nGid:\t10001\t10001\t10001\t10001\nGroups:\t" + str(first_run.os.getegid()) + " 10001\n"}
+        with patch.object(first_run, "run", return_value=json.dumps(identity)):
+            first_run.verify_container_user("a" * 64, "scarcity")
+            first_run.verify_container_user("a" * 64, "scarcity:scarcity")
+        for case in ("root-name", "duplicate-name", "duplicate-uid", "root-group", "duplicate-gid",
+                     "exec-root", "pid1-root", "supplementary-root"):
+            with self.subTest(case=case):
+                changed = json.loads(json.dumps(identity))
+                if case == "root-name":
+                    changed["users"][0][1] = 0
+                elif case == "duplicate-name":
+                    changed["users"].append(["scarcity", 10002, 10001])
+                elif case == "duplicate-uid":
+                    changed["users"].append(["other", 10001, 10001])
+                elif case == "root-group":
+                    changed["users"][0][2] = 0
+                    changed["groups"] = [["root", 0]]
+                elif case == "duplicate-gid":
+                    changed["groups"].append(["other", 10001])
+                elif case == "exec-root":
+                    changed["uids"] = [0, 0, 0]
+                elif case == "pid1-root":
+                    changed["pid1"] = "Uid:\t0\t0\t0\t0\nGid:\t10001\t10001\t10001\t10001\n"
+                else:
+                    changed["supplementary"].append(0)
+                with patch.object(first_run, "run", return_value=json.dumps(changed)):
+                    with self.assertRaises(ValueError):
+                        first_run.verify_container_user("a" * 64, "scarcity")
+        with self.assertRaises(ValueError):
+            first_run.verify_container_user("a" * 64, "scarcity;id")
+
     def test_wrong_live_tls_leaf_is_refused_before_http(self):
         conn = Mock()
         conn.sock.getpeercert.return_value = b"wrong certificate"
@@ -237,13 +271,13 @@ class FirstRunTests(unittest.TestCase):
         config = {"name": project, "services": {"router": {"image": image, "command": ["--data-dir=/data"]}},
                   "volumes": {"router-data": {"name": project + "_router-data"}},
                   "networks": {"backend": {"name": network_name}}}
-        image_config = {"Env": [], "Entrypoint": None, "User": "10001:10001"}
+        image_config = {"Env": [], "Entrypoint": None, "User": "scarcity"}
         container = {"State": {"Running": True}, "Image": image,
                      "Id": cid,
                      "Config": {"Labels": {"com.docker.compose.project": project,
                                             "com.docker.compose.service": "router",
                                             "com.docker.compose.container-number": "1"},
-                                "Entrypoint": None, "User": "10001:10001",
+                                "Entrypoint": None, "User": "scarcity",
                                 "Env": ["SR_HEALTHCHECK_URL=https://127.0.0.1:8787/healthz",
                                         "SR_HEALTHCHECK_CA=/run/foundry/tls/server.crt"],
                                 "Cmd": ["--data-dir=/data", "--tls-reload-ca-cert=/run/foundry/tls/server.crt"]},
@@ -263,7 +297,11 @@ class FirstRunTests(unittest.TestCase):
         output = [json.dumps([{"Endpoints": {"docker": {"Host": first_run.SOCKET}}}]),
                   json.dumps({"OSType": "linux", "ID": engine}), json.dumps([{"Id": image, "Config": image_config}]),
                   json.dumps(config), cid, project + "_router-data", "network-id", json.dumps([container]),
-                  json.dumps([volume]), cid, json.dumps([network]), self.args[3]]
+                  json.dumps([volume]), cid, json.dumps([network]),
+                  json.dumps({"users": [["scarcity", 10001, 10001]], "groups": [["scarcity", 10001]],
+                              "uids": [10001] * 3, "gids": [10001] * 3, "supplementary": [10001, first_run.os.getegid()],
+                              "pid1": "Uid:\t10001\t10001\t10001\t10001\nGid:\t10001\t10001\t10001\t10001\nGroups:\t" + str(first_run.os.getegid()) + " 10001\n"}),
+                  self.args[3]]
         output += output[4:]
         with patch.dict(first_run.os.environ, {}, clear=True), \
              patch.object(first_run.platform, "system", return_value="Linux"), \

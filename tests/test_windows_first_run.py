@@ -365,7 +365,9 @@ class FirstRunTests(unittest.TestCase):
                                                               (303, "/admin/onboarding", b"")]), \
              patch.object(first_run.sys.stdin, "isatty", return_value=True), \
              patch.object(first_run.sys.stdout, "isatty", return_value=True), \
-             patch("builtins.input", return_value="YES"), \
+             patch.object(first_run, "foreground_terminal", return_value=True), \
+             patch.object(first_run.os, "ttyname", return_value="/dev/pts/1"), \
+             patch("builtins.input", side_effect=["YES", "I ATTEST"]), \
              patch.object(first_run.subprocess, "run", return_value=Mock(returncode=0)) as process:
             self.assertEqual(first_run.main(self.args), 0)
         self.assertEqual(process.call_count, 2)

@@ -67,6 +67,34 @@ def require_safe_key_custody():
     raise ValueError("Docker Desktop TLS key custody is not established; startup and adoption refused")
 
 
+def foreground_terminal():
+    try:
+        return (all(os.isatty(fd) for fd in (0, 1, 2)) and
+                len({os.ttyname(fd) for fd in (0, 1, 2)}) == 1 and
+                os.tcgetpgrp(0) == os.getpgrp() and
+                sys.stdin.isatty() and sys.stdout.isatty() and sys.stderr.isatty())
+    except OSError:
+        return False
+
+
+def attest_claim_terminal():
+    if not foreground_terminal():
+        return None
+    terminal = os.ttyname(0)
+    print("Operator assertion only: terminal privacy and authorization are not automatically verified.")
+    print("Do not proceed if any status is unknown, recording is mandatory, or you are not authorized.")
+    print("Do not disable or bypass organizational monitoring.")
+    try:
+        answer = input("Attest that this terminal is genuinely private and local; no PowerShell transcription, "
+                       "terminal, screen or enterprise recording, API or remote relay or capture is active; "
+                       "and you are authorized to issue the claim. Type I ATTEST: ")
+    except EOFError:
+        return None
+    if answer != "I ATTEST" or not foreground_terminal() or os.ttyname(0) != terminal:
+        return None
+    return terminal
+
+
 def verify_container_user(container_id, image_user):
     if not re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_.-]*(?::[A-Za-z0-9_][A-Za-z0-9_.-]*)?", image_user):
         raise ValueError("invalid image user")
@@ -281,6 +309,10 @@ def managed_flow(project, image, distribution):
         if not sys.stdin.isatty() or not sys.stdout.isatty() or input("Issue one bootstrap claim to this terminal? Type YES: ") != "YES":
             print("No claim issued; onboarding incomplete.")
             return 1
+        claim_terminal = attest_claim_terminal()
+        if not claim_terminal:
+            print("Terminal attestation not established; no claim issued.")
+            return 1
         if verify_project(project, image, "", config, images[0]["Config"], fingerprint,
                           distribution, managed_volume=volume) != container_id:
             raise ValueError("router identity changed after consent")
@@ -290,6 +322,8 @@ def managed_flow(project, image, distribution):
         status, location, _ = request("/admin", cert, fingerprint)
         if status not in (302, 303, 307, 308) or location != "/admin/onboarding":
             raise ValueError("administrator state changed after consent")
+        if not foreground_terminal() or os.ttyname(0) != claim_terminal:
+            raise ValueError("terminal changed after attestation")
         result = subprocess.run(["docker", "exec", container_id, "python", "-m", "scarcity_router.control_server",
                                  "--data-dir", "/data", "--issue-bootstrap-claim"], timeout=30)
         if result.returncode:
@@ -421,12 +455,18 @@ def main(args):
         if input("Issue one bootstrap claim to this terminal? Type YES: ") != "YES":
             print("No claim issued; onboarding incomplete.")
             return 1
+        claim_terminal = attest_claim_terminal()
+        if not claim_terminal:
+            print("Terminal attestation not established; no claim issued.")
+            return 1
         validate(tls)
         if verify_project(project, image, tls, config, images[0]["Config"], fingerprint, distribution) != container_id:
             raise ValueError("router identity changed after consent")
         status, location, _ = request("/admin", cert, fingerprint)
         if status not in (302, 303, 307, 308) or location != "/admin/onboarding":
             raise ValueError("administrator state changed after consent")
+        if not foreground_terminal() or os.ttyname(0) != claim_terminal:
+            raise ValueError("terminal changed after attestation")
         # Never capture, retry, or place the claim in an argument or environment.
         result = subprocess.run(["docker", "exec", container_id, "python", "-m", "scarcity_router.control_server",
                                  "--data-dir", "/data", "--issue-bootstrap-claim"], timeout=30)

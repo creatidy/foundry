@@ -11,7 +11,7 @@ import subprocess
 import sys
 import unittest
 import uuid
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
@@ -117,6 +117,60 @@ class ManagedIntegrationTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 first_run.managed_flow(self.project, self.image, "Ubuntu")
             verify.assert_not_called()
+
+    def test_attestation_refusal_unknown_recording_eof_and_non_tty(self):
+        for response in ("NO", "UNKNOWN", "RECORDING REQUIRED", "", EOFError()):
+            with self.subTest(response=response), patch.object(first_run, "foreground_terminal", return_value=True), \
+                 patch.object(first_run.os, "ttyname", return_value="/dev/pts/1"), \
+                 patch("builtins.input", side_effect=response if isinstance(response, Exception) else None,
+                       return_value=response):
+                self.assertFalse(first_run.attest_claim_terminal())
+        with patch.object(first_run, "foreground_terminal", return_value=False), \
+             patch("builtins.input") as prompt:
+            self.assertFalse(first_run.attest_claim_terminal())
+            prompt.assert_not_called()
+        with patch.object(first_run, "foreground_terminal", side_effect=[True, False]), \
+             patch.object(first_run.os, "ttyname", return_value="/dev/pts/1"), \
+             patch("builtins.input", return_value="I ATTEST"):
+            self.assertFalse(first_run.attest_claim_terminal())
+        with patch.object(first_run, "foreground_terminal", return_value=True), \
+             patch.object(first_run.os, "ttyname", side_effect=["/dev/pts/1", "/dev/pts/2"]), \
+             patch("builtins.input", return_value="I ATTEST"):
+            self.assertFalse(first_run.attest_claim_terminal())
+
+    def test_managed_attestation_claim_only_once_and_never_captured(self):
+        for attestation, changed_tty in (("NO", False), ("UNKNOWN", False), ("RECORDING REQUIRED", False),
+                                         (EOFError(), False), ("I ATTEST", False), ("I ATTEST", True)):
+            tty = ["/dev/pts/1"] * 5 + ["/dev/pts/2" if changed_tty else "/dev/pts/1"]
+            with self.subTest(attestation=attestation, changed_tty=changed_tty), patch.dict(first_run.os.environ, {}, clear=True), \
+                 patch.object(first_run.os, "chdir"), patch.object(first_run.os, "isatty", return_value=True), \
+                 patch.object(first_run.os, "ttyname", side_effect=tty), \
+                 patch.object(first_run.os, "tcgetpgrp", return_value=12), patch.object(first_run.os, "getpgrp", return_value=12), \
+                 patch.object(first_run.sys.stdin, "isatty", return_value=True), \
+                 patch.object(first_run.sys.stdout, "isatty", return_value=True), \
+                 patch.object(first_run, "foreground_terminal", return_value=True), \
+                 patch.object(first_run, "run", side_effect=self.command), \
+                 patch.object(managed, "discover_tls_volume", return_value=(self.volume, self.nonce)), \
+                 patch.object(managed, "verify_tls_volume", return_value="certificate"), \
+                 patch.object(first_run, "verify_project", return_value=self.cid), \
+                 patch.object(first_run.ssl, "PEM_cert_to_DER_cert", return_value=b"der"), \
+                 patch.object(first_run, "request", side_effect=[(200, None, b'{"status":"ok"}'),
+                     (303, "/admin/onboarding", b""), (303, "/admin/onboarding", b"")]), \
+                 patch("builtins.input", side_effect=["YES", "YES", attestation]), \
+                 patch.object(first_run.subprocess, "run", return_value=Mock(returncode=0)) as process:
+                if changed_tty:
+                    with self.assertRaises(ValueError):
+                        first_run.managed_flow(self.project, self.image, "Ubuntu")
+                    process.assert_not_called()
+                    continue
+                result = first_run.managed_flow(self.project, self.image, "Ubuntu")
+                self.assertEqual(result, 0 if attestation == "I ATTEST" else 1)
+                if attestation == "I ATTEST":
+                    process.assert_called_once()
+                    self.assertEqual(process.call_args.args[0][-1], "--issue-bootstrap-claim")
+                    self.assertEqual(process.call_args.kwargs, {"timeout": 30})
+                else:
+                    process.assert_not_called()
 
     @unittest.skipUnless(shutil.which("docker") and subprocess.run(
         ["docker", "compose", "version"], stdout=subprocess.DEVNULL,

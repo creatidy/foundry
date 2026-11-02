@@ -5,6 +5,7 @@ import contextlib
 import io
 import os
 from pathlib import Path
+import re
 import shutil
 import socket
 import subprocess
@@ -17,6 +18,12 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 import windows_first_run as first_run
 import windows_managed_tls as managed
+
+
+def managed_test_image(value):
+    if not re.fullmatch(r"sha256:[a-f0-9]{64}", value):
+        raise ValueError("FOUNDRY_TEST_MANAGED_TLS_IMAGE must be a full immutable sha256 image ID")
+    return value
 
 
 class ManagedIntegrationTests(unittest.TestCase):
@@ -275,12 +282,19 @@ class ManagedIntegrationTests(unittest.TestCase):
                 managed.discover_tls_volume(self.project, self.image)
         self.assertFalse(any("rm" in call.args[0] for call in run.call_args_list))
 
-    @unittest.skipUnless(os.environ.get("FOUNDRY_TEST_MANAGED_TLS_IMAGE") ==
-                         "sha256:adcba8a8c65ceb23103c6de7629948ef0b54cd80bcabd4d41f9f9db1fa6fee97",
+    def test_managed_test_image_requires_full_immutable_id(self):
+        image = "sha256:" + "a" * 64
+        self.assertEqual(managed_test_image(image), image)
+        for invalid in ("", "latest", "example:latest", "sha256:" + "a" * 63,
+                        "sha256:" + "A" * 64, image + " ", " " + image):
+            with self.subTest(image=invalid), self.assertRaises(ValueError):
+                managed_test_image(invalid)
+
+    @unittest.skipUnless(os.environ.get("FOUNDRY_TEST_MANAGED_TLS_IMAGE"),
                          "requires explicit prepared Docker Desktop test image")
     def test_real_docker_fresh_conflicts_and_stopped_recovery(self):
         # Direct internal API test only: the production entrypoint guard is not changed.
-        image = os.environ["FOUNDRY_TEST_MANAGED_TLS_IMAGE"]
+        image = managed_test_image(os.environ["FOUNDRY_TEST_MANAGED_TLS_IMAGE"])
         project = "foundry-managed-test-" + uuid.uuid4().hex
         name = managed.volume_name(project)
         extra = name + "-conflict"
@@ -288,11 +302,6 @@ class ManagedIntegrationTests(unittest.TestCase):
         label = "label=com.docker.compose.project=" + project
         env = {k: v for k, v in os.environ.items() if not k.startswith(("COMPOSE_", "FOUNDRY_", "DOCKER_"))}
         env["DOCKER_HOST"] = first_run.SOCKET
-        with socket.socket() as port:
-            try:
-                port.bind(("127.0.0.1", 8787))
-            except OSError:
-                self.skipTest("loopback test port is occupied")
         def docker(*args):
             return subprocess.run(["docker", *args], check=True, text=True, stdout=subprocess.PIPE,
                                   stderr=subprocess.DEVNULL, timeout=120).stdout.strip()
@@ -300,6 +309,11 @@ class ManagedIntegrationTests(unittest.TestCase):
             info = json.loads(docker("info", "--format", "{{json .}}"))
             self.assertEqual((info.get("OSType"), info.get("Name")), ("linux", "docker-desktop"))
             self.assertEqual(json.loads(docker("image", "inspect", image))[0]["Id"], image)
+            with socket.socket() as port:
+                try:
+                    port.bind(("127.0.0.1", 8787))
+                except OSError:
+                    self.skipTest("loopback test port is occupied")
             for kind in ("container", "network", "volume"):
                 args = [kind, "ls"] + (["--all"] if kind == "container" else [])
                 self.assertFalse(docker(*args, "--filter", label, "--quiet"))

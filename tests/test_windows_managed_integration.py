@@ -97,6 +97,30 @@ class ManagedIntegrationTests(unittest.TestCase):
         self.assertTrue(any(call.args[:2] == ("docker", "start") for call in docker.call_args_list))
         self.assertFalse(any("rm" in call.args for call in docker.call_args_list))
 
+    def test_foreground_decline_does_not_issue_claim(self):
+        output = io.StringIO()
+        with patch.dict(first_run.os.environ, {}, clear=True), patch.object(first_run.os, "chdir"), \
+             patch.object(first_run.os, "isatty", return_value=True), \
+             patch.object(first_run.os, "ttyname", return_value="/dev/pts/1"), \
+             patch.object(first_run.os, "tcgetpgrp", return_value=12), patch.object(first_run.os, "getpgrp", return_value=12), \
+             patch.object(first_run.sys.stdin, "isatty", return_value=True), \
+             patch.object(output, "isatty", return_value=True), \
+             patch.object(first_run.sys.stderr, "isatty", return_value=True), \
+             patch.object(first_run, "run", side_effect=self.command), \
+             patch.object(managed, "discover_tls_volume", return_value=(self.volume, self.nonce)), \
+             patch.object(managed, "verify_tls_volume", return_value="certificate"), \
+             patch.object(first_run, "verify_project", return_value=self.cid), \
+             patch.object(first_run.ssl, "PEM_cert_to_DER_cert", return_value=b"der"), \
+             patch.object(first_run, "request", side_effect=[(200, None, b'{"status":"ok"}'),
+                 (303, "/admin/onboarding", b"")]), \
+             patch("builtins.input", side_effect=["YES", "NO"]) as prompt, \
+             patch.object(first_run.subprocess, "run", side_effect=AssertionError("claim attempted")) as process, \
+             contextlib.redirect_stdout(output):
+            self.assertEqual(first_run.managed_flow(self.project, self.image, "Ubuntu"), 1)
+        self.assertEqual(prompt.call_count, 2)
+        self.assertIn("No claim issued; onboarding incomplete.", output.getvalue())
+        process.assert_not_called()
+
     def test_confirmation_refusal_and_certificate_change_never_start(self):
         for choice, certificates in (("NO", ["certificate"]), (EOFError(), ["certificate"]), ("YES", ["certificate", "changed"])):
             with self.subTest(choice=choice), patch.dict(first_run.os.environ, {}, clear=True), \
@@ -304,13 +328,15 @@ class ManagedIntegrationTests(unittest.TestCase):
                          patch.object(os, "ttyname", return_value="/dev/pts/test"), \
                          patch.object(os, "tcgetpgrp", return_value=42), patch.object(os, "getpgrp", return_value=42), \
                          patch.object(sys.stdin, "isatty", return_value=True), patch.object(output, "isatty", return_value=True), \
-                         patch("builtins.input", side_effect=["YES", "NO"]) as consent, \
+                         patch.object(sys.stderr, "isatty", return_value=False), \
+                         patch("builtins.input", return_value="YES") as consent, \
                          contextlib.redirect_stdout(output):
                         result = first_run.managed_flow(project, image, "Ubuntu")
-                    self.assertEqual(consent.call_count, 2)
+                    self.assertEqual(consent.call_count, 1)
                     self.assertNotIn("PRIVATE KEY", output.getvalue())
+                    self.assertIn("SERVER_RUNNING — ADMIN_ONBOARDING_INCOMPLETE", output.getvalue())
                     return result
-                self.assertEqual(flow(), 1)
+                self.assertEqual(flow(), 2)
                 ids = docker("container", "ls", "--all", "--filter", label, "--quiet").splitlines()
                 self.assertEqual(len(ids), 1)
                 cid = ids[0]
@@ -337,7 +363,7 @@ class ManagedIntegrationTests(unittest.TestCase):
                     flow()
                 self.assertFalse(json.loads(docker("inspect", cid))[0]["State"]["Running"])
                 docker("volume", "rm", extra)
-                self.assertEqual(flow(), 1)
+                self.assertEqual(flow(), 2)
                 after = json.loads(docker("inspect", cid))[0]
                 self.assertEqual(before["Id"], after["Id"])
                 self.assertTrue(after["State"]["Running"])

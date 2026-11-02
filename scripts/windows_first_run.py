@@ -9,13 +9,11 @@ from pathlib import Path
 import platform
 import re
 import ssl
-import stat
 import subprocess
 import sys
 import time
 
 from local_tls_up import check_project, validate
-from local_tls_init import open_parent
 
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -56,36 +54,14 @@ def attest_container_certificate(container_id, fingerprint):
 
 
 def verify_bind_source(source, tls, distribution):
-    if source == tls:
-        return
-    prefix = "/run/desktop/mnt/host/wsl/docker-desktop-bind-mounts/" + distribution + "/"
-    if not source.startswith(prefix) or not re.fullmatch(r"[a-f0-9]{64}", source[len(prefix):]):
-        raise ValueError("unrecognized translated TLS bind source")
-    # WSL's shared mount is exposed under this path in Docker Desktop's VM.
-    shared = "/mnt/wsl/docker-desktop-bind-mounts/" + distribution + "/" + source[len(prefix):]
-    original_parent, original_name = open_parent(tls)
-    descriptors = [original_parent]
-    try:
-        original = os.open(original_name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=original_parent)
-        descriptors.append(original)
-        current = os.open("/", os.O_RDONLY | os.O_DIRECTORY)
-        descriptors.append(current)
-        for component in shared.strip("/").split("/"):
-            current = os.open(component, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=current)
-            descriptors.append(current)
-        for name in (None, "server.crt", "server.key"):
-            if name is None:
-                a, b = os.fstat(original), os.fstat(current)
-            else:
-                a = os.stat(name, dir_fd=original, follow_symlinks=False)
-                b = os.stat(name, dir_fd=current, follow_symlinks=False)
-                if not os.path.samestat(a, b) or not stat.S_ISREG(a.st_mode):
-                    raise ValueError("translated TLS file identity mismatch")
-            if not os.path.samestat(a, b):
-                raise ValueError("translated TLS directory identity mismatch")
-    finally:
-        for fd in reversed(descriptors):
-            os.close(fd)
+    if source != tls:
+        raise ValueError("translated TLS bind custody is not established")
+
+
+def require_safe_key_custody():
+    # Docker Desktop can expose the original key through a traversable WSL alias,
+    # and its reported pathname does not identify the already-mounted key.
+    raise ValueError("Docker Desktop TLS key custody is not established; startup and adoption refused")
 
 
 def verify_container_user(container_id, image_user):
@@ -240,6 +216,7 @@ def main(args):
         config = json.loads(run(*base, "config", "--format", "json", "--no-path-resolution"))
         if config.get("name") != project or config["services"]["router"]["image"] != image:
             raise ValueError("unexpected Compose configuration")
+        require_safe_key_custody()
         existing = check_project(project, config)
         if existing:
             if adoption != project:

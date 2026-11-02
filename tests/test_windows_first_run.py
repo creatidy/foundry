@@ -84,6 +84,31 @@ class FirstRunTests(unittest.TestCase):
              patch.object(first_run, "run", side_effect=AssertionError("Docker contacted")):
             self.assertEqual(first_run.main(self.args), 1)
 
+    def test_key_custody_blocks_fresh_and_adoption_before_mutation(self):
+        self.args[3] = hashlib.sha256(b"der").hexdigest()
+        project, image, _, _, engine, _, _ = self.args
+        config = {"name": project, "services": {"router": {"image": image}}}
+        output = [json.dumps([{"Endpoints": {"docker": {"Host": first_run.SOCKET}}}]),
+                  json.dumps({"OSType": "linux", "ID": engine}),
+                  json.dumps([{"Id": image, "Config": {}}]), json.dumps(config)]
+        for adoption in ("-", project):
+            args = self.args.copy()
+            args[5] = adoption
+            with self.subTest(adoption=adoption), patch.dict(first_run.os.environ, {}, clear=True), \
+                 patch.object(first_run.platform, "system", return_value="Linux"), \
+                 patch.object(first_run.platform, "release", return_value="microsoft-standard-WSL2"), \
+                 patch.object(first_run, "validate"), patch.object(first_run.os, "chdir"), \
+                 patch.object(Path, "read_text", return_value="certificate"), \
+                 patch.object(first_run.ssl, "PEM_cert_to_DER_cert", return_value=b"der"), \
+                 patch.object(first_run, "run", side_effect=output), \
+                 patch.object(first_run, "check_project") as discover, \
+                 patch.object(first_run, "verify_project") as verify, \
+                 patch.object(first_run.subprocess, "run", side_effect=AssertionError("mutation attempted")), \
+                 patch("builtins.input", side_effect=AssertionError("claim prompted")):
+                self.assertEqual(first_run.main(args), 1)
+                discover.assert_not_called()
+                verify.assert_not_called()
+
     def test_consent_denial_eof_and_revalidation_refuse_claim(self):
         self.args[3] = hashlib.sha256(b"der").hexdigest()
         self.args[5] = self.args[0]
@@ -100,6 +125,7 @@ class FirstRunTests(unittest.TestCase):
                  patch.object(Path, "read_text", return_value="certificate"), \
                  patch.object(first_run.ssl, "PEM_cert_to_DER_cert", return_value=b"der"), \
                  patch.object(first_run, "run", side_effect=output), \
+                 patch.object(first_run, "require_safe_key_custody"), \
                  patch.object(first_run, "check_project", return_value=True), \
                  patch.object(first_run, "verify_project", side_effect=["a" * 64, "b" * 64]), \
                  patch.object(first_run, "request", side_effect=[(200, None, b'{"status":"ok"}'),
@@ -140,6 +166,7 @@ class FirstRunTests(unittest.TestCase):
              patch.object(Path, "read_text", return_value="certificate"), \
              patch.object(first_run.ssl, "PEM_cert_to_DER_cert", return_value=b"der"), \
              patch.object(first_run, "run", side_effect=output), \
+             patch.object(first_run, "require_safe_key_custody"), \
              patch.object(first_run, "check_project", return_value=True), \
              patch.object(first_run, "verify_project", return_value="a" * 64), \
              patch.object(first_run, "request", side_effect=[(200, None, b'{"status":"ok"}'),
@@ -255,8 +282,8 @@ class FirstRunTests(unittest.TestCase):
                     with self.assertRaises(ValueError):
                         first_run.verify_project("p", "image", "/tls", config, {"Entrypoint": None, "User": "10001:10001"}, "b" * 64, "Ubuntu")
 
-    def test_translated_bind_same_inode_required(self):
-        with self.assertRaises((OSError, ValueError)):
+    def test_translated_bind_refused_even_if_shape_matches(self):
+        with self.assertRaises(ValueError):
             first_run.verify_bind_source("/run/desktop/mnt/host/wsl/docker-desktop-bind-mounts/Ubuntu/" + "a" * 64,
                                          "/tmp/nonexistent-foundry-private/tls", "Ubuntu")
         with self.assertRaises(ValueError):
@@ -310,6 +337,7 @@ class FirstRunTests(unittest.TestCase):
              patch.object(Path, "read_text", return_value="certificate"), \
              patch.object(first_run.ssl, "PEM_cert_to_DER_cert", return_value=b"der"), \
              patch.object(first_run, "run", side_effect=output), \
+             patch.object(first_run, "require_safe_key_custody"), \
              patch.object(first_run, "check_project", return_value=False), \
              patch.object(first_run, "request", side_effect=[(200, None, b'{"status":"ok"}'),
                                                               (303, "/admin/onboarding", b""),

@@ -53,6 +53,22 @@ class FirstRunTests(unittest.TestCase):
         self.assertNotIn("Invoke-Expression", source)
         self.assertNotIn("-ExecutionPolicy", source)
 
+    def test_protected_input_is_disabled_before_process_or_prompts(self):
+        source = (ROOT / "scripts/windows-first-run.ps1").read_text()
+        function = source.split("function Invoke-ManagedBootstrap {", 1)[1].split(
+            "\nif ([Environment]::OSVersion.Platform", 1)[0]
+        gate = function.index("return 'disabled'")
+        for operation in ("Read-Host", "SecureStringToBSTR", "$process.Start()"):
+            self.assertGreater(function.index(operation), gate)
+        self.assertEqual(source.count("Invoke-ManagedBootstrap"), 2)
+        self.assertEqual(function.count("-AsSecureString"), 2)
+        self.assertIn("-cne 'YES'", function)
+        self.assertIn("password = $password; confirmation = $confirmation", function)
+        self.assertIn("$bytes.Length -gt 4096", function)
+        self.assertIn("$process.StandardInput.BaseStream.Write($bytes, 0, $bytes.Length)", function)
+        self.assertIn("$process.StandardInput.Close()", function)
+        self.assertIn("ZeroFreeBSTR", function)
+
     def test_explicit_legacy_parameters_cannot_fall_back_to_managed(self):
         source = (ROOT / "scripts/windows-first-run.ps1").read_text()
         for name in ("TlsDirectory", "TlsFingerprint", "AdoptProject"):

@@ -2,12 +2,15 @@
 """Guarded Windows/WSL local TLS startup and read-only resume."""
 
 import hashlib
+import contextlib
 import http.client
 import json
 import os
 from pathlib import Path
 import platform
 import re
+import select
+import selectors
 import ssl
 import subprocess
 import sys
@@ -22,6 +25,185 @@ ROOT = Path(__file__).resolve().parent.parent
 COMPOSE_SHA256 = "1f099d26343f07e34c11232bac52e4fbbb70f424a1992c6edab2d4b1c29959a0"
 SOCKET = "unix:///var/run/docker.sock"
 MANAGED_ACTIVATED = True
+MANAGED_BOOTSTRAP_ENABLED = False
+
+
+class ManagedProtocol:
+    """One bounded JSON frame per line; stdin is shared through final EOF."""
+
+    def __init__(self, output, input_stream):
+        self.output = output
+        self.input = input_stream
+
+    def send(self, frame):
+        encoded = json.dumps(frame, ensure_ascii=True, separators=(",", ":"))
+        if len(encoded) > 8192:
+            raise ValueError("protocol frame too large")
+        self.output.write(encoded + "\n")
+        self.output.flush()
+
+    def confirm_certificate(self, project, cert, fingerprint):
+        self.send({"type": "certificate", "project": project, "certificate": cert,
+                   "sha256": fingerprint})
+        return self.input.readline(5) == b"YES\n"
+
+    def check_parent(self, deadline):
+        if time.monotonic() >= deadline:
+            raise TimeoutError()
+        poll = select.poll()
+        poll.register(self.output.fileno(), select.POLLERR | select.POLLHUP | select.POLLNVAL)
+        if poll.poll(0):
+            raise BrokenPipeError()
+
+
+class BootstrapReservation:
+    """Engine-global inert container; retain after uncertain remote side effects."""
+
+    def __init__(self, project, image):
+        self.name = "foundry-bootstrap-" + hashlib.sha256(project.encode("ascii")).hexdigest()
+        self.id = None
+        self.retain = False
+        result = run("docker", "create", "--pull", "never", "--name", self.name, "--network", "none", "--read-only",
+                     "--tmpfs", "/data:rw,noexec,nosuid,size=1m",
+                     "--label", "org.creatidy.foundry.bootstrap-reservation=1",
+                     "--entrypoint", "/bin/false", image).strip()
+        if not re.fullmatch(r"[a-f0-9]{64}", result):
+            raise ValueError("reservation identity unavailable")
+        self.id = result
+
+    def close(self):
+        if not self.retain and self.id:
+            run("docker", "rm", "-v", self.id)
+
+
+def read_bootstrap_input(stream, deadline):
+    result = bytearray()
+    with selectors.DefaultSelector() as selector:
+        selector.register(stream, selectors.EVENT_READ)
+        while len(result) <= 4096:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0 or not selector.select(remaining):
+                raise TimeoutError()
+            chunk = os.read(stream.fileno(), 4097 - len(result))
+            if not chunk:
+                return bytes(result)
+            result.extend(chunk)
+    return bytes(result)
+
+
+def issue_bootstrap_claim(container_id, deadline):
+    process = subprocess.Popen(["docker", "exec", container_id, "python", "-m",
+                                "scarcity_router.control_server", "--data-dir", "/data",
+                                "--issue-bootstrap-claim"], stdin=subprocess.DEVNULL,
+                               stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    try:
+        deadline = min(deadline, time.monotonic() + 30)
+        output = bytearray()
+        with selectors.DefaultSelector() as selector:
+            selector.register(process.stdout, selectors.EVENT_READ)
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0 or not selector.select(remaining):
+                    raise TimeoutError()
+                chunk = os.read(process.stdout.fileno(), 45 - len(output))
+                if not chunk:
+                    break
+                output.extend(chunk)
+                if len(output) >= 45:
+                    raise ValueError("invalid claim output")
+        if process.wait(timeout=max(0, deadline - time.monotonic())) or not re.fullmatch(rb"[A-Za-z0-9_-]{43}\n", output):
+            raise ValueError("claim issuance failed")
+        return bytes(output[:-1]).decode("ascii")
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait(timeout=5)
+        process.stdout.close()
+
+
+def managed_bootstrap(stream, *, project, image, engine, distribution, config,
+                      image_config, volume, nonce, cert, fingerprint, container_id,
+                      protocol, reservation, deadline):
+    """Disabled transaction. stream is EOF-terminated UTF-8 JSON, at most 4096 bytes.
+
+    The caller must supply the already confirmed managed-flow context. Outcomes
+    are non-secret; recovery outcomes require manual inspection, not a retry.
+    """
+    if not MANAGED_BOOTSTRAP_ENABLED:
+        return "disabled"
+    issued = False
+    try:
+        raw = read_bootstrap_input(stream, deadline)
+        if not isinstance(raw, bytes) or len(raw) > 4096:
+            return "invalid-input"
+        try:
+            credentials = json.loads(raw.decode("utf-8"))
+        except (UnicodeError, ValueError):
+            return "invalid-input"
+        if (not isinstance(credentials, dict) or set(credentials) != {"password", "confirmation"} or
+                not isinstance(credentials["password"], str) or
+                credentials["password"] != credentials["confirmation"] or
+                not 12 <= len(credentials["password"]) <= 128 or
+                credentials["password"].strip() != credentials["password"]):
+            return "invalid-input"
+        password = credentials["password"]
+        del credentials, raw
+        if (os.environ.get("DOCKER_HOST") != SOCKET or os.environ.get("DOCKER_CONTEXT") or
+                any(name.startswith(("COMPOSE_", "FOUNDRY_MI_")) for name in os.environ) or
+                hashlib.sha256((ROOT / "compose.yaml").read_bytes()).hexdigest() != COMPOSE_SHA256 or
+                hashlib.sha256(ssl.PEM_cert_to_DER_cert(cert)).hexdigest() != fingerprint):
+            return "recovery-required"
+        actual = json.loads(run("docker", "info", "--format", "{{json .}}"))
+        if actual.get("OSType") != "linux" or actual.get("ID") != engine:
+            return "recovery-required"
+        if managed_tls.verify_tls_volume(project, image, volume, nonce, allowed_consumer=container_id) != cert:
+            return "recovery-required"
+        if verify_project(project, image, "", config, image_config, fingerprint,
+                          distribution, managed_volume=volume) != container_id:
+            return "recovery-required"
+        status, location, _ = request("/admin", cert, fingerprint)
+        if status not in (302, 303, 307, 308) or location != "/admin/onboarding":
+            return "recovery-required"
+        protocol.check_parent(deadline)
+        # Issuance can succeed even if the CLI times out or its output is lost.
+        reservation.retain = True
+        issued = True
+        claim = issue_bootstrap_claim(container_id, deadline)
+        context = ssl.create_default_context(cadata=cert)
+        conn = http.client.HTTPSConnection("127.0.0.1", 8787, context=context, timeout=3)
+        try:
+            conn.connect()
+            if hashlib.sha256(conn.sock.getpeercert(binary_form=True)).hexdigest() != fingerprint:
+                return "recovery-required"
+            payload = json.dumps({"claim": claim, "password": password, "confirm": True}).encode("utf-8")
+            protocol.check_parent(deadline)
+            conn.request("POST", "/control/bootstrap/admin", body=payload,
+                         headers={"Content-Type": "application/json"})
+            response = conn.getresponse()
+            status = response.status
+        finally:
+            conn.close()
+        if status == 200:
+            status, location, _ = request("/admin", cert, fingerprint)
+            if status in (302, 303, 307, 308) and location == "/admin/login":
+                return "submitted"
+            return "recovery-required"
+        if status in (401, 409):
+            return "recovery-required"
+    except Exception:
+        if not issued:
+            return "recovery-required"
+    # Identity creation and session creation are separate. A configured state
+    # after an ambiguous response does not prove which actor created the admin.
+    try:
+        status, location, _ = request("/admin", cert, fingerprint)
+        if status in (302, 303, 307, 308) and location == "/admin/login":
+            return "configured-recovery-required"
+        if status in (302, 303, 307, 308) and location == "/admin/onboarding":
+            return "not-configured-recovery-required"
+    except Exception:
+        pass
+    return "recovery-required"
 
 
 def run(*args):
@@ -204,7 +386,7 @@ def verify_project(project, image, tls, config, image_config, fingerprint, distr
     return ids[0]
 
 
-def managed_flow(project, image, distribution):
+def managed_flow(project, image, distribution, *, engine=None, protocol=None):
     """Managed-volume flow; caller must enforce the managed activation gate."""
     os.chdir(ROOT)
     os.environ.update(FOUNDRY_ROUTER_IMAGE=image, FOUNDRY_ROUTER_HOST="127.0.0.1",
@@ -243,10 +425,14 @@ def managed_flow(project, image, distribution):
             cert = managed_tls.verify_tls_volume(project, image, volume, nonce,
                                                   allowed_consumer=ids[0] if ids else None)
         fingerprint = hashlib.sha256(ssl.PEM_cert_to_DER_cert(cert)).hexdigest()
-        print("Public certificate obtained from the verified local Docker volume:\n" + cert)
-        print("SHA256:", fingerprint)
-        print("Certificate confirmation is public and does not issue a claim.")
-        if input("Confirm this certificate and project for this session? Type YES: ") != "YES":
+        if protocol is None:
+            print("Public certificate obtained from the verified local Docker volume:\n" + cert)
+            print("SHA256:", fingerprint)
+            print("Certificate confirmation is public and does not issue a claim.")
+            confirmed = input("Confirm this certificate and project for this session? Type YES: ") == "YES"
+        else:
+            confirmed = protocol.confirm_certificate(project, cert, fingerprint)
+        if not confirmed:
             raise ValueError("certificate confirmation declined")
         container_id = None
         if ids:
@@ -297,6 +483,32 @@ def managed_flow(project, image, distribution):
             time.sleep(1)
         else:
             raise ValueError("verified TLS liveness check failed")
+        if protocol is not None:
+            if not MANAGED_BOOTSTRAP_ENABLED:
+                return 2
+            reservation = BootstrapReservation(project, image)
+            deadline = time.monotonic() + 120
+            try:
+                protocol.check_parent(deadline)
+                status, location, _ = request("/admin", cert, fingerprint)
+                if status in (302, 303, 307, 308) and location == "/admin/login":
+                    protocol.send({"type": "result", "outcome": "already-configured"})
+                    return 0
+                if status not in (302, 303, 307, 308) or location != "/admin/onboarding":
+                    raise ValueError("administrator state unknown")
+                protocol.send({"type": "credentials"})
+                outcome = managed_bootstrap(protocol.input, project=project, image=image, engine=engine,
+                                            distribution=distribution, config=config, image_config=images[0]["Config"],
+                                            volume=volume, nonce=nonce, cert=cert, fingerprint=fingerprint,
+                                            container_id=container_id, protocol=protocol, reservation=reservation,
+                                            deadline=deadline)
+                protocol.send({"type": "result", "outcome": outcome})
+                if outcome == "submitted":
+                    protocol.check_parent(deadline)
+                    reservation.retain = False
+                return 0 if outcome == "submitted" else 2
+            finally:
+                reservation.close()
         status, location, _ = request("/admin", cert, fingerprint)
         if status in (302, 303, 307, 308) and location == "/admin/login":
             print("Administrator configured; no claim issued. Authenticated readiness unknown.")
@@ -309,7 +521,7 @@ def managed_flow(project, image, distribution):
         return 2
 
 
-def managed_main(args):
+def managed_main(args, protocol=None):
     if len(args) != 4:
         print("Expected managed project, image, engine and distribution.", file=sys.stderr)
         return 1
@@ -341,7 +553,9 @@ def managed_main(args):
             raise ValueError("verified image ID unavailable")
         if not MANAGED_ACTIVATED:
             raise ValueError("managed TLS activation is disabled pending independent review")
-        return managed_flow(project, image, distribution)
+        if protocol is None:
+            return managed_flow(project, image, distribution)
+        return managed_flow(project, image, distribution, engine=engine, protocol=protocol)
     except (OSError, EOFError, ValueError, KeyError, IndexError, TypeError, RuntimeError,
             subprocess.SubprocessError, http.client.HTTPException):
         print("Managed first run stopped; inspect the local project and prerequisites.", file=sys.stderr)
@@ -349,6 +563,12 @@ def managed_main(args):
 
 
 def main(args):
+    if args and args[0] == "managed-protocol":
+        if not MANAGED_BOOTSTRAP_ENABLED:
+            return 1
+        protocol = ManagedProtocol(sys.stdout, sys.stdin.buffer)
+        with open(os.devnull, "w") as sink, contextlib.redirect_stdout(sink), contextlib.redirect_stderr(sink):
+            return managed_main(args[1:], protocol=protocol)
     if args and args[0] == "managed":
         return managed_main(args[1:])
     if len(args) != 7:

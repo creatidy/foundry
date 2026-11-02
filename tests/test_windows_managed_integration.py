@@ -116,6 +116,33 @@ class ManagedIntegrationTests(unittest.TestCase):
         self.assertTrue(any(call.args[:2] == ("docker", "start") for call in docker.call_args_list))
         self.assertFalse(any("rm" in call.args for call in docker.call_args_list))
 
+    def test_protocol_uses_same_verified_context_and_orders_frames(self):
+        output = io.StringIO()
+        credentials = io.BytesIO(b'YES\n{"password":"synthetic-pass","confirmation":"synthetic-pass"}')
+        protocol = first_run.ManagedProtocol(output, credentials)
+        with patch.dict(first_run.os.environ, {}, clear=True), patch.object(first_run.os, "chdir"), \
+             patch.object(first_run, "MANAGED_BOOTSTRAP_ENABLED", True), \
+             patch.object(first_run.ManagedProtocol, "check_parent"), \
+             patch.object(first_run, "BootstrapReservation") as reservation, \
+             patch.object(first_run, "run", side_effect=self.command), \
+             patch.object(managed, "discover_tls_volume", return_value=(self.volume, self.nonce)), \
+             patch.object(managed, "verify_tls_volume", return_value="certificate"), \
+             patch.object(first_run, "verify_project", return_value=self.cid), \
+             patch.object(first_run.ssl, "PEM_cert_to_DER_cert", return_value=b"der"), \
+             patch.object(first_run, "request", side_effect=[(200, None, b'{"status":"ok"}'),
+                  (303, "/admin/onboarding", b"")]), \
+             patch.object(first_run, "managed_bootstrap", return_value="submitted") as bootstrap, \
+             contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(first_run.managed_flow(self.project, self.image, "Ubuntu", engine="engine", protocol=protocol), 0)
+        frames = [json.loads(line) for line in output.getvalue().splitlines()]
+        self.assertEqual([frame["type"] for frame in frames], ["certificate", "credentials", "result"])
+        self.assertEqual(frames[-1]["outcome"], "submitted")
+        self.assertIs(bootstrap.call_args.args[0], credentials)
+        self.assertEqual(bootstrap.call_args.kwargs["container_id"], self.cid)
+        self.assertEqual(bootstrap.call_args.kwargs["volume"], self.volume)
+        reservation.return_value.close.assert_called_once()
+        self.assertNotIn("synthetic-pass", output.getvalue())
+
     def test_foreground_affirmative_cannot_issue_claim(self):
         output = io.StringIO()
         with patch.dict(first_run.os.environ, {}, clear=True), patch.object(first_run.os, "chdir"), \

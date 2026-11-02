@@ -2,9 +2,12 @@ param(
     [Parameter(Mandatory=$true)][string]$Distribution,
     [Parameter(Mandatory=$true)][string]$Project,
     [Parameter(Mandatory=$true)][string]$ImageId,
-    [Parameter(Mandatory=$true)][string]$TlsDirectory,
-    [Parameter(Mandatory=$true)][string]$TlsFingerprint,
-    [string]$AdoptProject = '-'
+    [string]$TlsDirectory = '-',
+    [string]$TlsFingerprint = '-',
+    [string]$AdoptProject = '-',
+    [switch]$ManagedTls,
+    [string]$TlsVolume = '-',
+    [string]$TlsNonce = '-'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -17,9 +20,12 @@ if ([Environment]::OSVersion.Platform -ne [PlatformID]::Win32NT) {
 if ($Distribution -notmatch '^[A-Za-z0-9][A-Za-z0-9_.-]*$' -or
     $Project -cnotmatch '^[a-z0-9][a-z0-9_-]*$' -or
     $ImageId -cnotmatch '^sha256:[a-f0-9]{64}$' -or
-    $TlsFingerprint -cnotmatch '^[a-f0-9]{64}$' -or
+    ($TlsFingerprint -cne '-' -and $TlsFingerprint -cnotmatch '^[a-f0-9]{64}$') -or
     ($AdoptProject -cne '-' -and $AdoptProject -cne $Project) -or
-    $TlsDirectory -cnotmatch '^/[A-Za-z0-9_./-]+$' -or
+    (-not $ManagedTls -and ($TlsDirectory -cnotmatch '^/[A-Za-z0-9_./-]+$' -or $TlsFingerprint -ceq '-')) -or
+    ($ManagedTls -and ($TlsDirectory -cne '-' -or
+        ($TlsVolume -cne '-' -and $TlsVolume -cnotmatch '^foundry-tls-[a-f0-9]{32}$') -or
+        ($TlsNonce -cne '-' -and $TlsNonce -cnotmatch '^[a-f0-9]{32}$'))) -or
     $PSScriptRoot -notmatch '^[A-Za-z]:\\[A-Za-z0-9_ .\\-]+$') {
     Write-Error 'Unsafe argument or non-local Windows script path; see README.'
     exit 1
@@ -58,5 +64,9 @@ if ($LASTEXITCODE -ne 0 -or $linuxScript -isnot [string] -or
     Write-Error 'Cannot resolve the Windows-local entrypoint in the selected WSL distribution.'
     exit 1
 }
-& $wsl --distribution $Distribution --exec python3 "$linuxScript" $Project $ImageId $TlsDirectory $TlsFingerprint $info.ID $AdoptProject $Distribution
+if ($ManagedTls) {
+    & $wsl --distribution $Distribution --exec python3 "$linuxScript" managed $Project $ImageId $TlsFingerprint $TlsVolume $TlsNonce $info.ID $AdoptProject $Distribution
+} else {
+    & $wsl --distribution $Distribution --exec python3 "$linuxScript" $Project $ImageId $TlsDirectory $TlsFingerprint $info.ID $AdoptProject $Distribution
+}
 exit $LASTEXITCODE

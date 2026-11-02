@@ -11,9 +11,11 @@ import re
 import ssl
 import subprocess
 import sys
+import tempfile
 import time
 
 from local_tls_up import check_project, validate
+import windows_managed_tls as managed_tls
 
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -27,7 +29,7 @@ def run(*args):
 
 
 def request(path, cert, fingerprint):
-    context = ssl.create_default_context(cafile=cert)
+    context = ssl.create_default_context(cadata=cert) if cert.startswith("-----BEGIN CERTIFICATE-----") else ssl.create_default_context(cafile=cert)
     conn = http.client.HTTPSConnection("127.0.0.1", 8787, context=context, timeout=3)
     try:
         conn.connect()
@@ -98,7 +100,8 @@ def verify_container_user(container_id, image_user):
         raise ValueError("running container user identity mismatch")
 
 
-def verify_project(project, image, tls, config, image_config, fingerprint, distribution):
+def verify_project(project, image, tls, config, image_config, fingerprint, distribution,
+                   managed_volume=None, allow_stopped=False):
     label = "label=com.docker.compose.project=" + project
     ids = run("docker", "container", "ls", "--all", "--filter", label, "--quiet").splitlines()
     volumes = run("docker", "volume", "ls", "--filter", label, "--quiet").splitlines()
@@ -124,7 +127,8 @@ def verify_project(project, image, tls, config, image_config, fingerprint, distr
                          "SR_HEALTHCHECK_CA": "/run/foundry/tls/server.crt"})
     actual_env = c["Config"].get("Env") or []
     image_user = image_config.get("User", "")
-    if (not c["State"]["Running"] or c["Image"] != image or
+    running = c["State"]["Running"]
+    if ((not running and not allow_stopped) or c["Image"] != image or
             labels.get("com.docker.compose.project") != project or
             labels.get("com.docker.compose.service") != "router" or
             labels.get("com.docker.compose.container-number") != "1" or
@@ -135,7 +139,8 @@ def verify_project(project, image, tls, config, image_config, fingerprint, distr
             dict(value.split("=", 1) for value in actual_env) != expected_env or
             len(data) != 1 or data[0]["Type"] != "volume" or not data[0]["RW"] or
             data[0]["Name"] != volume_name or len(cert) != 1 or
-            cert[0]["Type"] != "bind" or cert[0]["RW"] or
+            cert[0]["Type"] != ("volume" if managed_volume else "bind") or cert[0]["RW"] or
+            (managed_volume is not None and cert[0].get("Name") != managed_volume) or
             host.get("Privileged") or host.get("NetworkMode") != network_name or
             host.get("CapAdd") or host.get("CapDrop") or host.get("Devices") or
             host.get("DeviceRequests") or host.get("DeviceCgroupRules") or
@@ -147,7 +152,8 @@ def verify_project(project, image, tls, config, image_config, fingerprint, distr
             host.get("PortBindings") != {"8787/tcp": [{"HostIp": "127.0.0.1", "HostPort": "8787"}]} or
             set(c["NetworkSettings"]["Networks"]) != {network_name}):
         raise ValueError("running router configuration does not match")
-    verify_bind_source(cert[0]["Source"], tls, distribution)
+    if managed_volume is None:
+        verify_bind_source(cert[0]["Source"], tls, distribution)
     volume = json.loads(run("docker", "volume", "inspect", volume_name))
     if (len(volume) != 1 or volume[0]["Name"] != volume_name or
             volume[0].get("Driver") != "local" or volume[0].get("Options") not in (None, {}) or
@@ -161,14 +167,169 @@ def verify_project(project, image, tls, config, image_config, fingerprint, distr
     if (len(network) != 1 or network[0]["Name"] != network_name or
             network[0].get("Labels", {}).get("com.docker.compose.project") != project or
             network[0].get("Labels", {}).get("com.docker.compose.network") != "backend" or
-            set(network[0].get("Containers", {})) != {c["Id"]}):
+            set(network[0].get("Containers", {})) != ({c["Id"]} if running else set())):
         raise ValueError("network identity or membership mismatch")
-    verify_container_user(ids[0], image_user)
-    attest_container_certificate(ids[0], fingerprint)
+    if running:
+        verify_container_user(ids[0], image_user)
+        attest_container_certificate(ids[0], fingerprint)
     return ids[0]
 
 
+def managed_flow(project, image, fingerprint, volume, nonce, adoption, distribution):
+    """Dormant managed-volume flow; caller must enforce the custody gate first."""
+    os.chdir(ROOT)
+    os.environ.update(FOUNDRY_ROUTER_IMAGE=image, FOUNDRY_ROUTER_HOST="127.0.0.1",
+                      FOUNDRY_TLS_DIR="/dev/null", FOUNDRY_ROUTER_PORT="8787")
+    with tempfile.TemporaryDirectory(prefix="foundry-managed-") as tmp:
+        envfile = os.path.join(tmp, "env")
+        with open(envfile, "x", encoding="ascii") as stream:
+            stream.write("")
+        base = ["docker", "compose", "-p", project, "--env-file", envfile, "-f", "compose.yaml"]
+        config = json.loads(run(*base, "config", "--format", "json", "--no-path-resolution"))
+        if config.get("name") != project or config["services"]["router"]["image"] != image:
+            raise ValueError("unexpected Compose configuration")
+        images = json.loads(run("docker", "image", "inspect", image))
+        if (len(images) != 1 or images[0].get("Id") != image or
+                not images[0].get("Config", {}).get("User") or os.getegid() == 0):
+            raise ValueError("image identity or non-root operator group is invalid")
+        probe = run("docker", "run", "--rm", "--pull", "never", "--network", "none", "--read-only",
+                    "--cap-drop", "ALL", "--security-opt", "no-new-privileges:true", "--tmpfs",
+                    "/data:rw,noexec,nosuid,size=1m", "--entrypoint", "python", image,
+                    "-c", "import os; print(str(os.geteuid())+':'+str(os.getegid()))").strip()
+        if probe != "10001:10001":
+            raise ValueError("image default user is not the expected non-root identity")
+        if volume == nonce == fingerprint == "-":
+            if adoption != "-" or check_project(project, config):
+                raise ValueError("project is not fresh")
+            name, token, cert = managed_tls.initialize_tls_volume(project, image)
+            print("Managed TLS volume:", name, "nonce:", token)
+            print("Public certificate, not automatically trusted:\n" + cert)
+            print("Independently verify its fingerprint before explicitly resuming; no router was started.")
+            return 1
+        managed_tls._check_input(project, image, volume, nonce)
+        if adoption != project or not re.fullmatch(r"[a-f0-9]{64}", fingerprint):
+            raise ValueError("explicit project adoption and independently verified fingerprint required")
+        label = "label=com.docker.compose.project=" + project
+        ids = run("docker", "container", "ls", "--all", "--filter", label, "--quiet").splitlines()
+        if len(ids) > 1:
+            raise ValueError("project has extra containers")
+        container_id = None
+        if ids:
+            container_id = verify_project(project, image, "", config, images[0]["Config"], fingerprint,
+                                          distribution, managed_volume=volume, allow_stopped=True)
+        elif check_project(project, config):
+            raise ValueError("orphaned or ambiguous project resources")
+        cert = managed_tls.verify_tls_volume(project, image, volume, nonce, allowed_consumer=container_id)
+        if hashlib.sha256(ssl.PEM_cert_to_DER_cert(cert)).hexdigest() != fingerprint:
+            raise ValueError("independent TLS fingerprint mismatch")
+        if container_id:
+            state = json.loads(run("docker", "inspect", container_id))[0]["State"]
+            if not state["Running"]:
+                run("docker", "start", container_id)
+        else:
+            override = {"services": {"router": {
+                "command": config["services"]["router"]["command"] + ["--tls-reload-ca-cert=/run/foundry/tls/server.crt"],
+                "group_add": [str(os.getegid())],
+                "environment": {"SR_HEALTHCHECK_CA": "/run/foundry/tls/server.crt"},
+                "volumes": [{"type": "volume", "source": "managed-tls", "target": "/run/foundry/tls",
+                             "read_only": True, "volume": {"nocopy": True}}]}},
+                "volumes": {"managed-tls": {"external": True, "name": volume}}}
+            override_path = os.path.join(tmp, "override.json")
+            with open(override_path, "x", encoding="ascii") as stream:
+                json.dump(override, stream)
+            composed = base + ["-f", override_path]
+            merged = json.loads(run(*composed, "config", "--format", "json", "--no-path-resolution"))
+            mounts = merged["services"]["router"]["volumes"]
+            tls_mounts = [m for m in mounts if m.get("target") == "/run/foundry/tls"]
+            if (len(mounts) != 2 or len(tls_mounts) != 1 or tls_mounts[0].get("type") != "volume" or
+                    tls_mounts[0].get("source") != "managed-tls" or not tls_mounts[0].get("read_only") or
+                    not tls_mounts[0].get("volume", {}).get("nocopy") or
+                    merged["volumes"]["managed-tls"]["name"] != volume):
+                raise ValueError("unsafe merged Compose TLS mount")
+            if check_project(project, config):
+                raise ValueError("project collision before startup")
+            managed_tls._inspect(project, image, volume, nonce)
+            run(*composed, "up", "-d", "--no-build", "--pull", "never")
+        container_id = verify_project(project, image, "", config, images[0]["Config"], fingerprint,
+                                      distribution, managed_volume=volume)
+        for _ in range(30):
+            try:
+                status, _, body = request("/healthz", cert, fingerprint)
+                if status == 200 and json.loads(body) == {"status": "ok"}:
+                    break
+            except (OSError, ValueError, http.client.HTTPException):
+                pass
+            time.sleep(1)
+        else:
+            raise ValueError("verified TLS liveness check failed")
+        status, location, _ = request("/admin", cert, fingerprint)
+        if status in (302, 303, 307, 308) and location == "/admin/login":
+            print("Administrator configured; no claim issued. Authenticated readiness unknown.")
+            return 0
+        if status not in (302, 303, 307, 308) or location != "/admin/onboarding":
+            raise ValueError("administrator state unknown")
+        if not sys.stdin.isatty() or not sys.stdout.isatty() or input("Issue one bootstrap claim to this terminal? Type YES: ") != "YES":
+            print("No claim issued; onboarding incomplete.")
+            return 1
+        if verify_project(project, image, "", config, images[0]["Config"], fingerprint,
+                          distribution, managed_volume=volume) != container_id:
+            raise ValueError("router identity changed after consent")
+        current_cert = managed_tls.verify_tls_volume(project, image, volume, nonce, allowed_consumer=container_id)
+        if hashlib.sha256(ssl.PEM_cert_to_DER_cert(current_cert)).hexdigest() != fingerprint:
+            raise ValueError("TLS fingerprint changed after consent")
+        status, location, _ = request("/admin", cert, fingerprint)
+        if status not in (302, 303, 307, 308) or location != "/admin/onboarding":
+            raise ValueError("administrator state changed after consent")
+        result = subprocess.run(["docker", "exec", container_id, "python", "-m", "scarcity_router.control_server",
+                                 "--data-dir", "/data", "--issue-bootstrap-claim"], timeout=30)
+        if result.returncode:
+            raise ValueError("claim issuance failed; no automatic retry")
+        print("Open https://127.0.0.1:8787/admin/onboarding only with independently verified browser trust.")
+        print("Administrator completion and authenticated readiness are unknown.")
+        return 0
+
+
+def managed_main(args):
+    if len(args) != 8:
+        print("Expected managed project, image, fingerprint, volume, nonce, engine, adoption and distribution.", file=sys.stderr)
+        return 1
+    project, image, fingerprint, volume, nonce, engine, adoption, distribution = args
+    if (not re.fullmatch(r"[a-z0-9][a-z0-9_-]*", project) or
+            not re.fullmatch(r"sha256:[a-f0-9]{64}", image) or
+            not re.fullmatch(r"[A-Za-z0-9:_-]+", engine) or adoption not in ("-", project) or
+            not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", distribution)):
+        print("Invalid managed first-run inputs.", file=sys.stderr)
+        return 1
+    if platform.system() != "Linux" or not re.search(r"microsoft-standard-WSL2", platform.release(), re.I):
+        print("The selected environment is not an identifiable WSL2 Linux kernel.", file=sys.stderr)
+        return 1
+    try:
+        if any(os.environ.get(name) for name in ("DOCKER_HOST", "DOCKER_CONTEXT")) or any(
+                os.environ.get(name) for name in os.environ if name.startswith(("COMPOSE_", "FOUNDRY_MI_"))):
+            raise ValueError("Docker, Compose or MI overrides are not accepted")
+        if hashlib.sha256((ROOT / "compose.yaml").read_bytes()).hexdigest() != COMPOSE_SHA256:
+            raise ValueError("Compose file differs from the inspected version")
+        context = json.loads(run("docker", "context", "inspect"))
+        if len(context) != 1 or context[0]["Endpoints"]["docker"]["Host"] != SOCKET:
+            raise ValueError("selected WSL Docker endpoint is not the accepted local socket")
+        os.environ["DOCKER_HOST"] = SOCKET
+        actual = json.loads(run("docker", "info", "--format", "{{json .}}"))
+        if actual.get("OSType") != "linux" or actual.get("ID") != engine:
+            raise ValueError("WSL and Windows Docker engine identities do not match")
+        images = json.loads(run("docker", "image", "inspect", image))
+        if len(images) != 1 or images[0].get("Id") != image:
+            raise ValueError("verified image ID unavailable")
+        require_safe_key_custody()
+        return managed_flow(project, image, fingerprint, volume, nonce, adoption, distribution)
+    except (OSError, EOFError, ValueError, KeyError, IndexError, TypeError, RuntimeError,
+            subprocess.SubprocessError, http.client.HTTPException) as exc:
+        print("Managed first run stopped: " + str(exc), file=sys.stderr)
+        return 1
+
+
 def main(args):
+    if args and args[0] == "managed":
+        return managed_main(args[1:])
     if len(args) != 7:
         print("Expected project, image ID, TLS directory, fingerprint, engine ID, adoption and distribution.", file=sys.stderr)
         return 1

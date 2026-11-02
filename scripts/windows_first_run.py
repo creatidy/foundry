@@ -303,34 +303,10 @@ def managed_flow(project, image, distribution):
             return 0
         if status not in (302, 303, 307, 308) or location != "/admin/onboarding":
             raise ValueError("administrator state unknown")
-        if not foreground_terminal():
-            print("SERVER_RUNNING — ADMIN_ONBOARDING_INCOMPLETE: no claim issued; container and volumes retained.")
-            return 2
-        if input("Issue one bootstrap claim to this terminal? Type YES: ") != "YES":
-            print("No claim issued; onboarding incomplete.")
-            return 1
-        claim_terminal = attest_claim_terminal()
-        if not claim_terminal:
-            print("Terminal attestation not established; no claim issued.")
-            return 1
-        if verify_project(project, image, "", config, images[0]["Config"], fingerprint,
-                          distribution, managed_volume=volume) != container_id:
-            raise ValueError("router identity changed after consent")
-        current_cert = managed_tls.verify_tls_volume(project, image, volume, nonce, allowed_consumer=container_id)
-        if hashlib.sha256(ssl.PEM_cert_to_DER_cert(current_cert)).hexdigest() != fingerprint:
-            raise ValueError("TLS fingerprint changed after consent")
-        status, location, _ = request("/admin", cert, fingerprint)
-        if status not in (302, 303, 307, 308) or location != "/admin/onboarding":
-            raise ValueError("administrator state changed after consent")
-        if not foreground_terminal() or os.ttyname(0) != claim_terminal:
-            raise ValueError("terminal changed after attestation")
-        result = subprocess.run(["docker", "exec", container_id, "python", "-m", "scarcity_router.control_server",
-                                 "--data-dir", "/data", "--issue-bootstrap-claim"], timeout=30)
-        if result.returncode:
-            raise ValueError("claim issuance failed; no automatic retry")
-        print("Open https://127.0.0.1:8787/admin/onboarding only with independently verified browser trust.")
-        print("Administrator completion and authenticated readiness are unknown.")
-        return 0
+        print("SERVER_RUNNING — ADMIN_ONBOARDING_INCOMPLETE: experimental mode does not issue "
+              "administrator claims or support onboarding; container and volumes retained. "
+              "Authenticated readiness is unknown.")
+        return 2
 
 
 def managed_main(args):

@@ -87,6 +87,40 @@ class ManagedTlsTests(unittest.TestCase):
             self.assertEqual(result[:2], (name, nonce))
             self.assertEqual(managed.verify_tls_volume(self.project, image, name, nonce), result[2])
             self.assertIn("-----BEGIN CERTIFICATE-----", result[2])
+            # Replace only this test volume's synthetic keypair. Both fixtures
+            # remain valid for 127.0.0.1 and match their key; only the leaf
+            # Basic Constraints invariant differs.
+            fixture = r'''
+import os, subprocess, sys
+key, cert = '/tls/server.key', '/tls/server.crt'
+os.chmod(key, 0o600)
+os.chmod(cert, 0o600)
+def openssl(*args):
+    subprocess.run(['openssl', *args], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+common = ['-newkey', 'rsa:2048', '-noenc', '-keyout', key, '-subj', '/CN=127.0.0.1',
+          '-addext', 'subjectAltName=IP:127.0.0.1']
+if sys.argv[1] == 'ca':
+    openssl('req', '-x509', *common, '-addext', 'basicConstraints=critical,CA:TRUE', '-out', cert, '-days', '2')
+else:
+    openssl('req', '-new', *common, '-out', '/tmp/request.csr')
+    openssl('x509', '-req', '-in', '/tmp/request.csr', '-signkey', key, '-copy_extensions', 'copy', '-out', cert, '-days', '2')
+openssl('verify', '-CAfile', cert, '-verify_ip', '127.0.0.1', '-purpose', 'sslserver', cert)
+extension = subprocess.run(['openssl', 'x509', '-in', cert, '-noout', '-ext', 'basicConstraints'],
+                           check=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL).stdout
+if (sys.argv[1] == 'ca' and b'CA:TRUE' not in extension) or (sys.argv[1] == 'missing' and b'CA:' in extension):
+    sys.exit(2)
+for path in (key, cert):
+    os.chown(path, 0, 10001)
+    os.chmod(path, 0o440)
+'''
+            for case in ("ca", "missing"):
+                with self.subTest(constraints=case):
+                    args = managed._container(image, name, writable=True)
+                    args[args.index("--mount"):args.index("--mount")] = ["--tmpfs", "/tmp:rw,noexec,nosuid,size=1m"]
+                    args[-1] = fixture
+                    subprocess.run(args + [case], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=120)
+                    with self.assertRaises(subprocess.CalledProcessError):
+                        managed.verify_tls_volume(self.project, image, name, nonce)
         finally:
             managed._inspect(self.project, image, name, nonce)
             subprocess.run(["docker", "volume", "rm", name], check=True, stdout=subprocess.DEVNULL)

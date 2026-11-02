@@ -45,7 +45,7 @@ os.chmod(root, 0o750, follow_symlinks=False)
 '''
 
 _VERIFY = r'''
-import json, os, stat, subprocess, sys
+import json, os, re, stat, subprocess, sys
 root = '/tls'
 s = os.lstat(root)
 if not stat.S_ISDIR(s.st_mode) or (s.st_uid,s.st_gid,stat.S_IMODE(s.st_mode)) != (0,10001,0o750):
@@ -63,7 +63,11 @@ with open(root+'/server.crt', encoding='ascii') as f:
 if len(cert) > 1048576 or cert.count('-----BEGIN CERTIFICATE-----') != 1:
     sys.exit(5)
 def openssl(*args):
-    return subprocess.run(['openssl', *args], check=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL).stdout
+    return subprocess.run(['openssl', *args], check=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                          env={**os.environ, 'LC_ALL': 'C'}).stdout
+constraints = openssl('x509','-in',root+'/server.crt','-noout','-ext','basicConstraints')
+if not re.fullmatch(rb'\s*X509v3 Basic Constraints:\s*(?:critical\s*)?CA:FALSE\s*', constraints):
+    sys.exit(7)
 if openssl('x509','-in',root+'/server.crt','-pubkey','-noout') != openssl('pkey','-in',root+'/server.key','-pubout'):
     sys.exit(6)
 openssl('verify','-CAfile',root+'/server.crt','-verify_ip','127.0.0.1','-purpose','sslserver',root+'/server.crt')

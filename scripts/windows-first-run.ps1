@@ -31,7 +31,15 @@ if ($env:DOCKER_HOST -or $env:DOCKER_CONTEXT) {
 }
 
 # Explicit Windows pipe: do not use the configured Windows Docker context.
-$engine = & docker.exe --host 'npipe:////./pipe/dockerDesktopLinuxEngine' info --format '{{json .}}' 2>$null
+try {
+    $previousPreference = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    $engine = & docker.exe --host 'npipe:////./pipe/dockerDesktopLinuxEngine' info --format '{{json .}}' 2>$null
+} catch {
+    $engine = $null
+} finally {
+    $ErrorActionPreference = $previousPreference
+}
 if ($LASTEXITCODE -ne 0 -or $engine -isnot [string]) {
     Write-Error 'Docker Desktop Linux engine is unavailable on its fixed Windows pipe.'
     exit 1

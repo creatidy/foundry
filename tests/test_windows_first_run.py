@@ -5,6 +5,7 @@ import hashlib
 import json
 from pathlib import Path
 import sys
+import subprocess
 import unittest
 from unittest.mock import patch, Mock
 
@@ -58,6 +59,57 @@ class FirstRunTests(unittest.TestCase):
              patch.object(first_run, "run", side_effect=AssertionError("contacted Docker")):
             self.assertEqual(first_run.main(self.args), 1)
             validate.assert_not_called()
+
+    def test_checkout_attribute_preserves_hashed_compose_lf(self):
+        result = subprocess.run(["git", "-c", "core.autocrlf=true", "check-attr", "eol", "--", "compose.yaml"],
+                                cwd=ROOT, check=True, capture_output=True, text=True)
+        self.assertEqual(result.stdout.strip(), "compose.yaml: eol: lf")
+        self.assertEqual(hashlib.sha256((ROOT / "compose.yaml").read_bytes()).hexdigest(), first_run.COMPOSE_SHA256)
+
+    def test_compose_and_mi_environment_rejected_before_docker(self):
+        for name in ("COMPOSE_FILE", "FOUNDRY_MI_DIR"):
+            with self.subTest(name=name), patch.dict(first_run.os.environ, {name: "unsafe"}, clear=True), \
+                 patch.object(first_run.platform, "system", return_value="Linux"), \
+                 patch.object(first_run.platform, "release", return_value="microsoft-standard-WSL2"), \
+                 patch.object(first_run, "validate") as validate, \
+                 patch.object(first_run, "run", side_effect=AssertionError("Docker contacted")):
+                self.assertEqual(first_run.main(self.args), 1)
+                validate.assert_not_called()
+
+    def test_changed_compose_rejected_before_docker(self):
+        with patch.dict(first_run.os.environ, {}, clear=True), \
+             patch.object(first_run.platform, "system", return_value="Linux"), \
+             patch.object(first_run.platform, "release", return_value="microsoft-standard-WSL2"), \
+             patch.object(first_run, "COMPOSE_SHA256", "0" * 64), \
+             patch.object(first_run, "run", side_effect=AssertionError("Docker contacted")):
+            self.assertEqual(first_run.main(self.args), 1)
+
+    def test_consent_denial_eof_and_revalidation_refuse_claim(self):
+        self.args[3] = hashlib.sha256(b"der").hexdigest()
+        self.args[5] = self.args[0]
+        project, image, _, _, engine, _, _ = self.args
+        config = {"name": project, "services": {"router": {"image": image}}}
+        output = [json.dumps([{"Endpoints": {"docker": {"Host": first_run.SOCKET}}}]),
+                  json.dumps({"OSType": "linux", "ID": engine}),
+                  json.dumps([{"Id": image, "Config": {}}]), json.dumps(config)]
+        for choice in ("NO", EOFError(), "YES", None):
+            with self.subTest(choice=choice), patch.dict(first_run.os.environ, {}, clear=True), \
+                 patch.object(first_run.platform, "system", return_value="Linux"), \
+                 patch.object(first_run.platform, "release", return_value="microsoft-standard-WSL2"), \
+                 patch.object(first_run, "validate"), patch.object(first_run.os, "chdir"), \
+                 patch.object(Path, "read_text", return_value="certificate"), \
+                 patch.object(first_run.ssl, "PEM_cert_to_DER_cert", return_value=b"der"), \
+                 patch.object(first_run, "run", side_effect=output), \
+                 patch.object(first_run, "check_project", return_value=True), \
+                 patch.object(first_run, "verify_project", side_effect=["a" * 64, "b" * 64]), \
+                 patch.object(first_run, "request", side_effect=[(200, None, b'{"status":"ok"}'),
+                                                                  (303, "/admin/onboarding", b"")]), \
+                 patch.object(first_run.sys.stdin, "isatty", return_value=choice is not None), \
+                 patch.object(first_run.sys.stdout, "isatty", return_value=True), \
+                 patch("builtins.input", side_effect=choice if isinstance(choice, Exception) else None,
+                       return_value=choice), \
+                 patch.object(first_run.subprocess, "run", side_effect=AssertionError("claim attempted")):
+                self.assertEqual(first_run.main(self.args), 1)
 
     def test_engine_mismatch_stops_before_image_or_startup(self):
         self.args[3] = hashlib.sha256(b"der").hexdigest()
@@ -129,22 +181,34 @@ class FirstRunTests(unittest.TestCase):
                      "Config": {"Labels": {"com.docker.compose.project": "p",
                                             "com.docker.compose.service": "router",
                                             "com.docker.compose.container-number": "1"},
-                                "Entrypoint": None,
+                                "Entrypoint": None, "User": "10001:10001",
                                 "Env": ["SR_HEALTHCHECK_URL=https://127.0.0.1:8787/healthz",
                                         "SR_HEALTHCHECK_CA=/run/foundry/tls/server.crt"],
                                 "Cmd": ["--data-dir=/data", "--tls-reload-ca-cert=/run/foundry/tls/server.crt"]},
                      "HostConfig": {"NetworkMode": "p_backend", "Privileged": False,
+                                    "SecurityOpt": ["no-new-privileges:true"], "GroupAdd": [str(first_run.os.getegid())],
                                     "PortBindings": {"8787/tcp": [{"HostIp": "127.0.0.1", "HostPort": "8787"}]}},
                      "NetworkSettings": {"Networks": {"p_backend": {}}},
                      "Mounts": [{"Destination": "/data", "Type": "volume", "RW": True, "Name": "p_router-data"},
                                 {"Destination": "/run/foundry/tls", "Type": "bind", "Source": "/tls", "RW": False}]}
-        for change in ("writable", "extra", "other-distribution", "traversal", "unrelated"):
+        for change in ("writable", "extra", "other-distribution", "traversal", "unrelated",
+                       "user", "capability", "device", "pid", "seccomp"):
             with self.subTest(change=change):
                 current = json.loads(json.dumps(container))
                 if change == "writable":
                     current["Mounts"][1]["RW"] = True
                 elif change == "extra":
                     current["Mounts"].append({"Destination": "/run/foundry/mi/trust.json"})
+                elif change == "user":
+                    current["Config"]["User"] = "0:0"
+                elif change == "capability":
+                    current["HostConfig"]["CapAdd"] = ["SYS_ADMIN"]
+                elif change == "device":
+                    current["HostConfig"]["Devices"] = [{"PathOnHost": "/dev/sda"}]
+                elif change == "pid":
+                    current["HostConfig"]["PidMode"] = "host"
+                elif change == "seccomp":
+                    current["HostConfig"]["SecurityOpt"] = ["no-new-privileges:true", "seccomp=unconfined"]
                 else:
                     prefix = "/run/desktop/mnt/host/wsl/docker-desktop-bind-mounts/"
                     current["Mounts"][1]["Source"] = {
@@ -155,7 +219,15 @@ class FirstRunTests(unittest.TestCase):
                 output = [cid, "p_router-data", "network-id", json.dumps([current])]
                 with patch.object(first_run, "run", side_effect=output):
                     with self.assertRaises(ValueError):
-                        first_run.verify_project("p", "image", "/tls", config, {"Entrypoint": None}, "b" * 64, "Ubuntu")
+                        first_run.verify_project("p", "image", "/tls", config, {"Entrypoint": None, "User": "10001:10001"}, "b" * 64, "Ubuntu")
+
+    def test_translated_bind_same_inode_required(self):
+        with self.assertRaises((OSError, ValueError)):
+            first_run.verify_bind_source("/run/desktop/mnt/host/wsl/docker-desktop-bind-mounts/Ubuntu/" + "a" * 64,
+                                         "/tmp/nonexistent-foundry-private/tls", "Ubuntu")
+        with self.assertRaises(ValueError):
+            first_run.verify_bind_source("/run/desktop/mnt/host/wsl/docker-desktop-bind-mounts/Ubuntu/../bad",
+                                         "/tls", "Ubuntu")
 
     def test_fresh_start_claim_is_not_captured(self):
         self.args[3] = hashlib.sha256(b"der").hexdigest()
@@ -165,23 +237,25 @@ class FirstRunTests(unittest.TestCase):
         config = {"name": project, "services": {"router": {"image": image, "command": ["--data-dir=/data"]}},
                   "volumes": {"router-data": {"name": project + "_router-data"}},
                   "networks": {"backend": {"name": network_name}}}
-        image_config = {"Env": [], "Entrypoint": None}
+        image_config = {"Env": [], "Entrypoint": None, "User": "10001:10001"}
         container = {"State": {"Running": True}, "Image": image,
                      "Id": cid,
                      "Config": {"Labels": {"com.docker.compose.project": project,
                                             "com.docker.compose.service": "router",
                                             "com.docker.compose.container-number": "1"},
-                                "Entrypoint": None,
+                                "Entrypoint": None, "User": "10001:10001",
                                 "Env": ["SR_HEALTHCHECK_URL=https://127.0.0.1:8787/healthz",
                                         "SR_HEALTHCHECK_CA=/run/foundry/tls/server.crt"],
                                 "Cmd": ["--data-dir=/data", "--tls-reload-ca-cert=/run/foundry/tls/server.crt"]},
                      "HostConfig": {"Privileged": False, "NetworkMode": network_name,
+                                    "SecurityOpt": ["no-new-privileges:true"], "GroupAdd": [str(first_run.os.getegid())],
                                     "PortBindings": {"8787/tcp": [{"HostIp": "127.0.0.1", "HostPort": "8787"}]}},
                      "NetworkSettings": {"Networks": {network_name: {}}},
                      "Mounts": [{"Destination": "/data", "Type": "volume", "RW": True, "Name": project + "_router-data"},
                                 {"Destination": "/run/foundry/tls", "Type": "bind", "RW": False,
-                                 "Source": "/run/desktop/mnt/host/wsl/docker-desktop-bind-mounts/Ubuntu/0123456789abcdef"}]}
-        volume = {"Name": project + "_router-data", "Labels": {"com.docker.compose.project": project,
+                                 "Source": tls}]}
+        volume = {"Name": project + "_router-data", "Driver": "local", "Options": None,
+                  "Labels": {"com.docker.compose.project": project,
                                                                      "com.docker.compose.volume": "router-data"}}
         network = {"Name": network_name, "Labels": {"com.docker.compose.project": project,
                                                        "com.docker.compose.network": "backend"},
@@ -189,7 +263,8 @@ class FirstRunTests(unittest.TestCase):
         output = [json.dumps([{"Endpoints": {"docker": {"Host": first_run.SOCKET}}}]),
                   json.dumps({"OSType": "linux", "ID": engine}), json.dumps([{"Id": image, "Config": image_config}]),
                   json.dumps(config), cid, project + "_router-data", "network-id", json.dumps([container]),
-                  json.dumps([volume]), json.dumps([network]), self.args[3]]
+                  json.dumps([volume]), cid, json.dumps([network]), self.args[3]]
+        output += output[4:]
         with patch.dict(first_run.os.environ, {}, clear=True), \
              patch.object(first_run.platform, "system", return_value="Linux"), \
              patch.object(first_run.platform, "release", return_value="microsoft-standard-WSL2"), \
@@ -199,6 +274,7 @@ class FirstRunTests(unittest.TestCase):
              patch.object(first_run, "run", side_effect=output), \
              patch.object(first_run, "check_project", return_value=False), \
              patch.object(first_run, "request", side_effect=[(200, None, b'{"status":"ok"}'),
+                                                              (303, "/admin/onboarding", b""),
                                                               (303, "/admin/onboarding", b"")]), \
              patch.object(first_run.sys.stdin, "isatty", return_value=True), \
              patch.object(first_run.sys.stdout, "isatty", return_value=True), \
@@ -212,6 +288,18 @@ class FirstRunTests(unittest.TestCase):
                                         "--issue-bootstrap-claim"])
         self.assertNotIn("stdout", claim.kwargs)
         self.assertNotIn("capture_output", claim.kwargs)
+        for option in ("driver", "options", "consumer"):
+            with self.subTest(option=option):
+                bad_volume = dict(volume)
+                if option == "driver":
+                    bad_volume["Driver"] = "other"
+                elif option == "options":
+                    bad_volume["Options"] = {"device": "/other"}
+                checks = [cid, project + "_router-data", "network-id", json.dumps([container]),
+                          json.dumps([bad_volume]), cid + "\n" + "b" * 64]
+                with patch.object(first_run, "run", side_effect=checks):
+                    with self.assertRaises(ValueError):
+                        first_run.verify_project(project, image, tls, config, image_config, self.args[3], "Ubuntu")
 
 
 if __name__ == "__main__":

@@ -9,11 +9,13 @@ from pathlib import Path
 import platform
 import re
 import ssl
+import stat
 import subprocess
 import sys
 import time
 
 from local_tls_up import check_project, validate
+from local_tls_init import open_parent
 
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -53,6 +55,39 @@ def attest_container_certificate(container_id, fingerprint):
         raise ValueError("container TLS leaf fingerprint mismatch")
 
 
+def verify_bind_source(source, tls, distribution):
+    if source == tls:
+        return
+    prefix = "/run/desktop/mnt/host/wsl/docker-desktop-bind-mounts/" + distribution + "/"
+    if not source.startswith(prefix) or not re.fullmatch(r"[a-f0-9]{64}", source[len(prefix):]):
+        raise ValueError("unrecognized translated TLS bind source")
+    # WSL's shared mount is exposed under this path in Docker Desktop's VM.
+    shared = "/mnt/wsl/docker-desktop-bind-mounts/" + distribution + "/" + source[len(prefix):]
+    original_parent, original_name = open_parent(tls)
+    descriptors = [original_parent]
+    try:
+        original = os.open(original_name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=original_parent)
+        descriptors.append(original)
+        current = os.open("/", os.O_RDONLY | os.O_DIRECTORY)
+        descriptors.append(current)
+        for component in shared.strip("/").split("/"):
+            current = os.open(component, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=current)
+            descriptors.append(current)
+        for name in (None, "server.crt", "server.key"):
+            if name is None:
+                a, b = os.fstat(original), os.fstat(current)
+            else:
+                a = os.stat(name, dir_fd=original, follow_symlinks=False)
+                b = os.stat(name, dir_fd=current, follow_symlinks=False)
+                if not os.path.samestat(a, b) or not stat.S_ISREG(a.st_mode):
+                    raise ValueError("translated TLS file identity mismatch")
+            if not os.path.samestat(a, b):
+                raise ValueError("translated TLS directory identity mismatch")
+    finally:
+        for fd in reversed(descriptors):
+            os.close(fd)
+
+
 def verify_project(project, image, tls, config, image_config, fingerprint, distribution):
     label = "label=com.docker.compose.project=" + project
     ids = run("docker", "container", "ls", "--all", "--filter", label, "--quiet").splitlines()
@@ -78,29 +113,41 @@ def verify_project(project, image, tls, config, image_config, fingerprint, distr
     expected_env.update({"SR_HEALTHCHECK_URL": "https://127.0.0.1:8787/healthz",
                          "SR_HEALTHCHECK_CA": "/run/foundry/tls/server.crt"})
     actual_env = c["Config"].get("Env") or []
-    translated = (r"/run/desktop/mnt/host/wsl/docker-desktop-bind-mounts/" +
-                  re.escape(distribution) + r"/[A-Za-z0-9_-]+")
+    image_user = image_config.get("User", "")
     if (not c["State"]["Running"] or c["Image"] != image or
             labels.get("com.docker.compose.project") != project or
             labels.get("com.docker.compose.service") != "router" or
             labels.get("com.docker.compose.container-number") != "1" or
             c["Config"]["Cmd"] != expected_command or len(mounts) != 2 or
             c["Config"].get("Entrypoint") != image_config.get("Entrypoint") or
+            not re.fullmatch(r"[1-9][0-9]*(?::[0-9]+)?", image_user) or
+            c["Config"].get("User") != image_user or
             len(actual_env) != len(expected_env) or
             dict(value.split("=", 1) for value in actual_env) != expected_env or
             len(data) != 1 or data[0]["Type"] != "volume" or not data[0]["RW"] or
             data[0]["Name"] != volume_name or len(cert) != 1 or
-            cert[0]["Type"] != "bind" or
-            not (cert[0]["Source"] == tls or re.fullmatch(translated, cert[0]["Source"])) or cert[0]["RW"] or
+            cert[0]["Type"] != "bind" or cert[0]["RW"] or
             host.get("Privileged") or host.get("NetworkMode") != network_name or
+            host.get("CapAdd") or host.get("CapDrop") or host.get("Devices") or
+            host.get("DeviceRequests") or host.get("DeviceCgroupRules") or
+            host.get("PidMode") not in ("", None) or host.get("UTSMode") not in ("", None) or
+            host.get("UsernsMode") not in ("", None) or host.get("IpcMode") not in ("", None, "private", "shareable") or
+            host.get("CgroupnsMode") not in ("", None, "private") or
+            host.get("SecurityOpt") != ["no-new-privileges:true"] or
+            host.get("GroupAdd") != [str(os.getegid())] or
             host.get("PortBindings") != {"8787/tcp": [{"HostIp": "127.0.0.1", "HostPort": "8787"}]} or
             set(c["NetworkSettings"]["Networks"]) != {network_name}):
         raise ValueError("running router configuration does not match")
+    verify_bind_source(cert[0]["Source"], tls, distribution)
     volume = json.loads(run("docker", "volume", "inspect", volume_name))
     if (len(volume) != 1 or volume[0]["Name"] != volume_name or
+            volume[0].get("Driver") != "local" or volume[0].get("Options") not in (None, {}) or
             volume[0].get("Labels", {}).get("com.docker.compose.project") != project or
             volume[0].get("Labels", {}).get("com.docker.compose.volume") != "router-data"):
         raise ValueError("data volume identity mismatch")
+    consumers = run("docker", "container", "ls", "--all", "--filter", "volume=" + volume_name, "--quiet").splitlines()
+    if len(consumers) != 1 or not c["Id"].startswith(consumers[0]):
+        raise ValueError("data volume has other or ambiguous consumers")
     network = json.loads(run("docker", "network", "inspect", networks[0]))
     if (len(network) != 1 or network[0]["Name"] != network_name or
             network[0].get("Labels", {}).get("com.docker.compose.project") != project or
@@ -191,6 +238,12 @@ def main(args):
         if input("Issue one bootstrap claim to this terminal? Type YES: ") != "YES":
             print("No claim issued; onboarding incomplete.")
             return 1
+        validate(tls)
+        if verify_project(project, image, tls, config, images[0]["Config"], fingerprint, distribution) != container_id:
+            raise ValueError("router identity changed after consent")
+        status, location, _ = request("/admin", cert, fingerprint)
+        if status not in (302, 303, 307, 308) or location != "/admin/onboarding":
+            raise ValueError("administrator state changed after consent")
         # Never capture, retry, or place the claim in an argument or environment.
         result = subprocess.run(["docker", "exec", container_id, "python", "-m", "scarcity_router.control_server",
                                  "--data-dir", "/data", "--issue-bootstrap-claim"], timeout=30)
@@ -200,7 +253,7 @@ def main(args):
         print("Open https://127.0.0.1:8787/admin/onboarding only in a browser that already trusts the verified leaf.")
         print("Administrator completion and authenticated readiness are unknown.")
         return 0
-    except (OSError, ValueError, KeyError, IndexError, TypeError, json.JSONDecodeError,
+    except (OSError, EOFError, ValueError, KeyError, IndexError, TypeError, json.JSONDecodeError,
             subprocess.SubprocessError, http.client.HTTPException) as exc:
         print("First run stopped: " + str(exc), file=sys.stderr)
         return 1

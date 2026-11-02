@@ -21,7 +21,7 @@ import windows_managed_tls as managed_tls
 ROOT = Path(__file__).resolve().parent.parent
 COMPOSE_SHA256 = "1f099d26343f07e34c11232bac52e4fbbb70f424a1992c6edab2d4b1c29959a0"
 SOCKET = "unix:///var/run/docker.sock"
-MANAGED_ACTIVATED = False
+MANAGED_ACTIVATED = True
 
 
 def run(*args):
@@ -205,7 +205,7 @@ def verify_project(project, image, tls, config, image_config, fingerprint, distr
 
 
 def managed_flow(project, image, distribution):
-    """Dormant managed-volume flow; caller must enforce the custody gate first."""
+    """Managed-volume flow; caller must enforce the managed activation gate."""
     os.chdir(ROOT)
     os.environ.update(FOUNDRY_ROUTER_IMAGE=image, FOUNDRY_ROUTER_HOST="127.0.0.1",
                       FOUNDRY_TLS_DIR="/dev/null", FOUNDRY_ROUTER_PORT="8787")
@@ -227,10 +227,6 @@ def managed_flow(project, image, distribution):
                     "-c", "import os; print(str(os.geteuid())+':'+str(os.getegid()))").strip()
         if probe != "10001:10001":
             raise ValueError("image default user is not the expected non-root identity")
-        if (not all(os.isatty(fd) for fd in (0, 1, 2)) or
-                len({os.ttyname(fd) for fd in (0, 1, 2)}) != 1 or
-                os.tcgetpgrp(0) != os.getpgrp()):
-            raise ValueError("a foreground private terminal is required")
         found = managed_tls.discover_tls_volume(project, image)
         label = "label=com.docker.compose.project=" + project
         ids = run("docker", "container", "ls", "--all", "--filter", label, "--quiet").splitlines()
@@ -249,6 +245,7 @@ def managed_flow(project, image, distribution):
         fingerprint = hashlib.sha256(ssl.PEM_cert_to_DER_cert(cert)).hexdigest()
         print("Public certificate obtained from the verified local Docker volume:\n" + cert)
         print("SHA256:", fingerprint)
+        print("Certificate confirmation is public and does not issue a claim.")
         if input("Confirm this certificate and project for this session? Type YES: ") != "YES":
             raise ValueError("certificate confirmation declined")
         container_id = None
@@ -306,7 +303,10 @@ def managed_flow(project, image, distribution):
             return 0
         if status not in (302, 303, 307, 308) or location != "/admin/onboarding":
             raise ValueError("administrator state unknown")
-        if not sys.stdin.isatty() or not sys.stdout.isatty() or input("Issue one bootstrap claim to this terminal? Type YES: ") != "YES":
+        if not foreground_terminal():
+            print("SERVER_RUNNING — ADMIN_ONBOARDING_INCOMPLETE: no claim issued; container and volumes retained.")
+            return 2
+        if input("Issue one bootstrap claim to this terminal? Type YES: ") != "YES":
             print("No claim issued; onboarding incomplete.")
             return 1
         claim_terminal = attest_claim_terminal()

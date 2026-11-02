@@ -1,4 +1,4 @@
-"""Managed proposal remains separately disabled until independent review."""
+"""Managed proposal checks; activation requires independent review."""
 
 import json
 import contextlib
@@ -34,6 +34,7 @@ class ManagedIntegrationTests(unittest.TestCase):
         with patch.dict(first_run.os.environ, {}, clear=True), \
              patch.object(first_run.platform, "system", return_value="Linux"), \
              patch.object(first_run.platform, "release", return_value="microsoft-standard-WSL2"), \
+             patch.object(first_run, "MANAGED_ACTIVATED", False), \
              patch.object(first_run, "run", side_effect=result), \
              patch.object(first_run, "managed_flow") as flow:
             self.assertEqual(first_run.managed_main([self.project, self.image, "engine", "Ubuntu"]), 1)
@@ -64,9 +65,7 @@ class ManagedIntegrationTests(unittest.TestCase):
             events.append("volume")
             return "certificate"
         with patch.dict(first_run.os.environ, {}, clear=True), \
-             patch.object(first_run.os, "chdir"), patch.object(first_run.os, "isatty", return_value=True), \
-             patch.object(first_run.os, "ttyname", return_value="/dev/pts/1"), \
-             patch.object(first_run.os, "tcgetpgrp", return_value=12), patch.object(first_run.os, "getpgrp", return_value=12), \
+             patch.object(first_run.os, "chdir"), patch.object(first_run, "foreground_terminal", return_value=False), \
              patch.object(first_run, "run", side_effect=command), \
              patch.object(managed, "discover_tls_volume", return_value=(self.volume, self.nonce)), \
              patch.object(managed, "verify_tls_volume", side_effect=verify), \
@@ -77,28 +76,38 @@ class ManagedIntegrationTests(unittest.TestCase):
             self.assertEqual(first_run.managed_flow(self.project, self.image, "Ubuntu"), 0)
         self.assertEqual(events, ["volume", "volume", "start"])
 
-    def test_non_terminal_refuses_before_volume_discovery(self):
+    def test_non_terminal_starts_but_does_not_issue_claim_when_onboarding_needed(self):
+        output = io.StringIO()
         with patch.dict(first_run.os.environ, {}, clear=True), patch.object(first_run.os, "chdir"), \
-             patch.object(first_run.os, "isatty", return_value=False), \
-             patch.object(first_run, "run", side_effect=self.command), \
-             patch.object(managed, "discover_tls_volume") as discover:
-            with self.assertRaises(ValueError):
-                first_run.managed_flow(self.project, self.image, "Ubuntu")
-            discover.assert_not_called()
+             patch.object(first_run, "foreground_terminal", return_value=False), \
+             patch.object(first_run, "run", side_effect=self.command) as docker, \
+             patch.object(managed, "discover_tls_volume", return_value=(self.volume, self.nonce)), \
+             patch.object(managed, "verify_tls_volume", return_value="certificate"), \
+             patch.object(first_run, "verify_project", return_value=self.cid), \
+             patch.object(first_run.ssl, "PEM_cert_to_DER_cert", return_value=b"der"), \
+             patch("builtins.input", return_value="YES") as prompt, \
+             patch.object(first_run, "request", side_effect=[(200, None, b'{"status":"ok"}'),
+                 (303, "/admin/onboarding", b"")]), \
+             patch.object(first_run.subprocess, "run", side_effect=AssertionError("claim attempted")), \
+             contextlib.redirect_stdout(output):
+            self.assertEqual(first_run.managed_flow(self.project, self.image, "Ubuntu"), 2)
+        self.assertEqual(prompt.call_count, 1)
+        self.assertIn("SERVER_RUNNING — ADMIN_ONBOARDING_INCOMPLETE", output.getvalue())
+        self.assertIn("does not issue a claim", output.getvalue())
+        self.assertTrue(any(call.args[:2] == ("docker", "start") for call in docker.call_args_list))
+        self.assertFalse(any("rm" in call.args for call in docker.call_args_list))
 
     def test_confirmation_refusal_and_certificate_change_never_start(self):
-        for choice, certificates in (("NO", ["certificate"]), ("YES", ["certificate", "changed"])):
+        for choice, certificates in (("NO", ["certificate"]), (EOFError(), ["certificate"]), ("YES", ["certificate", "changed"])):
             with self.subTest(choice=choice), patch.dict(first_run.os.environ, {}, clear=True), \
-                 patch.object(first_run.os, "chdir"), patch.object(first_run.os, "isatty", return_value=True), \
-                 patch.object(first_run.os, "ttyname", return_value="/dev/pts/1"), \
-                 patch.object(first_run.os, "tcgetpgrp", return_value=12), patch.object(first_run.os, "getpgrp", return_value=12), \
+                 patch.object(first_run.os, "chdir"), \
                  patch.object(first_run, "run", side_effect=self.command) as docker, \
                  patch.object(managed, "discover_tls_volume", return_value=(self.volume, self.nonce)), \
                  patch.object(managed, "verify_tls_volume", side_effect=certificates), \
                  patch.object(first_run, "verify_project", return_value=self.cid), \
                  patch.object(first_run.ssl, "PEM_cert_to_DER_cert", return_value=b"der"), \
-                 patch("builtins.input", return_value=choice):
-                with self.assertRaises(ValueError):
+                 patch("builtins.input", side_effect=choice if isinstance(choice, Exception) else None, return_value=choice):
+                with self.assertRaises((ValueError, EOFError)):
                     first_run.managed_flow(self.project, self.image, "Ubuntu")
                 self.assertFalse(any(call.args[:2] == ("docker", "start") for call in docker.call_args_list))
 
@@ -108,9 +117,7 @@ class ManagedIntegrationTests(unittest.TestCase):
                 return ""
             return self.command(*args)
         with patch.dict(first_run.os.environ, {}, clear=True), \
-             patch.object(first_run.os, "chdir"), patch.object(first_run.os, "isatty", return_value=True), \
-             patch.object(first_run.os, "ttyname", return_value="/dev/pts/1"), \
-             patch.object(first_run.os, "tcgetpgrp", return_value=12), patch.object(first_run.os, "getpgrp", return_value=12), \
+             patch.object(first_run.os, "chdir"), \
              patch.object(first_run, "run", side_effect=command), \
              patch.object(managed, "discover_tls_volume", return_value=(self.volume, self.nonce)), \
              patch.object(managed, "verify_tls_volume") as verify:
@@ -141,7 +148,7 @@ class ManagedIntegrationTests(unittest.TestCase):
     def test_managed_attestation_claim_only_once_and_never_captured(self):
         for attestation, changed_tty in (("NO", False), ("UNKNOWN", False), ("RECORDING REQUIRED", False),
                                          (EOFError(), False), ("I ATTEST", False), ("I ATTEST", True)):
-            tty = ["/dev/pts/1"] * 5 + ["/dev/pts/2" if changed_tty else "/dev/pts/1"]
+            tty = ["/dev/pts/1"] * 2 + ["/dev/pts/2" if changed_tty else "/dev/pts/1"]
             with self.subTest(attestation=attestation, changed_tty=changed_tty), patch.dict(first_run.os.environ, {}, clear=True), \
                  patch.object(first_run.os, "chdir"), patch.object(first_run.os, "isatty", return_value=True), \
                  patch.object(first_run.os, "ttyname", side_effect=tty), \
@@ -172,6 +179,28 @@ class ManagedIntegrationTests(unittest.TestCase):
                 else:
                     process.assert_not_called()
 
+    def test_managed_claim_failures_never_retry(self):
+        for case in ("consent", "consent_eof", "identity", "certificate", "admin", "claim"):
+            with self.subTest(case=case), patch.dict(first_run.os.environ, {}, clear=True), \
+                 patch.object(first_run.os, "chdir"), patch.object(first_run, "foreground_terminal", return_value=True), \
+                 patch.object(first_run.os, "ttyname", return_value="/dev/pts/1"), \
+                 patch.object(first_run, "attest_claim_terminal", return_value="/dev/pts/1"), \
+                 patch.object(first_run, "run", side_effect=self.command), \
+                 patch.object(managed, "discover_tls_volume", return_value=(self.volume, self.nonce)), \
+                 patch.object(managed, "verify_tls_volume", side_effect=["certificate", "certificate", "changed" if case == "certificate" else "certificate"]), \
+                 patch.object(first_run, "verify_project", side_effect=[self.cid, self.cid, "different" if case == "identity" else self.cid]), \
+                 patch.object(first_run.ssl, "PEM_cert_to_DER_cert", side_effect=lambda cert: cert.encode()), \
+                 patch.object(first_run, "request", side_effect=[(200, None, b'{"status":"ok"}'),
+                     (303, "/admin/onboarding", b""), (303, "/admin/login" if case == "admin" else "/admin/onboarding", b"")]), \
+                 patch("builtins.input", side_effect=["YES", EOFError() if case == "consent_eof" else "NO" if case == "consent" else "YES"]), \
+                 patch.object(first_run.subprocess, "run", return_value=Mock(returncode=1)) as process:
+                if case == "consent":
+                    self.assertEqual(first_run.managed_flow(self.project, self.image, "Ubuntu"), 1)
+                else:
+                    with self.assertRaises(EOFError if case == "consent_eof" else ValueError):
+                        first_run.managed_flow(self.project, self.image, "Ubuntu")
+                self.assertEqual(process.call_count, 1 if case == "claim" else 0)
+
     @unittest.skipUnless(shutil.which("docker") and subprocess.run(
         ["docker", "compose", "version"], stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL).returncode == 0, "Docker Compose unavailable")
@@ -185,9 +214,9 @@ class ManagedIntegrationTests(unittest.TestCase):
                 return ""
             return self.command(*args)
         with patch.dict(first_run.os.environ, {"FOUNDRY_ROUTER_IMAGE": "unsafe"}, clear=True), \
-             patch.object(first_run.os, "isatty", return_value=False), \
+             patch.object(managed, "discover_tls_volume", side_effect=ValueError("stop after config")), \
              patch.object(first_run, "run", side_effect=command):
-            with self.assertRaisesRegex(ValueError, "terminal"):
+            with self.assertRaisesRegex(ValueError, "stop after config"):
                 first_run.managed_flow(self.project, self.image, "Ubuntu")
 
     @unittest.skipUnless(shutil.which("docker") and subprocess.run(

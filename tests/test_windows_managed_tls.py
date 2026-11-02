@@ -20,7 +20,7 @@ class ManagedTlsTests(unittest.TestCase):
         self.project = "test-project"
         self.image = "sha256:" + "a" * 64
         self.nonce = "b" * 32
-        self.name = "foundry-tls-" + self.nonce
+        self.name = managed.volume_name(self.project)
         labels = {managed._LABEL: "1", managed._LABEL + ".project": self.project,
                   managed._LABEL + ".image": self.image, managed._LABEL + ".nonce": self.nonce}
         self.volume = {"Name": self.name, "Driver": "local", "Options": None, "Labels": labels}

@@ -1,20 +1,22 @@
-"""Dormant managed flow tests: no custody gate is lifted."""
+"""Managed proposal remains separately disabled until independent review."""
 
-import hashlib
 import json
+import contextlib
+import io
 import os
 from pathlib import Path
 import shutil
 import socket
 import subprocess
 import sys
-import uuid
 import unittest
+import uuid
 from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 import windows_first_run as first_run
+import windows_managed_tls as managed
 
 
 class ManagedIntegrationTests(unittest.TestCase):
@@ -22,11 +24,11 @@ class ManagedIntegrationTests(unittest.TestCase):
         self.project = "isolated-test"
         self.image = "sha256:" + "a" * 64
         self.nonce = "b" * 32
-        self.volume = "foundry-tls-" + self.nonce
-        self.fingerprint = hashlib.sha256(b"der").hexdigest()
+        self.volume = managed.volume_name(self.project)
         self.cid = "c" * 64
+        self.config = {"name": self.project, "services": {"router": {"image": self.image}}}
 
-    def test_gate_blocks_managed_flow(self):
+    def test_separate_gate_blocks_managed_flow(self):
         result = [json.dumps([{"Endpoints": {"docker": {"Host": first_run.SOCKET}}}]),
                   json.dumps({"OSType": "linux", "ID": "engine"}), json.dumps([{"Id": self.image}])]
         with patch.dict(first_run.os.environ, {}, clear=True), \
@@ -34,129 +36,250 @@ class ManagedIntegrationTests(unittest.TestCase):
              patch.object(first_run.platform, "release", return_value="microsoft-standard-WSL2"), \
              patch.object(first_run, "run", side_effect=result), \
              patch.object(first_run, "managed_flow") as flow:
-            self.assertEqual(first_run.managed_main([self.project, self.image, "-", "-", "-", "engine", "-", "Ubuntu"]), 1)
+            self.assertEqual(first_run.managed_main([self.project, self.image, "engine", "Ubuntu"]), 1)
             flow.assert_not_called()
 
-    def test_stopped_resume_checks_fingerprint_before_start(self):
+    def command(self, *args):
+        if "config" in args:
+            return json.dumps(self.config)
+        if args[:3] == ("docker", "image", "inspect"):
+            return json.dumps([{"Id": self.image, "Config": {"User": "scarcity"}}])
+        if args[:2] == ("docker", "run"):
+            return "10001:10001"
+        if args[:3] == ("docker", "container", "ls"):
+            return self.cid
+        if args[:2] == ("docker", "inspect"):
+            return json.dumps([{"State": {"Running": False}}])
+        if args[:2] == ("docker", "start"):
+            return self.cid
+        raise AssertionError(args)
+
+    def test_stopped_recovery_requires_consent_and_reverification(self):
         events = []
-        config = {"name": self.project, "services": {"router": {"image": self.image}}}
         def command(*args):
-            if "config" in args:
-                return json.dumps(config)
-            if args[:3] == ("docker", "container", "ls"):
-                return self.cid
-            if args[:3] == ("docker", "image", "inspect"):
-                return json.dumps([{"Id": self.image, "Config": {"User": "scarcity"}}])
-            if args[:2] == ("docker", "run"):
-                return "10001:10001"
-            if args[:2] == ("docker", "inspect"):
-                return json.dumps([{"State": {"Running": False}}])
             if args[:2] == ("docker", "start"):
                 events.append("start")
-                return self.cid
-            raise AssertionError(args)
-        def volume(*args, **kwargs):
+            return self.command(*args)
+        def verify(*args, **kwargs):
             events.append("volume")
             return "certificate"
         with patch.dict(first_run.os.environ, {}, clear=True), \
-             patch.object(first_run.os, "chdir"), patch.object(first_run, "run", side_effect=command), \
+             patch.object(first_run.os, "chdir"), patch.object(first_run.os, "isatty", return_value=True), \
+             patch.object(first_run.os, "ttyname", return_value="/dev/pts/1"), \
+             patch.object(first_run.os, "tcgetpgrp", return_value=12), patch.object(first_run.os, "getpgrp", return_value=12), \
+             patch.object(first_run, "run", side_effect=command), \
+             patch.object(managed, "discover_tls_volume", return_value=(self.volume, self.nonce)), \
+             patch.object(managed, "verify_tls_volume", side_effect=verify), \
              patch.object(first_run, "verify_project", return_value=self.cid), \
-             patch.object(first_run.managed_tls, "verify_tls_volume", side_effect=volume), \
              patch.object(first_run.ssl, "PEM_cert_to_DER_cert", return_value=b"der"), \
+             patch("builtins.input", return_value="YES"), \
              patch.object(first_run, "request", side_effect=[(200, None, b'{"status":"ok"}'), (303, "/admin/login", b"")]):
-            self.assertEqual(first_run.managed_flow(self.project, self.image, self.fingerprint, self.volume,
-                                                    self.nonce, self.project, "Ubuntu"), 0)
-        self.assertEqual(events, ["volume", "start"])
-        events.clear()
-        with patch.dict(first_run.os.environ, {}, clear=True), \
-             patch.object(first_run.os, "chdir"), patch.object(first_run, "run", side_effect=command), \
-             patch.object(first_run, "verify_project", return_value=self.cid), \
-             patch.object(first_run.managed_tls, "verify_tls_volume", side_effect=volume), \
-             patch.object(first_run.ssl, "PEM_cert_to_DER_cert", return_value=b"der"):
-            with self.assertRaises(ValueError):
-                first_run.managed_flow(self.project, self.image, "0" * 64, self.volume,
-                                       self.nonce, self.project, "Ubuntu")
-        self.assertEqual(events, ["volume"])
+            self.assertEqual(first_run.managed_flow(self.project, self.image, "Ubuntu"), 0)
+        self.assertEqual(events, ["volume", "volume", "start"])
 
-    def test_existing_project_never_initializes_a_new_volume(self):
-        config = {"name": self.project, "services": {"router": {"image": self.image}}}
-        results = [json.dumps(config), json.dumps([{"Id": self.image, "Config": {"User": "scarcity"}}]), "10001:10001"]
-        with patch.dict(first_run.os.environ, {}, clear=True), \
-             patch.object(first_run.os, "chdir"), patch.object(first_run, "run", side_effect=results), \
-             patch.object(first_run, "check_project", return_value=True), \
-             patch.object(first_run.managed_tls, "initialize_tls_volume") as initialize:
+    def test_non_terminal_refuses_before_volume_discovery(self):
+        with patch.dict(first_run.os.environ, {}, clear=True), patch.object(first_run.os, "chdir"), \
+             patch.object(first_run.os, "isatty", return_value=False), \
+             patch.object(first_run, "run", side_effect=self.command), \
+             patch.object(managed, "discover_tls_volume") as discover:
             with self.assertRaises(ValueError):
-                first_run.managed_flow(self.project, self.image, "-", "-", "-", "-", "Ubuntu")
-            initialize.assert_not_called()
+                first_run.managed_flow(self.project, self.image, "Ubuntu")
+            discover.assert_not_called()
+
+    def test_confirmation_refusal_and_certificate_change_never_start(self):
+        for choice, certificates in (("NO", ["certificate"]), ("YES", ["certificate", "changed"])):
+            with self.subTest(choice=choice), patch.dict(first_run.os.environ, {}, clear=True), \
+                 patch.object(first_run.os, "chdir"), patch.object(first_run.os, "isatty", return_value=True), \
+                 patch.object(first_run.os, "ttyname", return_value="/dev/pts/1"), \
+                 patch.object(first_run.os, "tcgetpgrp", return_value=12), patch.object(first_run.os, "getpgrp", return_value=12), \
+                 patch.object(first_run, "run", side_effect=self.command) as docker, \
+                 patch.object(managed, "discover_tls_volume", return_value=(self.volume, self.nonce)), \
+                 patch.object(managed, "verify_tls_volume", side_effect=certificates), \
+                 patch.object(first_run, "verify_project", return_value=self.cid), \
+                 patch.object(first_run.ssl, "PEM_cert_to_DER_cert", return_value=b"der"), \
+                 patch("builtins.input", return_value=choice):
+                with self.assertRaises(ValueError):
+                    first_run.managed_flow(self.project, self.image, "Ubuntu")
+                self.assertFalse(any(call.args[:2] == ("docker", "start") for call in docker.call_args_list))
+
+    def test_unattached_volume_is_not_adopted(self):
+        def command(*args):
+            if args[:3] == ("docker", "container", "ls"):
+                return ""
+            return self.command(*args)
+        with patch.dict(first_run.os.environ, {}, clear=True), \
+             patch.object(first_run.os, "chdir"), patch.object(first_run.os, "isatty", return_value=True), \
+             patch.object(first_run.os, "ttyname", return_value="/dev/pts/1"), \
+             patch.object(first_run.os, "tcgetpgrp", return_value=12), patch.object(first_run.os, "getpgrp", return_value=12), \
+             patch.object(first_run, "run", side_effect=command), \
+             patch.object(managed, "discover_tls_volume", return_value=(self.volume, self.nonce)), \
+             patch.object(managed, "verify_tls_volume") as verify:
+            with self.assertRaises(ValueError):
+                first_run.managed_flow(self.project, self.image, "Ubuntu")
+            verify.assert_not_called()
 
     @unittest.skipUnless(shutil.which("docker") and subprocess.run(
         ["docker", "compose", "version"], stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL).returncode == 0, "Docker Compose unavailable")
-    def test_real_compose_merge_contains_no_host_tls_bind(self):
+    def test_compose_uses_empty_explicit_env_file(self):
         original = first_run.run
-        config_calls = []
+        def command(*args):
+            if args[:2] == ("docker", "compose") and "config" in args:
+                self.assertNotEqual(args[args.index("--env-file") + 1], ".env")
+                return original(*args)
+            if args[:3] == ("docker", "container", "ls"):
+                return ""
+            return self.command(*args)
+        with patch.dict(first_run.os.environ, {"FOUNDRY_ROUTER_IMAGE": "unsafe"}, clear=True), \
+             patch.object(first_run.os, "isatty", return_value=False), \
+             patch.object(first_run, "run", side_effect=command):
+            with self.assertRaisesRegex(ValueError, "terminal"):
+                first_run.managed_flow(self.project, self.image, "Ubuntu")
+
+    @unittest.skipUnless(shutil.which("docker") and subprocess.run(
+        ["docker", "compose", "version"], stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL).returncode == 0, "Docker Compose unavailable")
+    def test_real_compose_override_has_readonly_volume_not_bind(self):
+        original = first_run.run
+        configs = []
         def command(*args):
             if args[:2] == ("docker", "compose") and "config" in args:
                 result = original(*args)
-                config_calls.append(json.loads(result))
+                configs.append(json.loads(result))
                 return result
             if args[:3] == ("docker", "container", "ls"):
                 return ""
-            if args[:3] == ("docker", "image", "inspect"):
-                return json.dumps([{"Id": self.image, "Config": {"User": "scarcity"}}])
-            if args[:2] == ("docker", "run"):
-                return "10001:10001"
             if args[:2] == ("docker", "compose") and "up" in args:
                 return ""
-            raise AssertionError(args)
+            return self.command(*args)
         with patch.dict(first_run.os.environ, {}, clear=True), \
+             patch.object(first_run.os, "isatty", return_value=True), \
+             patch.object(first_run.os, "ttyname", return_value="/dev/pts/1"), \
+             patch.object(first_run.os, "tcgetpgrp", return_value=12), patch.object(first_run.os, "getpgrp", return_value=12), \
              patch.object(first_run, "run", side_effect=command), \
              patch.object(first_run, "check_project", return_value=False), \
              patch.object(first_run, "verify_project", return_value=self.cid), \
-             patch.object(first_run.managed_tls, "_inspect"), \
-             patch.object(first_run.managed_tls, "verify_tls_volume", return_value="certificate"), \
+             patch.object(managed, "discover_tls_volume", return_value=None), \
+             patch.object(managed, "initialize_tls_volume", return_value=(self.volume, self.nonce, "certificate")), \
+             patch.object(managed, "verify_tls_volume", return_value="certificate"), \
+             patch.object(managed, "_inspect"), \
              patch.object(first_run.ssl, "PEM_cert_to_DER_cert", return_value=b"der"), \
+             patch("builtins.input", return_value="YES"), \
              patch.object(first_run, "request", side_effect=[(200, None, b'{"status":"ok"}'), (303, "/admin/login", b"")]):
-            self.assertEqual(first_run.managed_flow(self.project, self.image, self.fingerprint, self.volume,
-                                                    self.nonce, self.project, "Ubuntu"), 0)
-        tls = [m for m in config_calls[-1]["services"]["router"]["volumes"] if m["target"] == "/run/foundry/tls"]
+            self.assertEqual(first_run.managed_flow(self.project, self.image, "Ubuntu"), 0)
+        tls = [m for m in configs[-1]["services"]["router"]["volumes"] if m["target"] == "/run/foundry/tls"]
         self.assertEqual(len(tls), 1)
         self.assertEqual(tls[0]["type"], "volume")
         self.assertTrue(tls[0]["read_only"])
 
-    @unittest.skipUnless(os.environ.get("FOUNDRY_TEST_MANAGED_TLS_IMAGE"), "requires explicit isolated Docker test image")
-    def test_isolated_real_start_and_stopped_recovery(self):
+    def test_discovery_refuses_conflicts_and_unexpected_project_volumes(self):
+        for outputs in ([self.volume, ""], ["", "other"], [self.volume + "\nother", self.volume + "\nother"]):
+            with self.subTest(outputs=outputs), patch.object(managed, "_run", side_effect=outputs):
+                with self.assertRaises(ValueError):
+                    managed.discover_tls_volume(self.project, self.image)
+
+    def test_timeout_never_deletes_resources(self):
+        with patch.object(managed, "_run", side_effect=subprocess.TimeoutExpired("docker", 1)) as run:
+            with self.assertRaises(subprocess.TimeoutExpired):
+                managed.discover_tls_volume(self.project, self.image)
+        self.assertFalse(any("rm" in call.args[0] for call in run.call_args_list))
+
+    @unittest.skipUnless(os.environ.get("FOUNDRY_TEST_MANAGED_TLS_IMAGE") ==
+                         "sha256:adcba8a8c65ceb23103c6de7629948ef0b54cd80bcabd4d41f9f9db1fa6fee97",
+                         "requires explicit prepared Docker Desktop test image")
+    def test_real_docker_fresh_conflicts_and_stopped_recovery(self):
+        # Direct internal API test only: the production entrypoint guard is not changed.
         image = os.environ["FOUNDRY_TEST_MANAGED_TLS_IMAGE"]
-        project = "foundry-managed-test-" + uuid.uuid4().hex[:12]
-        with socket.socket() as probe:
+        project = "foundry-managed-test-" + uuid.uuid4().hex
+        name = managed.volume_name(project)
+        extra = name + "-conflict"
+        consumer = project + "-consumer"
+        label = "label=com.docker.compose.project=" + project
+        env = {k: v for k, v in os.environ.items() if not k.startswith(("COMPOSE_", "FOUNDRY_", "DOCKER_"))}
+        env["DOCKER_HOST"] = first_run.SOCKET
+        with socket.socket() as port:
             try:
-                probe.bind(("127.0.0.1", 8787))
+                port.bind(("127.0.0.1", 8787))
             except OSError:
                 self.skipTest("loopback test port is occupied")
-        volume, nonce, cert = first_run.managed_tls.initialize_tls_volume(project, image)
-        fingerprint = hashlib.sha256(first_run.ssl.PEM_cert_to_DER_cert(cert)).hexdigest()
-        label = "label=com.docker.compose.project=" + project
-        try:
-            self.assertEqual(first_run.managed_flow(project, image, fingerprint, volume, nonce, project, "Ubuntu"), 1)
-            ids = first_run.run("docker", "container", "ls", "--all", "--filter", label, "--quiet").splitlines()
-            self.assertEqual(len(ids), 1)
-            before = json.loads(first_run.run("docker", "inspect", ids[0]))[0]
-            first_run.run("docker", "stop", ids[0])
-            self.assertEqual(first_run.managed_flow(project, image, fingerprint, volume, nonce, project, "Ubuntu"), 1)
-            after = json.loads(first_run.run("docker", "inspect", ids[0]))[0]
-            self.assertEqual(before["Id"], after["Id"])
-            self.assertTrue(after["State"]["Running"])
-        finally:
-            # Only names scoped to this random project and the created TLS volume are removed.
-            ids = first_run.run("docker", "container", "ls", "--all", "--filter", label, "--quiet").splitlines()
-            for cid in ids:
-                subprocess.run(["docker", "rm", "-f", cid], check=True, stdout=subprocess.DEVNULL)
-            for kind in ("network", "volume"):
-                names = first_run.run("docker", kind, "ls", "--filter", label, "--format", "{{.Name}}").splitlines()
-                for name in names:
-                    subprocess.run(["docker", kind, "rm", name], check=True, stdout=subprocess.DEVNULL)
-            first_run.managed_tls._inspect(project, image, volume, nonce)
-            subprocess.run(["docker", "volume", "rm", volume], check=True, stdout=subprocess.DEVNULL)
+        def docker(*args):
+            return subprocess.run(["docker", *args], check=True, text=True, stdout=subprocess.PIPE,
+                                  stderr=subprocess.DEVNULL, timeout=120).stdout.strip()
+        with patch.dict(os.environ, env, clear=True):
+            info = json.loads(docker("info", "--format", "{{json .}}"))
+            self.assertEqual((info.get("OSType"), info.get("Name")), ("linux", "docker-desktop"))
+            self.assertEqual(json.loads(docker("image", "inspect", image))[0]["Id"], image)
+            for kind in ("container", "network", "volume"):
+                args = [kind, "ls"] + (["--all"] if kind == "container" else [])
+                self.assertFalse(docker(*args, "--filter", label, "--quiet"))
+            self.assertNotIn(name, docker("volume", "ls", "--quiet").splitlines())
+            self.assertNotIn(extra, docker("volume", "ls", "--quiet").splitlines())
+            try:
+                def flow():
+                    output = io.StringIO()
+                    with patch.object(os, "isatty", return_value=True), \
+                         patch.object(os, "ttyname", return_value="/dev/pts/test"), \
+                         patch.object(os, "tcgetpgrp", return_value=42), patch.object(os, "getpgrp", return_value=42), \
+                         patch.object(sys.stdin, "isatty", return_value=True), patch.object(output, "isatty", return_value=True), \
+                         patch("builtins.input", side_effect=["YES", "NO"]) as consent, \
+                         contextlib.redirect_stdout(output):
+                        result = first_run.managed_flow(project, image, "Ubuntu")
+                    self.assertEqual(consent.call_count, 2)
+                    self.assertNotIn("PRIVATE KEY", output.getvalue())
+                    return result
+                self.assertEqual(flow(), 1)
+                ids = docker("container", "ls", "--all", "--filter", label, "--quiet").splitlines()
+                self.assertEqual(len(ids), 1)
+                cid = ids[0]
+                before = json.loads(docker("inspect", cid))[0]
+                self.assertEqual(before["Image"], image)
+                mounts = before["Mounts"]
+                tls = [m for m in mounts if m["Destination"] == "/run/foundry/tls"]
+                self.assertEqual(len(tls), 1)
+                self.assertEqual((tls[0]["Type"], tls[0]["Name"], tls[0]["RW"]), ("volume", name, False))
+                self.assertFalse(any(m["Type"] == "bind" for m in mounts))
+                self.assertTrue(before["State"]["Running"])
+                docker("stop", cid)
+                # A stopped foreign consumer must also block recovery.
+                docker("create", "--name", consumer, "--label", "foundry.test.owner=" + project,
+                       "--network", "none", "--tmpfs", "/data:rw,noexec,nosuid,size=1m",
+                       "--mount", "type=volume,src=" + name + ",dst=/tls,readonly,volume-nocopy",
+                       "--entrypoint", "python", image, "-c", "pass")
+                with self.assertRaises(ValueError):
+                    flow()
+                self.assertFalse(json.loads(docker("inspect", cid))[0]["State"]["Running"])
+                docker("rm", consumer)
+                docker("volume", "create", "--label", managed._LABEL + ".project=" + project, extra)
+                with self.assertRaises(ValueError):
+                    flow()
+                self.assertFalse(json.loads(docker("inspect", cid))[0]["State"]["Running"])
+                docker("volume", "rm", extra)
+                self.assertEqual(flow(), 1)
+                after = json.loads(docker("inspect", cid))[0]
+                self.assertEqual(before["Id"], after["Id"])
+                self.assertTrue(after["State"]["Running"])
+                self.assertEqual(managed.discover_tls_volume(project, image)[0], name)
+            finally:
+                # The random, pre-checked project and labels scope cleanup to this test.
+                consumers = docker("container", "ls", "--all", "--filter", "label=foundry.test.owner=" + project,
+                                   "--quiet").splitlines()
+                for item in consumers:
+                    docker("rm", "-f", item)
+                for item in docker("container", "ls", "--all", "--filter", label, "--quiet").splitlines():
+                    docker("rm", "-f", item)
+                for kind in ("network", "volume"):
+                    for item in docker(kind, "ls", "--filter", label, "--quiet").splitlines():
+                        docker(kind, "rm", item)
+                names = docker("volume", "ls", "--quiet").splitlines()
+                for item in (extra, name):
+                    if item in names:
+                        data = json.loads(docker("volume", "inspect", item))[0]
+                        self.assertEqual(data.get("Labels", {}).get(managed._LABEL + ".project"), project)
+                        docker("volume", "rm", item)
+                for kind in ("container", "network", "volume"):
+                    args = [kind, "ls"] + (["--all"] if kind == "container" else [])
+                    self.assertFalse(docker(*args, "--filter", label, "--quiet"))
+                self.assertFalse(set((extra, name)) & set(docker("volume", "ls", "--quiet").splitlines()))
 
 
 if __name__ == "__main__":

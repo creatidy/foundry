@@ -21,6 +21,7 @@ import windows_managed_tls as managed_tls
 ROOT = Path(__file__).resolve().parent.parent
 COMPOSE_SHA256 = "1f099d26343f07e34c11232bac52e4fbbb70f424a1992c6edab2d4b1c29959a0"
 SOCKET = "unix:///var/run/docker.sock"
+MANAGED_ACTIVATED = False
 
 
 def run(*args):
@@ -175,7 +176,7 @@ def verify_project(project, image, tls, config, image_config, fingerprint, distr
     return ids[0]
 
 
-def managed_flow(project, image, fingerprint, volume, nonce, adoption, distribution):
+def managed_flow(project, image, distribution):
     """Dormant managed-volume flow; caller must enforce the custody gate first."""
     os.chdir(ROOT)
     os.environ.update(FOUNDRY_ROUTER_IMAGE=image, FOUNDRY_ROUTER_HOST="127.0.0.1",
@@ -198,30 +199,39 @@ def managed_flow(project, image, fingerprint, volume, nonce, adoption, distribut
                     "-c", "import os; print(str(os.geteuid())+':'+str(os.getegid()))").strip()
         if probe != "10001:10001":
             raise ValueError("image default user is not the expected non-root identity")
-        if volume == nonce == fingerprint == "-":
-            if adoption != "-" or check_project(project, config):
-                raise ValueError("project is not fresh")
-            name, token, cert = managed_tls.initialize_tls_volume(project, image)
-            print("Managed TLS volume:", name, "nonce:", token)
-            print("Public certificate, not automatically trusted:\n" + cert)
-            print("Independently verify its fingerprint before explicitly resuming; no router was started.")
-            return 1
-        managed_tls._check_input(project, image, volume, nonce)
-        if adoption != project or not re.fullmatch(r"[a-f0-9]{64}", fingerprint):
-            raise ValueError("explicit project adoption and independently verified fingerprint required")
+        if (not all(os.isatty(fd) for fd in (0, 1, 2)) or
+                len({os.ttyname(fd) for fd in (0, 1, 2)}) != 1 or
+                os.tcgetpgrp(0) != os.getpgrp()):
+            raise ValueError("a foreground private terminal is required")
+        found = managed_tls.discover_tls_volume(project, image)
         label = "label=com.docker.compose.project=" + project
         ids = run("docker", "container", "ls", "--all", "--filter", label, "--quiet").splitlines()
         if len(ids) > 1:
             raise ValueError("project has extra containers")
+        if found is None:
+            if ids or check_project(project, config):
+                raise ValueError("project is not fresh")
+            volume, nonce, cert = managed_tls.initialize_tls_volume(project, image)
+        else:
+            if not ids:
+                raise ValueError("unattached managed TLS volume requires manual inspection")
+            volume, nonce = found
+            cert = managed_tls.verify_tls_volume(project, image, volume, nonce,
+                                                  allowed_consumer=ids[0] if ids else None)
+        fingerprint = hashlib.sha256(ssl.PEM_cert_to_DER_cert(cert)).hexdigest()
+        print("Public certificate obtained from the verified local Docker volume:\n" + cert)
+        print("SHA256:", fingerprint)
+        if input("Confirm this certificate and project for this session? Type YES: ") != "YES":
+            raise ValueError("certificate confirmation declined")
         container_id = None
         if ids:
             container_id = verify_project(project, image, "", config, images[0]["Config"], fingerprint,
                                           distribution, managed_volume=volume, allow_stopped=True)
         elif check_project(project, config):
             raise ValueError("orphaned or ambiguous project resources")
-        cert = managed_tls.verify_tls_volume(project, image, volume, nonce, allowed_consumer=container_id)
-        if hashlib.sha256(ssl.PEM_cert_to_DER_cert(cert)).hexdigest() != fingerprint:
-            raise ValueError("independent TLS fingerprint mismatch")
+        current = managed_tls.verify_tls_volume(project, image, volume, nonce, allowed_consumer=container_id)
+        if current != cert:
+            raise ValueError("TLS certificate changed after confirmation")
         if container_id:
             state = json.loads(run("docker", "inspect", container_id))[0]["State"]
             if not state["Running"]:
@@ -290,13 +300,13 @@ def managed_flow(project, image, fingerprint, volume, nonce, adoption, distribut
 
 
 def managed_main(args):
-    if len(args) != 8:
-        print("Expected managed project, image, fingerprint, volume, nonce, engine, adoption and distribution.", file=sys.stderr)
+    if len(args) != 4:
+        print("Expected managed project, image, engine and distribution.", file=sys.stderr)
         return 1
-    project, image, fingerprint, volume, nonce, engine, adoption, distribution = args
+    project, image, engine, distribution = args
     if (not re.fullmatch(r"[a-z0-9][a-z0-9_-]*", project) or
             not re.fullmatch(r"sha256:[a-f0-9]{64}", image) or
-            not re.fullmatch(r"[A-Za-z0-9:_-]+", engine) or adoption not in ("-", project) or
+            not re.fullmatch(r"[A-Za-z0-9:_-]+", engine) or
             not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", distribution)):
         print("Invalid managed first-run inputs.", file=sys.stderr)
         return 1
@@ -319,11 +329,12 @@ def managed_main(args):
         images = json.loads(run("docker", "image", "inspect", image))
         if len(images) != 1 or images[0].get("Id") != image:
             raise ValueError("verified image ID unavailable")
-        require_safe_key_custody()
-        return managed_flow(project, image, fingerprint, volume, nonce, adoption, distribution)
+        if not MANAGED_ACTIVATED:
+            raise ValueError("managed TLS activation is disabled pending independent review")
+        return managed_flow(project, image, distribution)
     except (OSError, EOFError, ValueError, KeyError, IndexError, TypeError, RuntimeError,
-            subprocess.SubprocessError, http.client.HTTPException) as exc:
-        print("Managed first run stopped: " + str(exc), file=sys.stderr)
+            subprocess.SubprocessError, http.client.HTTPException):
+        print("Managed first run stopped; inspect the local project and prerequisites.", file=sys.stderr)
         return 1
 
 
@@ -426,8 +437,8 @@ def main(args):
         print("Administrator completion and authenticated readiness are unknown.")
         return 0
     except (OSError, EOFError, ValueError, KeyError, IndexError, TypeError, json.JSONDecodeError,
-            subprocess.SubprocessError, http.client.HTTPException) as exc:
-        print("First run stopped: " + str(exc), file=sys.stderr)
+            subprocess.SubprocessError, http.client.HTTPException):
+        print("First run stopped; inspect the local project and prerequisites.", file=sys.stderr)
         return 1
 
 

@@ -5,9 +5,7 @@ param(
     [string]$TlsDirectory = '-',
     [string]$TlsFingerprint = '-',
     [string]$AdoptProject = '-',
-    [switch]$ManagedTls,
-    [string]$TlsVolume = '-',
-    [string]$TlsNonce = '-'
+    [switch]$ManagedTls
 )
 
 $ErrorActionPreference = 'Stop'
@@ -22,10 +20,10 @@ if ($Distribution -notmatch '^[A-Za-z0-9][A-Za-z0-9_.-]*$' -or
     $ImageId -cnotmatch '^sha256:[a-f0-9]{64}$' -or
     ($TlsFingerprint -cne '-' -and $TlsFingerprint -cnotmatch '^[a-f0-9]{64}$') -or
     ($AdoptProject -cne '-' -and $AdoptProject -cne $Project) -or
-    (-not $ManagedTls -and ($TlsDirectory -cnotmatch '^/[A-Za-z0-9_./-]+$' -or $TlsFingerprint -ceq '-')) -or
-    ($ManagedTls -and ($TlsDirectory -cne '-' -or
-        ($TlsVolume -cne '-' -and $TlsVolume -cnotmatch '^foundry-tls-[a-f0-9]{32}$') -or
-        ($TlsNonce -cne '-' -and $TlsNonce -cnotmatch '^[a-f0-9]{32}$'))) -or
+    ($TlsDirectory -ceq '-' -and ($PSBoundParameters.ContainsKey('TlsDirectory') -or
+        $PSBoundParameters.ContainsKey('TlsFingerprint') -or $PSBoundParameters.ContainsKey('AdoptProject'))) -or
+    ($TlsDirectory -cne '-' -and ($ManagedTls -or $TlsDirectory -cnotmatch '^/[A-Za-z0-9_./-]+$' -or $TlsFingerprint -ceq '-')) -or
+    ($TlsDirectory -ceq '-' -and ($TlsFingerprint -cne '-' -or $AdoptProject -cne '-')) -or
     $PSScriptRoot -notmatch '^[A-Za-z]:\\[A-Za-z0-9_ .\\-]+$') {
     Write-Error 'Unsafe argument or non-local Windows script path; see README.'
     exit 1
@@ -64,8 +62,8 @@ if ($LASTEXITCODE -ne 0 -or $linuxScript -isnot [string] -or
     Write-Error 'Cannot resolve the Windows-local entrypoint in the selected WSL distribution.'
     exit 1
 }
-if ($ManagedTls) {
-    & $wsl --distribution $Distribution --exec python3 "$linuxScript" managed $Project $ImageId $TlsFingerprint $TlsVolume $TlsNonce $info.ID $AdoptProject $Distribution
+if ($TlsDirectory -ceq '-') {
+    & $wsl --distribution $Distribution --exec python3 "$linuxScript" managed $Project $ImageId $info.ID $Distribution
 } else {
     & $wsl --distribution $Distribution --exec python3 "$linuxScript" $Project $ImageId $TlsDirectory $TlsFingerprint $info.ID $AdoptProject $Distribution
 }

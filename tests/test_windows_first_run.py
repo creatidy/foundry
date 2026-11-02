@@ -2,6 +2,8 @@
 
 import importlib.util
 import hashlib
+import contextlib
+import io
 import json
 from pathlib import Path
 import sys
@@ -50,6 +52,25 @@ class FirstRunTests(unittest.TestCase):
         self.assertIn("npipe:////./pipe/dockerDesktopLinuxEngine", source)
         self.assertNotIn("Invoke-Expression", source)
         self.assertNotIn("-ExecutionPolicy", source)
+
+    def test_explicit_legacy_parameters_cannot_fall_back_to_managed(self):
+        source = (ROOT / "scripts/windows-first-run.ps1").read_text()
+        for name in ("TlsDirectory", "TlsFingerprint", "AdoptProject"):
+            self.assertIn("$PSBoundParameters.ContainsKey('" + name + "')", source)
+        self.assertIn("if ($TlsDirectory -ceq '-')", source)
+
+    def test_errors_do_not_log_tls_paths(self):
+        secret_path = "/home/user/private/secret-key-directory"
+        args = self.args.copy()
+        args[2] = secret_path
+        output = io.StringIO()
+        with patch.dict(first_run.os.environ, {}, clear=True), \
+             patch.object(first_run.platform, "system", return_value="Linux"), \
+             patch.object(first_run.platform, "release", return_value="microsoft-standard-WSL2"), \
+             patch.object(first_run, "validate", side_effect=OSError("failure at " + secret_path)), \
+             contextlib.redirect_stderr(output):
+            self.assertEqual(first_run.main(args), 1)
+        self.assertNotIn(secret_path, output.getvalue())
 
     def test_remote_override_rejected_before_tls_or_docker(self):
         with patch.object(first_run.platform, "system", return_value="Linux"), \

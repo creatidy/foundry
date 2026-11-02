@@ -4,6 +4,7 @@ The Docker daemon, its administrators, and the independently verified image
 are trusted. No private key bytes leave the volume or the helper containers.
 """
 
+import hashlib
 import json
 import re
 import secrets
@@ -88,8 +89,36 @@ def _run(args, *, quiet=False):
 def _check_input(project, image, name, nonce):
     if (not re.fullmatch(r"[a-z0-9][a-z0-9_-]*", project) or
             not re.fullmatch(r"sha256:[a-f0-9]{64}", image) or
-            not re.fullmatch(r"[a-f0-9]{32}", nonce) or name != "foundry-tls-" + nonce):
+            not re.fullmatch(r"[a-f0-9]{32}", nonce) or name != volume_name(project)):
         raise ValueError("invalid managed TLS identity")
+
+
+def volume_name(project):
+    if not re.fullmatch(r"[a-z0-9][a-z0-9_-]*", project):
+        raise ValueError("invalid managed TLS project")
+    return "foundry-tls-" + hashlib.sha256(project.encode("ascii")).hexdigest()
+
+
+def discover_tls_volume(project, image):
+    """Find a project volume, rejecting ambiguous or mismatched identities."""
+    name = volume_name(project)
+    names = _run(["docker", "volume", "ls", "--quiet"]).splitlines()
+    tagged = _run(["docker", "volume", "ls", "--filter",
+                   "label=" + _LABEL + ".project=" + project, "--quiet"]).splitlines()
+    if len(names) != len(set(names)) or len(tagged) != len(set(tagged)):
+        raise ValueError("ambiguous managed TLS volume list")
+    if name not in names:
+        if tagged:
+            raise ValueError("unexpected project TLS volume")
+        return None
+    if tagged != [name]:
+        raise ValueError("conflicting project TLS volume")
+    volumes = json.loads(_run(["docker", "volume", "inspect", name]))
+    if len(volumes) != 1:
+        raise ValueError("ambiguous managed TLS volume")
+    nonce = (volumes[0].get("Labels") or {}).get(_LABEL + ".nonce", "")
+    _check_input(project, image, name, nonce)
+    return name, nonce
 
 
 def _inspect(project, image, name, nonce, allowed_consumer=None):
@@ -137,7 +166,7 @@ def initialize_tls_volume(project, image):
     provenance first. The returned name and nonce identify the owned volume.
     """
     nonce = secrets.token_hex(16)
-    name = "foundry-tls-" + nonce
+    name = volume_name(project)
     _check_input(project, image, name, nonce)
     labels = {_LABEL: "1", _LABEL + ".project": project, _LABEL + ".image": image,
               _LABEL + ".nonce": nonce}

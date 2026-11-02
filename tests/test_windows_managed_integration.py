@@ -40,6 +40,18 @@ class ManagedIntegrationTests(unittest.TestCase):
             self.assertEqual(first_run.managed_main([self.project, self.image, "engine", "Ubuntu"]), 1)
             flow.assert_not_called()
 
+    def test_wrong_engine_stops_before_image_or_startup(self):
+        result = [json.dumps([{"Endpoints": {"docker": {"Host": first_run.SOCKET}}}]),
+                  json.dumps({"OSType": "linux", "ID": "different-engine"})]
+        with patch.dict(first_run.os.environ, {}, clear=True), \
+             patch.object(first_run.platform, "system", return_value="Linux"), \
+             patch.object(first_run.platform, "release", return_value="microsoft-standard-WSL2"), \
+             patch.object(first_run, "run", side_effect=result) as run, \
+             patch.object(first_run, "managed_flow") as flow:
+            self.assertEqual(first_run.managed_main([self.project, self.image, "engine", "Ubuntu"]), 1)
+            self.assertEqual(run.call_count, 2)
+            flow.assert_not_called()
+
     def command(self, *args):
         if "config" in args:
             return json.dumps(self.config)

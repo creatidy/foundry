@@ -33,13 +33,14 @@ orchestrator, model selector, facts producer or shared authority database.
 - The owner's Windows workstation is not disposable. Starting Windows-native
   processes from WSL affects the host even with mocks, synthetic data or temporary
   files. Read-only repository analysis does not authorize host-interacting tests.
-- Do not use generated, encoded, compressed, obfuscated or dynamically reconstructed
-  PowerShell to work around execution-policy or path restrictions, failed launches or
-  endpoint-security detections. This includes generated `-EncodedCommand` payloads,
-  Base64/gzip loaders, dynamic `[scriptblock]::Create(...)` and in-memory execution
-  to bypass a restricted `-File` path. These patterns are not inherently malicious;
-  inspect existing code statically but do not execute it until a separate
-  owner-authorized remediation and validation plan exists.
+- Do not execute generated, encoded, compressed, obfuscated or dynamically
+  reconstructed PowerShell, or existing code containing such techniques, for any
+  purpose until a separate owner-authorized remediation and validation plan exists.
+  Examples include generated `-EncodedCommand` payloads, Base64/gzip loaders,
+  dynamic `[scriptblock]::Create(...)` and in-memory execution used to bypass a
+  restricted `-File` path. These patterns are not inherently malicious and may be
+  inspected statically. Never use them to work around execution-policy or path
+  restrictions, failed launches or endpoint-security detections.
 - Obtain explicit advance owner approval for each batch of tests that starts native
   Windows processes, changes Windows state or may interact with endpoint protection.
   Describe exact commands and executables, affected machine and account, expected

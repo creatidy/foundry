@@ -67,34 +67,6 @@ def require_safe_key_custody():
     raise ValueError("Docker Desktop TLS key custody is not established; startup and adoption refused")
 
 
-def foreground_terminal():
-    try:
-        return (all(os.isatty(fd) for fd in (0, 1, 2)) and
-                len({os.ttyname(fd) for fd in (0, 1, 2)}) == 1 and
-                os.tcgetpgrp(0) == os.getpgrp() and
-                sys.stdin.isatty() and sys.stdout.isatty() and sys.stderr.isatty())
-    except OSError:
-        return False
-
-
-def attest_claim_terminal():
-    if not foreground_terminal():
-        return None
-    terminal = os.ttyname(0)
-    print("Operator assertion only: terminal privacy and authorization are not automatically verified.")
-    print("Do not proceed if any status is unknown, recording is mandatory, or you are not authorized.")
-    print("Do not disable or bypass organizational monitoring.")
-    try:
-        answer = input("Attest that this terminal is genuinely private and local; no PowerShell transcription, "
-                       "terminal, screen or enterprise recording, API or remote relay or capture is active; "
-                       "and you are authorized to issue the claim. Type I ATTEST: ")
-    except EOFError:
-        return None
-    if answer != "I ATTEST" or not foreground_terminal() or os.ttyname(0) != terminal:
-        return None
-    return terminal
-
-
 def verify_container_user(container_id, image_user):
     if not re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_.-]*(?::[A-Za-z0-9_][A-Za-z0-9_.-]*)?", image_user):
         raise ValueError("invalid image user")
@@ -144,6 +116,8 @@ def verify_project(project, image, tls, config, image_config, fingerprint, distr
     if len(container) != 1:
         raise ValueError("router container identity is ambiguous")
     c = container[0]
+    if not re.fullmatch(r"[a-f0-9]{64}", c.get("Id", "")) or not c["Id"].startswith(ids[0]):
+        raise ValueError("router container identity mismatch")
     labels = c["Config"]["Labels"]
     expected_command = config["services"]["router"]["command"] + [
         "--tls-reload-ca-cert=/run/foundry/tls/server.crt"]
@@ -201,7 +175,7 @@ def verify_project(project, image, tls, config, image_config, fingerprint, distr
     if running:
         verify_container_user(ids[0], image_user)
         attest_container_certificate(ids[0], fingerprint)
-    return ids[0]
+    return c["Id"]
 
 
 def managed_flow(project, image, distribution):
@@ -299,13 +273,22 @@ def managed_flow(project, image, distribution):
             raise ValueError("verified TLS liveness check failed")
         status, location, _ = request("/admin", cert, fingerprint)
         if status in (302, 303, 307, 308) and location == "/admin/login":
-            print("Administrator configured; no claim issued. Authenticated readiness unknown.")
+            print("Administrator configured. Login: https://127.0.0.1:8787/admin/login")
+            print("Use a browser that trusts the verified certificate. Authenticated readiness unknown.")
             return 0
         if status not in (302, 303, 307, 308) or location != "/admin/onboarding":
             raise ValueError("administrator state unknown")
-        print("SERVER_RUNNING — ADMIN_ONBOARDING_INCOMPLETE: experimental mode does not issue "
-              "administrator claims or support onboarding; container and volumes retained. "
-              "Authenticated readiness is unknown.")
+        if verify_project(project, image, "", config, images[0]["Config"], fingerprint,
+                          distribution, managed_volume=volume) != container_id:
+            raise ValueError("router identity changed before instructions")
+        print("SERVER_RUNNING — ADMIN_ONBOARDING_INCOMPLETE: no administrator exists.")
+        print("Personally run this command in a trusted private native Windows terminal, "
+              "not through an agent or recorded session:")
+        print("docker.exe --host npipe:////./pipe/dockerDesktopLinuxEngine exec " + container_id +
+              " python -m scarcity_router.control_server --data-dir /data --issue-bootstrap-claim")
+        print("Open https://127.0.0.1:8787/admin/onboarding in a browser that trusts the verified certificate.")
+        print("Copy the 15-minute claim into the form and set the administrator password there. "
+              "Do not put the claim in logs, URLs, files or shared channels.")
         return 2
 
 
@@ -424,34 +407,8 @@ def main(args):
         if status not in (302, 303, 307, 308) or location != "/admin/onboarding":
             print("Administrator state is unknown or already configured; no claim issued.")
             return 1
-        print("SR redirected to onboarding: no administrator was observed at this instant.")
-        if not sys.stdin.isatty() or not sys.stdout.isatty():
-            print("Private interactive terminal required; no claim issued.")
-            return 1
-        if input("Issue one bootstrap claim to this terminal? Type YES: ") != "YES":
-            print("No claim issued; onboarding incomplete.")
-            return 1
-        claim_terminal = attest_claim_terminal()
-        if not claim_terminal:
-            print("Terminal attestation not established; no claim issued.")
-            return 1
-        validate(tls)
-        if verify_project(project, image, tls, config, images[0]["Config"], fingerprint, distribution) != container_id:
-            raise ValueError("router identity changed after consent")
-        status, location, _ = request("/admin", cert, fingerprint)
-        if status not in (302, 303, 307, 308) or location != "/admin/onboarding":
-            raise ValueError("administrator state changed after consent")
-        if not foreground_terminal() or os.ttyname(0) != claim_terminal:
-            raise ValueError("terminal changed after attestation")
-        # Never capture, retry, or place the claim in an argument or environment.
-        result = subprocess.run(["docker", "exec", container_id, "python", "-m", "scarcity_router.control_server",
-                                 "--data-dir", "/data", "--issue-bootstrap-claim"], timeout=30)
-        if result.returncode:
-            print("Claim issuance failed; no automatic retry.", file=sys.stderr)
-            return 1
-        print("Open https://127.0.0.1:8787/admin/onboarding only in a browser that already trusts the verified leaf.")
-        print("Administrator completion and authenticated readiness are unknown.")
-        return 0
+        print("Onboarding is unavailable on the legacy bind-mounted path.")
+        return 1
     except (OSError, EOFError, ValueError, KeyError, IndexError, TypeError, json.JSONDecodeError,
             subprocess.SubprocessError, http.client.HTTPException):
         print("First run stopped; inspect the local project and prerequisites.", file=sys.stderr)

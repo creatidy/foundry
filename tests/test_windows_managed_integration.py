@@ -84,7 +84,7 @@ class ManagedIntegrationTests(unittest.TestCase):
             events.append("volume")
             return "certificate"
         with patch.dict(first_run.os.environ, {}, clear=True), \
-             patch.object(first_run.os, "chdir"), patch.object(first_run, "foreground_terminal", return_value=False), \
+             patch.object(first_run.os, "chdir"), \
              patch.object(first_run, "run", side_effect=command), \
              patch.object(managed, "discover_tls_volume", return_value=(self.volume, self.nonce)), \
              patch.object(managed, "verify_tls_volume", side_effect=verify), \
@@ -95,10 +95,9 @@ class ManagedIntegrationTests(unittest.TestCase):
             self.assertEqual(first_run.managed_flow(self.project, self.image, "Ubuntu"), 0)
         self.assertEqual(events, ["volume", "volume", "start"])
 
-    def test_non_terminal_starts_but_does_not_issue_claim_when_onboarding_needed(self):
+    def test_onboarding_prints_exact_manual_command_without_issuing_claim(self):
         output = io.StringIO()
         with patch.dict(first_run.os.environ, {}, clear=True), patch.object(first_run.os, "chdir"), \
-             patch.object(first_run, "foreground_terminal", return_value=False), \
              patch.object(first_run, "run", side_effect=self.command) as docker, \
              patch.object(managed, "discover_tls_volume", return_value=(self.volume, self.nonce)), \
              patch.object(managed, "verify_tls_volume", return_value="certificate"), \
@@ -113,34 +112,12 @@ class ManagedIntegrationTests(unittest.TestCase):
         self.assertEqual(prompt.call_count, 1)
         self.assertIn("SERVER_RUNNING — ADMIN_ONBOARDING_INCOMPLETE", output.getvalue())
         self.assertIn("does not issue a claim", output.getvalue())
+        command = ("docker.exe --host npipe:////./pipe/dockerDesktopLinuxEngine exec " + self.cid +
+                   " python -m scarcity_router.control_server --data-dir /data --issue-bootstrap-claim")
+        self.assertEqual([line for line in output.getvalue().splitlines() if line.startswith("docker.exe")], [command])
+        self.assertFalse(any("--issue-bootstrap-claim" in call.args for call in docker.call_args_list))
         self.assertTrue(any(call.args[:2] == ("docker", "start") for call in docker.call_args_list))
         self.assertFalse(any("rm" in call.args for call in docker.call_args_list))
-
-    def test_foreground_affirmative_cannot_issue_claim(self):
-        output = io.StringIO()
-        with patch.dict(first_run.os.environ, {}, clear=True), patch.object(first_run.os, "chdir"), \
-             patch.object(first_run.os, "isatty", return_value=True), \
-             patch.object(first_run.os, "ttyname", return_value="/dev/pts/1"), \
-             patch.object(first_run.os, "tcgetpgrp", return_value=12), patch.object(first_run.os, "getpgrp", return_value=12), \
-             patch.object(first_run.sys.stdin, "isatty", return_value=True), \
-             patch.object(output, "isatty", return_value=True), \
-             patch.object(first_run.sys.stderr, "isatty", return_value=True), \
-             patch.object(first_run, "run", side_effect=self.command), \
-             patch.object(managed, "discover_tls_volume", return_value=(self.volume, self.nonce)), \
-             patch.object(managed, "verify_tls_volume", return_value="certificate"), \
-             patch.object(first_run, "verify_project", return_value=self.cid), \
-             patch.object(first_run.ssl, "PEM_cert_to_DER_cert", return_value=b"der"), \
-             patch.object(first_run, "request", side_effect=[(200, None, b'{"status":"ok"}'),
-                 (303, "/admin/onboarding", b"")]), \
-             patch("builtins.input", side_effect=["YES", "YES", "I ATTEST"]) as prompt, \
-             patch.object(first_run, "attest_claim_terminal", return_value="/dev/pts/1") as attestation, \
-             patch.object(first_run.subprocess, "run", side_effect=AssertionError("claim attempted")) as process, \
-             contextlib.redirect_stdout(output):
-            self.assertEqual(first_run.managed_flow(self.project, self.image, "Ubuntu"), 2)
-        self.assertEqual(prompt.call_count, 1)
-        attestation.assert_not_called()
-        self.assertIn("experimental mode does not issue", output.getvalue())
-        process.assert_not_called()
 
     def test_confirmation_refusal_and_certificate_change_never_start(self):
         for choice, certificates in (("NO", ["certificate"]), (EOFError(), ["certificate"]), ("YES", ["certificate", "changed"])):
@@ -170,26 +147,6 @@ class ManagedIntegrationTests(unittest.TestCase):
                 first_run.managed_flow(self.project, self.image, "Ubuntu")
             verify.assert_not_called()
 
-    def test_attestation_refusal_unknown_recording_eof_and_non_tty(self):
-        for response in ("NO", "UNKNOWN", "RECORDING REQUIRED", "", EOFError()):
-            with self.subTest(response=response), patch.object(first_run, "foreground_terminal", return_value=True), \
-                 patch.object(first_run.os, "ttyname", return_value="/dev/pts/1"), \
-                 patch("builtins.input", side_effect=response if isinstance(response, Exception) else None,
-                       return_value=response):
-                self.assertFalse(first_run.attest_claim_terminal())
-        with patch.object(first_run, "foreground_terminal", return_value=False), \
-             patch("builtins.input") as prompt:
-            self.assertFalse(first_run.attest_claim_terminal())
-            prompt.assert_not_called()
-        with patch.object(first_run, "foreground_terminal", side_effect=[True, False]), \
-             patch.object(first_run.os, "ttyname", return_value="/dev/pts/1"), \
-             patch("builtins.input", return_value="I ATTEST"):
-            self.assertFalse(first_run.attest_claim_terminal())
-        with patch.object(first_run, "foreground_terminal", return_value=True), \
-             patch.object(first_run.os, "ttyname", side_effect=["/dev/pts/1", "/dev/pts/2"]), \
-             patch("builtins.input", return_value="I ATTEST"):
-            self.assertFalse(first_run.attest_claim_terminal())
-
     def test_admin_status_is_not_confused_with_onboarding(self):
         for status, location, expected in ((303, "/admin/login", 0), (303, "/admin/onboarding", 2),
                                            (200, None, None), (303, "/other", None),
@@ -215,6 +172,9 @@ class ManagedIntegrationTests(unittest.TestCase):
                 self.assertEqual(prompt.call_count, 1)
                 self.assertEqual("ADMIN_ONBOARDING_INCOMPLETE" in output.getvalue(), expected == 2)
                 self.assertEqual("Administrator configured" in output.getvalue(), expected == 0)
+                if expected != 2:
+                    self.assertNotIn("docker.exe", output.getvalue())
+                    self.assertNotIn("--issue-bootstrap-claim", output.getvalue())
 
     @unittest.skipUnless(shutil.which("docker") and subprocess.run(
         ["docker", "compose", "version"], stdout=subprocess.DEVNULL,

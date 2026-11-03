@@ -130,7 +130,7 @@ class FirstRunTests(unittest.TestCase):
                 discover.assert_not_called()
                 verify.assert_not_called()
 
-    def test_consent_denial_eof_and_revalidation_refuse_claim(self):
+    def test_legacy_onboarding_refuses_claim_without_prompt(self):
         self.args[3] = hashlib.sha256(b"der").hexdigest()
         self.args[5] = self.args[0]
         project, image, _, _, engine, _, _ = self.args
@@ -138,8 +138,7 @@ class FirstRunTests(unittest.TestCase):
         output = [json.dumps([{"Endpoints": {"docker": {"Host": first_run.SOCKET}}}]),
                   json.dumps({"OSType": "linux", "ID": engine}),
                   json.dumps([{"Id": image, "Config": {}}]), json.dumps(config)]
-        for choice in ("NO", EOFError(), "YES", None):
-            with self.subTest(choice=choice), patch.dict(first_run.os.environ, {}, clear=True), \
+        with patch.dict(first_run.os.environ, {}, clear=True), \
                  patch.object(first_run.platform, "system", return_value="Linux"), \
                  patch.object(first_run.platform, "release", return_value="microsoft-standard-WSL2"), \
                  patch.object(first_run, "validate"), patch.object(first_run.os, "chdir"), \
@@ -148,13 +147,10 @@ class FirstRunTests(unittest.TestCase):
                  patch.object(first_run, "run", side_effect=output), \
                  patch.object(first_run, "require_safe_key_custody"), \
                  patch.object(first_run, "check_project", return_value=True), \
-                 patch.object(first_run, "verify_project", side_effect=["a" * 64, "b" * 64]), \
+                  patch.object(first_run, "verify_project", return_value="a" * 64), \
                  patch.object(first_run, "request", side_effect=[(200, None, b'{"status":"ok"}'),
                                                                   (303, "/admin/onboarding", b"")]), \
-                 patch.object(first_run.sys.stdin, "isatty", return_value=choice is not None), \
-                 patch.object(first_run.sys.stdout, "isatty", return_value=True), \
-                 patch("builtins.input", side_effect=choice if isinstance(choice, Exception) else None,
-                       return_value=choice), \
+                  patch("builtins.input", side_effect=AssertionError("unexpected prompt")), \
                  patch.object(first_run.subprocess, "run", side_effect=AssertionError("claim attempted")):
                 self.assertEqual(first_run.main(self.args), 1)
 
@@ -311,7 +307,7 @@ class FirstRunTests(unittest.TestCase):
             first_run.verify_bind_source("/run/desktop/mnt/host/wsl/docker-desktop-bind-mounts/Ubuntu/../bad",
                                          "/tls", "Ubuntu")
 
-    def test_fresh_start_claim_is_not_captured(self):
+    def test_invalid_volume_and_consumer_are_refused(self):
         self.args[3] = hashlib.sha256(b"der").hexdigest()
         project, image, tls, _, engine, _, _ = self.args
         cid = "a" * 64
@@ -342,41 +338,13 @@ class FirstRunTests(unittest.TestCase):
         network = {"Name": network_name, "Labels": {"com.docker.compose.project": project,
                                                        "com.docker.compose.network": "backend"},
                    "Containers": {cid: {}}}
-        output = [json.dumps([{"Endpoints": {"docker": {"Host": first_run.SOCKET}}}]),
-                  json.dumps({"OSType": "linux", "ID": engine}), json.dumps([{"Id": image, "Config": image_config}]),
-                  json.dumps(config), cid, project + "_router-data", "network-id", json.dumps([container]),
-                  json.dumps([volume]), cid, json.dumps([network]),
-                  json.dumps({"users": [["scarcity", 10001, 10001]], "groups": [["scarcity", 10001]],
-                              "uids": [10001] * 3, "gids": [10001] * 3, "supplementary": [10001, first_run.os.getegid()],
-                              "pid1": "Uid:\t10001\t10001\t10001\t10001\nGid:\t10001\t10001\t10001\t10001\nGroups:\t" + str(first_run.os.getegid()) + " 10001\n"}),
-                  self.args[3]]
-        output += output[4:]
-        with patch.dict(first_run.os.environ, {}, clear=True), \
-             patch.object(first_run.platform, "system", return_value="Linux"), \
-             patch.object(first_run.platform, "release", return_value="microsoft-standard-WSL2"), \
-             patch.object(first_run, "validate"), patch.object(first_run.os, "chdir"), \
-             patch.object(Path, "read_text", return_value="certificate"), \
-             patch.object(first_run.ssl, "PEM_cert_to_DER_cert", return_value=b"der"), \
-             patch.object(first_run, "run", side_effect=output), \
-             patch.object(first_run, "require_safe_key_custody"), \
-             patch.object(first_run, "check_project", return_value=False), \
-             patch.object(first_run, "request", side_effect=[(200, None, b'{"status":"ok"}'),
-                                                              (303, "/admin/onboarding", b""),
-                                                              (303, "/admin/onboarding", b"")]), \
-             patch.object(first_run.sys.stdin, "isatty", return_value=True), \
-             patch.object(first_run.sys.stdout, "isatty", return_value=True), \
-             patch.object(first_run, "foreground_terminal", return_value=True), \
-             patch.object(first_run.os, "ttyname", return_value="/dev/pts/1"), \
-             patch("builtins.input", side_effect=["YES", "I ATTEST"]), \
-             patch.object(first_run.subprocess, "run", return_value=Mock(returncode=0)) as process:
-            self.assertEqual(first_run.main(self.args), 0)
-        self.assertEqual(process.call_count, 2)
-        claim = process.call_args_list[1]
-        self.assertEqual(claim.args[0], ["docker", "exec", cid, "python", "-m",
-                                        "scarcity_router.control_server", "--data-dir", "/data",
-                                        "--issue-bootstrap-claim"])
-        self.assertNotIn("stdout", claim.kwargs)
-        self.assertNotIn("capture_output", claim.kwargs)
+        for substituted in ("b" * 64, cid[:12] + ";id", cid[:12]):
+            with self.subTest(substituted=substituted):
+                changed = dict(container, Id=substituted)
+                checks = [cid, project + "_router-data", "network-id", json.dumps([changed])]
+                with patch.object(first_run, "run", side_effect=checks):
+                    with self.assertRaisesRegex(ValueError, "container identity mismatch"):
+                        first_run.verify_project(project, image, tls, config, image_config, self.args[3], "Ubuntu")
         for option in ("driver", "options", "consumer"):
             with self.subTest(option=option):
                 bad_volume = dict(volume)

@@ -13,6 +13,8 @@ orchestrator, model selector, facts producer or shared authority database.
 - Do not create, move or rewrite product repositories as a side effect.
 - Record decisions in this repository only for Foundry packaging and integration;
   source components own their own APIs, behavior, tests, data and credentials.
+- Target ordinary feature PRs at `develop`; use `main` for controlled integration
+  and promotions from `develop`.
 - No `main` promotion, release, deployment, external credentials or DNS changes
   without explicit authority.
 

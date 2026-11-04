@@ -176,10 +176,13 @@ class ManagedIntegrationTests(unittest.TestCase):
                     self.assertNotIn("docker.exe", output.getvalue())
                     self.assertNotIn("--issue-bootstrap-claim", output.getvalue())
 
-    @unittest.skipUnless(shutil.which("docker") and subprocess.run(
-        ["docker", "compose", "version"], stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL).returncode == 0, "Docker Compose unavailable")
+    @unittest.skipUnless(os.environ.get("FOUNDRY_TEST_COMPOSE_CONFIG") == "1",
+                         "requires separately authorized Docker Compose integration")
     def test_compose_uses_empty_explicit_env_file(self):
+        if not shutil.which("docker") or subprocess.run(
+            ["docker", "compose", "version"], stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL, timeout=30).returncode != 0:
+            self.skipTest("Docker Compose unavailable")
         original = first_run.run
         def command(*args):
             if args[:2] == ("docker", "compose") and "config" in args:
@@ -194,10 +197,13 @@ class ManagedIntegrationTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "stop after config"):
                 first_run.managed_flow(self.project, self.image, "Ubuntu")
 
-    @unittest.skipUnless(shutil.which("docker") and subprocess.run(
-        ["docker", "compose", "version"], stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL).returncode == 0, "Docker Compose unavailable")
+    @unittest.skipUnless(os.environ.get("FOUNDRY_TEST_COMPOSE_CONFIG") == "1",
+                         "requires separately authorized Docker Compose integration")
     def test_real_compose_override_has_readonly_volume_not_bind(self):
+        if not shutil.which("docker") or subprocess.run(
+            ["docker", "compose", "version"], stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL, timeout=30).returncode != 0:
+            self.skipTest("Docker Compose unavailable")
         original = first_run.run
         configs = []
         def command(*args):

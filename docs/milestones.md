@@ -9,9 +9,9 @@ Do not treat a documentation-only plan or synthetic fixture as a deployed integr
 - [x] Document current functionality, external dependencies and trust boundaries.
 - [x] Create `Creatidy/foundry` on canonical Forgejo and publish the bootstrap.
 - [ ] Publish reviewed integration changes.
-- [ ] Verify rendered Compose using Docker from an inspected exact SR image and a publicly trusted certificate.
-- [ ] Verify first-run admin onboarding, denied unauthorized calls, native Windows/WSL access, and actual authenticated execution with an authorized resource.
-- [ ] Resolve zero-touch TLS / standard Docker Desktop UX, without changing global Docker settings behind the owner's back. The M0 Compose is not yet an installer.
+- [ ] **Local target:** on each supported native Linux, Windows WSL2/Ubuntu and Docker option, an ordinary user can install and start Foundry, open the local UI, complete first-administrator onboarding and use authenticated SR functionality, including execution with an authorized resource, without manually managing certificates, Docker image hashes or network settings. No such complete installer is delivered yet.
+- [ ] Verify actual installation, first-run and restart, persistent identity/configuration/data, safe update and recovery, denied unauthorized access and local-only network boundaries on each supported platform. Docker bridge HTTP requires an accepted and verified SR #224 contract; native Linux/WSL work can proceed independently.
+- [ ] **Advanced TLS:** separately verify operator-managed certificates, hostname and chain validation, renewal/reload, authenticated operation and secure failures for supported remote, LAN/VPN and distributed deployments. Do not require this certificate lifecycle for basic local onboarding.
 
 ## M1 — evidence integration
 

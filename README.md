@@ -8,6 +8,8 @@ Foundry is the public **deployment and integration product**. It does not own ro
 
 **Status: M0 bootstrap — NOT a completed or production-ready integrated installation.** The current Compose file describes only the existing Scarcity Router server, with explicit pre-provisioned TLS and an explicitly supplied image. Apart from the separate local test leaf generator below, this repository does **not** implement certificate issuance or renewal, a MI update job, a Kernel runner, or a connected Console. No integrated end-to-end operation has been established.
 
+**Direction, not delivered:** the owner-selected default is a simple local HTTP installation without certificates or manual image IDs or network setup, for native Linux, Windows WSL2/Ubuntu and Docker. Docker bridge HTTP requires a future verified SR security contract and is not supported by the current Compose. Advanced and distributed deployments retain verified TLS with operator-managed certificates. The experimental Windows certificate-import proposal in [PR #14](https://forgejo.creatidy.com/Creatidy/foundry/pulls/14) is superseded as the default onboarding direction; it has not been integrated. See the [deployment matrix and security conditions](docs/architecture.md#target-deployment-topology).
+
 ## Repositories and ownership
 
 | Component | Canonical Forgejo repository | Foundry role |
@@ -22,7 +24,7 @@ Foundry is the public **deployment and integration product**. It does not own ro
 
 ## M0 compose — deliberately not zero-touch
 
-The provisional [`compose.yaml`](compose.yaml) requires **an existing SR image and a publicly trusted hostname-matching certificate/key**. The private-CA case requires a separately accepted trust-bootstrap path; it is not supported by the M0 Compose. This avoids reviving unsafe plaintext communication across Docker bridges. Even when the host port is bound to `127.0.0.1`, Docker publication alone is NOT proof of LAN non-reachability; server-side TLS and authorization remain mandatory.
+The provisional [`compose.yaml`](compose.yaml), not the future local installer, requires **an existing SR image and a publicly trusted hostname-matching certificate/key**. The private-CA case requires a separately accepted trust-bootstrap path; it is not supported by this Compose path. Even when the host port is bound to `127.0.0.1`, Docker publication alone is NOT proof of LAN non-reachability; server-side TLS and authorization remain mandatory under the current SR contract.
 
 1. Build an SR image from an inspected exact canonical Forgejo revision and supply its explicit reference in `.env` (`FOUNDRY_ROUTER_IMAGE`). The image must support `--tls-reload-hostname`: the inspected SR revision `209f7d39f3ecebbd1b98b11d7c44c63192fe50a4` supports it, while its first parent (the prior `develop` tip) does not. This is a source compatibility check, not an installation acceptance. No SR release was published as of 2026-10-31; this bootstrap does not clone, build or publish an image.
 2. Provide an existing certificate chain and private key readable by SR's non-root container identity. Set `FOUNDRY_TLS_DIR` to the absolute directory containing `server.crt` and `server.key`. Do not add secrets to Git.

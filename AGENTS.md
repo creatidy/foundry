@@ -30,6 +30,16 @@ orchestrator, model selector, facts producer or shared authority database.
   source are frozen. Exact review/CI/merge authority comes from current canonical
   repository policy, not this bootstrap.
 
+## Architecture choices
+
+- Check standard Linux, Docker, WSL and existing product capabilities first;
+  compare the simplest feasible alternatives before choosing a design.
+- Separate user requirements, security requirements and current implementation
+  limitations. Identify the exact threat or contract justifying complexity, and
+  assess installation steps and ongoing maintenance.
+- Do not turn an incidental implementation constraint into a permanent product
+  requirement; reject new infrastructure unless a concrete need is demonstrated.
+
 ## Host security and test execution
 
 - The owner's Windows workstation is not disposable. Starting Windows-native

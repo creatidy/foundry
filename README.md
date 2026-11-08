@@ -8,7 +8,31 @@ Foundry is the public **deployment and integration product**. It does not own ro
 
 **Status: M0 bootstrap — NOT a completed or production-ready integrated installation.** The current Compose file describes only the existing Scarcity Router server, with explicit pre-provisioned TLS and an explicitly supplied image. Apart from the separate local test leaf generator below, this repository does **not** implement certificate issuance or renewal, a MI update job, a Kernel runner, or a connected Console. No integrated end-to-end operation has been established.
 
-**Direction, not delivered:** the owner-selected default is a simple local HTTP installation without certificates or manual image IDs or network setup, for native Linux, Windows WSL2/Ubuntu and Docker. Docker bridge HTTP requires a future verified SR security contract and is not supported by the current Compose. Advanced and distributed deployments retain verified TLS with operator-managed certificates. The experimental Windows certificate-import proposal in [PR #14](https://forgejo.creatidy.com/Creatidy/foundry/pulls/14) is superseded as the default onboarding direction; it has not been integrated. See the [deployment matrix and security conditions](docs/architecture.md#target-deployment-topology).
+The owner-selected default is a simple local HTTP installation without certificates or manual image IDs or network setup, for native Linux, Windows WSL2/Ubuntu and Docker. The native launcher below requires a separately prepared SR runtime; it is not a complete installer. Docker bridge HTTP requires a future verified SR security contract and is not supported by the current Compose. Advanced and distributed deployments retain verified TLS with operator-managed certificates. The experimental Windows certificate-import proposal in [PR #14](https://forgejo.creatidy.com/Creatidy/foundry/pulls/14) is superseded as the default onboarding direction; it has not been integrated. See the [deployment matrix and security conditions](docs/architecture.md#target-deployment-topology).
+
+## Native Linux startup
+
+Prepare an SR Python 3.12+ environment from the inspected canonical [SR source](https://forgejo.creatidy.com/Creatidy/scarcity-router) and its dependencies using SR's installation instructions. SR is not published to PyPI. The launcher targets the full server contract inspected at SR revision `c16cc1db29f3828b3f9e8d05b19e645cfb0c32b8`, not `scarcity-router-server`. Select the absolute path to the interpreter that imports that compatible SR package; the launcher does not install or verify it. Protect the runtime and its import environment from modification.
+
+If no suitable environment exists, SR documents `uv tool install /path/to/scarcity-router-checkout` for an inspected checkout. This explicit command installs dependencies and may access the network; review SR's instructions and the checkout first. Locate the resulting environment with `uv tool dir` and select its `scarcity-router/bin/python` interpreter. Do not install a second copy merely to use Foundry.
+
+From the Foundry checkout, start in the foreground:
+
+```sh
+./scripts/local-start.sh /absolute/path/to/sr-python
+```
+
+SR prints when its listener has bound. Open exactly `http://127.0.0.1:8787/admin`. A bind failure is an error, not an existing server to adopt. SR opens its store before binding, so a failed start can still initialize or modify state. Stop with Ctrl-C and repeat the same command to restart. The printed data directory is SR's `$XDG_DATA_HOME/scarcity-router/server` when `XDG_DATA_HOME` is absolute, otherwise `$HOME/.local/share/scarcity-router/server`. Keep the same environment and user on restart; changing them can select different state.
+
+For a fresh installation, leave the server running and open a second trusted private terminal. Run the following using the **same interpreter** and replacing the data-directory placeholder with the exact path printed at startup:
+
+```sh
+/absolute/path/to/sr-python -m scarcity_router.control_server --data-dir '/exact/path/printed/at/startup' --issue-bootstrap-claim
+```
+
+Paste the resulting one-time claim into SR's onboarding form and set the administrator password there. Do not run the claim command through an agent, a recorded terminal, or a shared channel; do not put the claim in a URL, argument, file or log. The claim expires after 15 minutes; issuing another invalidates the previous one until an administrator exists. Do not issue a claim on normal restarts.
+
+The same launcher is intended for WSL2 Ubuntu, but Windows browser access and negative external-access tests remain separately unverified; loopback forwarding alone proves neither. Native startup alone does not establish first-admin onboarding, persistent identity, unauthorized-access denial, local-only reachability, authenticated execution, or supported installation, upgrade and recovery. Those remain M0 acceptance requirements.
 
 ## Repositories and ownership
 

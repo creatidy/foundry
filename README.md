@@ -22,7 +22,9 @@ From the Foundry checkout, start in the foreground:
 ./scripts/local-start.sh /absolute/path/to/sr-python
 ```
 
-SR prints when its listener has bound. Open exactly `http://127.0.0.1:8787/admin`. A bind failure is an error, not an existing server to adopt. SR opens its store before binding, so a failed start can still initialize or modify state. Stop with Ctrl-C and repeat the same command to restart. The printed data directory is SR's `$XDG_DATA_HOME/scarcity-router/server` when `XDG_DATA_HOME` is absolute, otherwise `$HOME/.local/share/scarcity-router/server`. Keep the same environment and user on restart; changing them can select different state.
+SR prints when its listener has bound. Open exactly `http://127.0.0.1:8787/admin`. Run only one SR server per data directory, and stop it before restarting. At the inspected SR revision, even a second start that fails because the port is occupied can fence the running server's producer and disrupt its snapshot/replay operations: stop the original server and restart it to recover. A failed start can also initialize or modify state; it never adopts an existing listener. Stop with Ctrl-C and repeat the same command to restart. The printed data directory is SR's `$XDG_DATA_HOME/scarcity-router/server` when `XDG_DATA_HOME` is absolute, otherwise `$HOME/.local/share/scarcity-router/server`. Keep the same environment and user on restart; changing them can select different state.
+
+The duplicate-start hazard is tracked in [SR #253](https://forgejo.creatidy.com/Creatidy/scarcity-router/issues/253); the launcher does not enforce single-server use.
 
 For a fresh installation, leave the server running and open a second trusted private terminal. Run the following using the **same interpreter** and replacing the data-directory placeholder with the exact path printed at startup:
 

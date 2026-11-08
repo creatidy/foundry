@@ -8,7 +8,33 @@ Foundry is the public **deployment and integration product**. It does not own ro
 
 **Status: M0 bootstrap — NOT a completed or production-ready integrated installation.** The current Compose file describes only the existing Scarcity Router server, with explicit pre-provisioned TLS and an explicitly supplied image. Apart from the separate local test leaf generator below, this repository does **not** implement certificate issuance or renewal, a MI update job, a Kernel runner, or a connected Console. No integrated end-to-end operation has been established.
 
-**Direction, not delivered:** the owner-selected default is a simple local HTTP installation without certificates or manual image IDs or network setup, for native Linux, Windows WSL2/Ubuntu and Docker. Docker bridge HTTP requires a future verified SR security contract and is not supported by the current Compose. Advanced and distributed deployments retain verified TLS with operator-managed certificates. The experimental Windows certificate-import proposal in [PR #14](https://forgejo.creatidy.com/Creatidy/foundry/pulls/14) is superseded as the default onboarding direction; it has not been integrated. See the [deployment matrix and security conditions](docs/architecture.md#target-deployment-topology).
+The owner-selected default is a simple local HTTP installation without certificates or manual image IDs or network setup, for native Linux, Windows WSL2/Ubuntu and Docker. The native launcher below requires a separately prepared SR runtime; it is not a complete installer. Docker bridge HTTP requires a future verified SR security contract and is not supported by the current Compose. Advanced and distributed deployments retain verified TLS with operator-managed certificates. The experimental Windows certificate-import proposal in [PR #14](https://forgejo.creatidy.com/Creatidy/foundry/pulls/14) is superseded as the default onboarding direction; it has not been integrated. See the [deployment matrix and security conditions](docs/architecture.md#target-deployment-topology).
+
+## Native Linux startup
+
+Prepare an SR Python 3.12+ environment from the inspected canonical [SR source](https://forgejo.creatidy.com/Creatidy/scarcity-router) and its dependencies using SR's installation instructions. SR is not published to PyPI. The minimum accepted SR revision is `925ec06681c7fa085edd5015f57663e85d735768`, or a verified compatible descendant containing the SR #253 fix. The launcher invokes the full composed server, not `scarcity-router-server`. Select the absolute path to the interpreter whose ordinary imports resolve to that compatible SR package; verify the module paths and source revision, not just the unchanged `0.1.0` package version or a `PYTHONPATH` override. The launcher does not install or verify the runtime. Protect the runtime and its import environment from modification.
+
+If no suitable environment exists, SR documents `uv tool install /path/to/scarcity-router-checkout` for an inspected checkout. This explicit command installs dependencies and may access the network; review SR's instructions and the checkout first. Locate the resulting environment with `uv tool dir` and select its `scarcity-router/bin/python` interpreter. Do not install a second copy merely to use Foundry.
+
+From the Foundry checkout, start in the foreground:
+
+```sh
+./scripts/local-start.sh /absolute/path/to/sr-python
+```
+
+SR prints when its listener has bound. Open exactly `http://127.0.0.1:8787/admin`. Stop with Ctrl-C and repeat the same command to restart. The printed data directory is SR's `$XDG_DATA_HOME/scarcity-router/server` when `XDG_DATA_HOME` is absolute, otherwise `$HOME/.local/share/scarcity-router/server`. Keep the same environment and user on restart; changing them can select different state.
+
+The historical duplicate-start producer-fencing defect at SR revision `c16cc1db29f3828b3f9e8d05b19e645cfb0c32b8` was fixed in [SR #253 / PR #254](https://forgejo.creatidy.com/Creatidy/scarcity-router/pulls/254), integrated at the minimum revision above. SR now acquires exclusive server ownership before opening the store or constructing the producer. A concurrent server using the same data directory is refused without fencing the running producer's snapshot/replay operations; ownership is released on shutdown or process death. Stop any pre-fix server before upgrading: it does not participate in this ownership protocol. This protection belongs to SR, not a Foundry lock, and does not block the separate administrator claim command below. A refused duplicate never adopts the existing listener. Other startup failures can still initialize or modify state; do not assume every failed start leaves durable state unchanged.
+
+For a fresh installation, leave the server running and open a second trusted private terminal. Run the following using the **same interpreter** and replacing the data-directory placeholder with the exact path printed at startup:
+
+```sh
+/absolute/path/to/sr-python -m scarcity_router.control_server --data-dir '/exact/path/printed/at/startup' --issue-bootstrap-claim
+```
+
+Paste the resulting one-time claim into SR's onboarding form and set the administrator password there. Do not run the claim command through an agent, a recorded terminal, or a shared channel; do not put the claim in a URL, argument, file or log. The claim expires after 15 minutes; issuing another invalidates the previous one until an administrator exists. Do not issue a claim on normal restarts.
+
+The same launcher is intended for WSL2 Ubuntu, but Windows browser access and negative external-access tests remain separately unverified; loopback forwarding alone proves neither. Native startup alone does not establish first-admin onboarding, persistent identity, unauthorized-access denial, local-only reachability, authenticated execution, or supported installation, upgrade and recovery. Those remain M0 acceptance requirements.
 
 ## Repositories and ownership
 

@@ -64,11 +64,11 @@ def verify(python):
         expected[str(Path(name).relative_to("scarcity_router"))] = digest
     if not {"control_server.py", "server_ownership.py", "__init__.py"} <= expected.keys():
         raise ValueError("source lacks the composed startup/ownership contract")
-    # Hatch adds this resource when building a non-editable checkout installation.
-    if (package / "default-selector-policy.json").exists():
-        expected["default-selector-policy.json"] = git(
-            "rev-parse", f"{revision}:examples/selector-policy.json",
-        )
+    policy_digest = git("rev-parse", f"{revision}:examples/selector-policy.json")
+    editable = source["dir_info"].get("editable", False)
+    # Hatch must include this resource in every non-editable installation.
+    if not editable or (package / "default-selector-policy.json").exists():
+        expected["default-selector-policy.json"] = policy_digest
     actual = {
         str(path.relative_to(package)): path
         for path in package.rglob("*")
@@ -76,6 +76,13 @@ def verify(python):
     }
     if actual.keys() != expected.keys():
         raise ValueError("imported SR package file set differs from source revision")
+    # SR prefers the source-tree example when present, even beside an installed copy.
+    policy_source = package.resolve().parent / "examples/selector-policy.json"
+    if editable and not policy_source.is_file():
+        raise ValueError("editable SR default selector-policy source is missing")
+    if editable or policy_source.is_file():
+        expected["../examples/selector-policy.json"] = policy_digest
+        actual["../examples/selector-policy.json"] = policy_source
     for name, path in actual.items():
         data = path.read_bytes()
         digest = hashlib.sha1(b"blob " + str(len(data)).encode() + b"\0" + data).hexdigest()

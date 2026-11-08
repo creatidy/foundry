@@ -33,9 +33,11 @@ class LocalRuntimeTests(unittest.TestCase):
         package.mkdir(parents=True)
         for name in ("__init__.py", "control_server.py", "server_ownership.py"):
             (package / name).write_text("# isolated synthetic SR fixture\n")
+        (self.checkout / "examples").mkdir()
+        (self.checkout / "examples/selector-policy.json").write_text("{}\n")
         subprocess.run(["git", "init", "-q", str(self.checkout)], check=True)
         self.git("remote", "add", "origin", runtime.CANONICAL)
-        self.git("add", "scarcity_router")
+        self.git("add", "scarcity_router", "examples/selector-policy.json")
         self.git("-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
                  "-c", "commit.gpgsign=false", "commit", "-qm", "Synthetic fixture")
         self.revision = self.git("rev-parse", "HEAD").strip()
@@ -56,6 +58,8 @@ class LocalRuntimeTests(unittest.TestCase):
             (site / "fixture.pth").write_text(str(self.checkout) + "\n")
         else:
             shutil.copytree(self.checkout / "scarcity_router", site / "scarcity_router")
+            shutil.copyfile(self.checkout / "examples/selector-policy.json",
+                            site / "scarcity_router/default-selector-policy.json")
         metadata = site / "scarcity_router-0.1.0.dist-info"
         metadata.mkdir()
         (metadata / "METADATA").write_text("Metadata-Version: 2.1\nName: scarcity-router\nVersion: 0.1.0\n")
@@ -123,6 +127,34 @@ class LocalRuntimeTests(unittest.TestCase):
         with patch.dict(os.environ, {"FOUNDRY_SR_CHECKOUT": "relative"}):
             with self.assertRaisesRegex(ValueError, "absolute"):
                 runtime.discover()
+
+    def test_modified_or_missing_editable_default_policy_refused(self):
+        policy = self.checkout / "examples/selector-policy.json"
+        policy.write_text('{"modified": true}\n')
+        with self.assertRaisesRegex(ValueError, "differs from source revision.*selector-policy"):
+            runtime.verify(self.python)
+        policy.unlink()
+        with self.assertRaisesRegex(ValueError, "selector-policy source is missing"):
+            runtime.verify(self.python)
+
+    def test_missing_or_modified_packaged_default_policy_refused(self):
+        python = self.tool()
+        package = next((python.parent.parent / "lib").glob("python*/site-packages/scarcity_router"))
+        policy = package / "default-selector-policy.json"
+        policy.write_text('{"modified": true}\n')
+        with self.assertRaisesRegex(ValueError, "differs from source revision.*selector-policy"):
+            runtime.verify(python)
+        policy.unlink()
+        with self.assertRaisesRegex(ValueError, "file set"):
+            runtime.verify(python)
+
+    def test_installed_policy_source_precedence_is_also_verified(self):
+        python = self.tool()
+        site = next((python.parent.parent / "lib").glob("python*/site-packages"))
+        (site / "examples").mkdir()
+        (site / "examples/selector-policy.json").write_text('{"modified": true}\n')
+        with self.assertRaisesRegex(ValueError, "differs from source revision.*selector-policy"):
+            runtime.verify(python)
 
     def test_absence_has_explicit_install_guidance(self):
         self.python.unlink()

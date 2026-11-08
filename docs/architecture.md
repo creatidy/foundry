@@ -1,6 +1,6 @@
 # Foundry integration architecture — M0
 
-**Status:** owner-approved product direction and target architecture; the native launcher requires a prepared SR runtime, and the complete local installer and Docker HTTP transport are not delivered. The existing Compose is a separate, unverified TLS candidate. This is not approval for live installation or a product release.
+**Status:** owner-approved product direction and target architecture; `make start` discovers a verifiable existing native SR runtime and delegates to the foreground launcher. Absent runtimes use an explicit inspected-checkout `uv tool install` step. The complete local installer and Docker HTTP transport are not delivered. The existing Compose is a separate, unverified TLS candidate. This is not approval for live installation or a product release.
 
 ## Scope
 

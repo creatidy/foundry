@@ -1,9 +1,16 @@
-# Foundry M0: only existing Compose commands; do not hide extra infrastructure.
+# Native foreground startup and the separate advanced Compose workflow.
 COMPOSE := docker compose --env-file .env -f compose.yaml
 
-.PHONY: config preflight tls-check up down ps logs local-tls-init local-tls-up
+.PHONY: start runtime-check config preflight tls-check up down ps logs local-tls-init local-tls-up
 
 export TLS_DEST LOCAL_TLS_PROJECT LOCAL_TLS_ADOPT_PROJECT FOUNDRY_MI_DIR FOUNDRY_MI_SHA256 FOUNDRY_MI_IMAGE_ID
+export FOUNDRY_SR_CHECKOUT
+
+start:
+	@python3 scripts/local_runtime.py
+
+runtime-check:
+	@python3 scripts/local_runtime.py --check
 
 local-tls-init:
 	@python3 scripts/local_tls_init.py

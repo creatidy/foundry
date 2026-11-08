@@ -10,23 +10,50 @@ Foundry is the public **deployment and integration product**. It does not own ro
 
 The owner-selected default is a simple local HTTP installation without certificates or manual image IDs or network setup, for native Linux, Windows WSL2/Ubuntu and Docker. The native launcher below requires a separately prepared SR runtime; it is not a complete installer. Docker bridge HTTP requires a future verified SR security contract and is not supported by the current Compose. Advanced and distributed deployments retain verified TLS with operator-managed certificates. The experimental Windows certificate-import proposal in [PR #14](https://forgejo.creatidy.com/Creatidy/foundry/pulls/14) is superseded as the default onboarding direction; it has not been integrated. See the [deployment matrix and security conditions](docs/architecture.md#target-deployment-topology).
 
-## Native Linux startup
+## Linux / WSL2 startup
 
-Prepare an SR Python 3.12+ environment from the inspected canonical [SR source](https://forgejo.creatidy.com/Creatidy/scarcity-router) and its dependencies using SR's installation instructions. SR is not published to PyPI. The minimum accepted SR revision is `925ec06681c7fa085edd5015f57663e85d735768`, or a verified compatible descendant containing the SR #253 fix. The launcher invokes the full composed server, not `scarcity-router-server`. Select the absolute path to the interpreter whose ordinary imports resolve to that compatible SR package; verify the module paths and source revision, not just the unchanged `0.1.0` package version or a `PYTHONPATH` override. The launcher does not install or verify the runtime. Protect the runtime and its import environment from modification.
-
-If no suitable environment exists, SR documents `uv tool install /path/to/scarcity-router-checkout` for an inspected checkout. This explicit command installs dependencies and may access the network; review SR's instructions and the checkout first. Locate the resulting environment with `uv tool dir` and select its `scarcity-router/bin/python` interpreter. Do not install a second copy merely to use Foundry.
-
-From the Foundry checkout, start in the foreground:
+From the Foundry checkout, start in the foreground with GNU Make, Python 3 and Git installed:
 
 ```sh
-./scripts/local-start.sh /absolute/path/to/sr-python
+make start
 ```
 
-SR prints when its listener has bound. Open exactly `http://127.0.0.1:8787/admin`. Stop with Ctrl-C and repeat the same command to restart. The printed data directory is SR's `$XDG_DATA_HOME/scarcity-router/server` when `XDG_DATA_HOME` is absolute, otherwise `$HOME/.local/share/scarcity-router/server`. Keep the same environment and user on restart; changing them can select different state.
+Open exactly `http://127.0.0.1:8787/admin` after SR prints **server component listening**. A selected runtime and a "Starting SR" message are not readiness; failures remain visible and return nonzero. Ctrl-C stops the foreground server; repeat `make start` to restart. This does not install a service or promise automatic startup after reboot. The command invokes the full composed server, not the recommendation-only `scarcity-router-server`.
+
+### Runtime discovery
+
+`make runtime-check` performs the same discovery without starting a server or opening its store. Foundry checks only the sibling `../scarcity-router/.venv/bin/python` and, when `uv` is on PATH, `$(uv tool dir)/scarcity-router/bin/python`. It does not search your home, activate an environment, change PATH, download anything or replace installations. An incompatible candidate is reported and excluded; two compatible environments are ambiguous and refuse startup. To explicitly select a nonstandard checkout or disambiguate existing environments, use `FOUNDRY_SR_CHECKOUT=/absolute/inspected/scarcity-router make start`; this selects only that checkout's `.venv`, not an arbitrary Python argument.
+
+Verification uses Python 3.12+, ordinary `scarcity_router.control_server` import resolution and installed `direct_url.json` checkout provenance, not the unchanged `0.1.0` version. The retained source must have canonical HTTPS origin `https://forgejo.creatidy.com/Creatidy/scarcity-router.git` and HEAD at an inspected exact revision: `925ec06681c7fa085edd5015f57663e85d735768` (minimum, SR #253 ownership fix), or `c67900723cd6ec7430a36dd0357ee17061f811b6` (also includes SR #255 browser onboarding fix). Every imported package file and the effective default selector-policy asset must match that Git tree; non-editable installations must contain the packaged policy, and editable installations must retain the source example. Extra or modified code and missing/modified default assets are refused; existing user policy is not inspected or changed. Unrelated checkout docs/tests can be dirty. Non-editable `uv tool` copies are compared with the retained checkout, not assumed current from their local directory URL. Wheel-only, VCS-only metadata, uninspected revisions and other installation layouts are not yet auto-discovered.
+
+This is an offline compatibility/provenance check under a trusted operator-controlled host, Git objects, Python/uv executables and environment, not publisher authentication or dependency auditing. `PYTHONPATH` and `PYTHONHOME` overrides are refused. Protect the runtime, dependencies, source checkout and import environment from modification, including between verification and execution. New SR revisions require explicit Foundry compatibility review and an update to `scripts/local_runtime.py`; startup never follows a mutable branch. Do not reset a checkout containing other work to satisfy this check.
+
+### Install SR if absent
+
+Reuse an already compatible environment first. SR is not on PyPI. If there is no SR checkout, the following prepares a new **absent** sibling path at the inspected immutable revision (do not run it over an existing checkout):
+
+```sh
+git clone --no-checkout https://forgejo.creatidy.com/Creatidy/scarcity-router.git ../scarcity-router
+git -C ../scarcity-router checkout --detach c67900723cd6ec7430a36dd0357ee17061f811b6
+```
+
+Inspect that checkout's README, `pyproject.toml` and installation/dependency contract before the one supported installation step:
+
+```sh
+uv tool install --python 3.12 ../scarcity-router
+make runtime-check
+make start
+```
+
+This explicit SR-supported local-checkout installation can download Python/build/runtime dependencies; they are not a fully locked release. No installation was performed by Foundry. Keep the checkout at the installed revision for subsequent verification. An existing `uv tool` installation is not silently overwritten: do not add `--force` or run SR's install-or-upgrade target merely to start Foundry. If the tool or checkout is older, modified or unverifiable, startup explains the refusal; inspect and deliberately plan its upgrade and data backup first, especially if other commands or a worker use the environment. No automatic migration, downgrade or rollback is provided. A separately inspected wheel is supported by SR packaging, but lacks sufficient provenance for this discovery increment; use the retained-checkout installation path above.
+
+### State and onboarding
+
+The unchanged underlying `scripts/local-start.sh` remains available for explicitly prepared interpreter use. The printed data directory is SR's `$XDG_DATA_HOME/scarcity-router/server` when `XDG_DATA_HOME` is absolute, otherwise `$HOME/.local/share/scarcity-router/server`. Keep the same environment and user on restart; changing them can select different state. Foundry does not reset, copy or migrate administrator identity, resources, keys or configuration. SR owns normal store opening and schema behavior. Discovery does not open user data; running a server can modify it.
 
 The historical duplicate-start producer-fencing defect at SR revision `c16cc1db29f3828b3f9e8d05b19e645cfb0c32b8` was fixed in [SR #253 / PR #254](https://forgejo.creatidy.com/Creatidy/scarcity-router/pulls/254), integrated at the minimum revision above. SR now acquires exclusive server ownership before opening the store or constructing the producer. A concurrent server using the same data directory is refused without fencing the running producer's snapshot/replay operations; ownership is released on shutdown or process death. Stop any pre-fix server before upgrading: it does not participate in this ownership protocol. This protection belongs to SR, not a Foundry lock, and does not block the separate administrator claim command below. A refused duplicate never adopts the existing listener. Other startup failures can still initialize or modify state; do not assume every failed start leaves durable state unchanged.
 
-For a fresh installation, leave the server running and open a second trusted private terminal. Run the following using the **same interpreter** and replacing the data-directory placeholder with the exact path printed at startup:
+For a fresh installation only, leave the server running and open a second trusted private terminal. Use the **SR interpreter** printed by `make start` and replace the data-directory placeholder with the exact path printed at startup:
 
 ```sh
 /absolute/path/to/sr-python -m scarcity_router.control_server --data-dir '/exact/path/printed/at/startup' --issue-bootstrap-claim
@@ -34,7 +61,7 @@ For a fresh installation, leave the server running and open a second trusted pri
 
 Paste the resulting one-time claim into SR's onboarding form and set the administrator password there. Do not run the claim command through an agent, a recorded terminal, or a shared channel; do not put the claim in a URL, argument, file or log. The claim expires after 15 minutes; issuing another invalidates the previous one until an administrator exists. Do not issue a claim on normal restarts.
 
-The same launcher is intended for WSL2 Ubuntu, but Windows browser access and negative external-access tests remain separately unverified; loopback forwarding alone proves neither. Native startup alone does not establish first-admin onboarding, persistent identity, unauthorized-access denial, local-only reachability, authenticated execution, or supported installation, upgrade and recovery. Those remain M0 acceptance requirements.
+The owner confirmed local startup, Windows browser UI access, first-admin onboarding/login and administrator persistence across restart on ROG Windows 11 / WSL2 Ubuntu with the prior launcher. Existing Linux Chromium/Playwright exercised administration, providers, resources, permissions, sessions and security protections; two SR-owned defects and a separate inference-evidence gap were handed to SR and are not re-tested or fixed here. That evidence is not clean-machine installation, negative external reachability or authenticated inference acceptance for this new command. Those and supported upgrade/recovery remain M0 requirements. Launcher PR #19 was not a complete installer; discovery removes the interpreter-path step, not the remaining installation gates.
 
 ## Repositories and ownership
 

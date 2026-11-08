@@ -13,7 +13,8 @@ from urllib.parse import unquote, urlsplit
 
 ROOT = Path(__file__).resolve().parents[1]
 MINIMUM = "925ec06681c7fa085edd5015f57663e85d735768"
-ACCEPTED = {MINIMUM, "c67900723cd6ec7430a36dd0357ee17061f811b6"}
+ACCEPTED = {MINIMUM, "c67900723cd6ec7430a36dd0357ee17061f811b6",
+            "8fc4f91ff1aa4c52f4738d436fc2ac12d0b8acb1"}
 CANONICAL = "https://forgejo.creatidy.com/Creatidy/scarcity-router.git"
 PROBE = """
 import importlib.metadata, importlib.util, json, sys

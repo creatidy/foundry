@@ -199,11 +199,9 @@ class HostMIProvenanceTests(unittest.TestCase):
         document = json.loads(cuts["fresh"][1])
         document["scope"]["channel"] = "not-authorized"
         altered["fresh"] = (cuts["fresh"][0], json.dumps(document, sort_keys=True, separators=(",", ":")).encode())
-        args.authorize_disposable_linux_engine = True
         with mock.patch.object(runner, "_project") as project:
             with self.assertRaisesRegex(ValueError, "trust mismatch"):
-                runner._run_phases(args, prepared=(actual_helper, actual_fake, altered), evidence=None,
-                                   _capability=runner._ORCHESTRATION)
+                runner._validate_cuts(altered)
         project.assert_not_called()
         with tempfile.TemporaryDirectory() as tmp:
             from installed_provisioning import prepare_mi

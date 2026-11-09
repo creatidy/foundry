@@ -15,6 +15,7 @@ from unittest import mock
 import installed_admin
 import installed_lifecycle_adapter as lifecycle
 import run_installed_acceptance as entry
+from test_installed_acceptance_wiring import mocked_full_run
 
 
 class AdminTests(unittest.TestCase):
@@ -115,11 +116,12 @@ class OfflineLifecycleTests(unittest.TestCase):
              mock.patch.object(entry, "InstalledProject", return_value=project), \
              mock.patch.object(entry, "InstalledLifecycleAdapter", return_value=adapter), \
              mock.patch.object(entry, "_security_negatives"), mock.patch.object(entry, "_client", return_value="key"), \
-             mock.patch.object(entry, "_control", return_value=mock.Mock()), mock.patch.object(entry, "assert_input_boundary"), \
-             mock.patch.object(entry, "_execution", side_effect=RuntimeError("worker failed")):
+             mock.patch.object(entry, "_control", return_value=mock.Mock()), \
+             mock.patch.object(entry, "assert_input_boundary", return_value={'route': {'target': {'resource': {'resource_id': 'foundry-worker-a:gpt-6-sol:high'}}}}), \
+             mock.patch.object(entry, "_execution", side_effect=RuntimeError("worker failed")), \
+             mocked_full_run(args):
             with self.assertRaisesRegex(RuntimeError, "worker failed"):
-                entry._run_phases(args, prepared=(b"fixture", b"fixture", {"fresh": (b"fresh", b"trust")}),
-                                  evidence=None, _capability=entry._ORCHESTRATION)
+                entry.run(args)
             self.assertEqual(2, project.cleanup.call_count)
 
     def test_complete_entrypoint_requires_external_boundaries(self):

@@ -1,6 +1,7 @@
 """Offline-only tests for phase wiring, isolation and fail-closed entry."""
 
 from types import SimpleNamespace
+from contextlib import contextmanager, ExitStack
 import json
 import hashlib
 import os
@@ -13,6 +14,35 @@ import unittest
 from unittest import mock
 
 import run_installed_acceptance as entry
+
+
+@contextmanager
+def mocked_full_run(args):
+    args.authorize_disposable_linux_engine = args.authorize_image_build = True
+    args.confirm_external_boundaries = True
+    args.preflight_evidence = '/tmp/kilo/probe/acceptance.json'
+    args.base_digest = 'sha256:' + 'a' * 64
+    args.sr_repo = '/sr'
+    args.mi_repo = '/mi'
+    args.zai_python = args.zai_output_dir = None
+    args.authorize_zai_source_reads = False
+    args.evidence_dir = '/tmp/kilo/result'
+    evidence = mock.Mock(data={'image_cleanup': {}, 'images': {}, 'preflight': {},
+                               'phases': {name: {} for name in entry.PHASE_CHECKS}})
+    executor = mock.MagicMock(probe_uncertain=False, cleanup_failed=False)
+    executor.__enter__.return_value = executor
+    with ExitStack() as stack:
+        for obj, name, kwargs in (
+            (entry.Path, 'is_dir', {'return_value': True}),
+            (entry.provenance, 'dockerfile', {}),
+            (entry, '_read_preflight', {'return_value': args.engine_id}),
+            (entry, '_discover_engine', {'return_value': args.engine_id}),
+            (entry, 'Evidence', {'return_value': evidence}),
+            (entry.build, 'DockerExecutor', {'return_value': executor}),
+            (entry.build, 'build_verified', {'side_effect': ['old', 'new']}),
+        ):
+            stack.enter_context(mock.patch.object(obj, name, **kwargs))
+        yield evidence
 
 
 class WiringTests(unittest.TestCase):
@@ -200,7 +230,7 @@ class WiringTests(unittest.TestCase):
             self.assertTrue(ready())
             self.assertTrue(verify(key, {}, "digest"))
             events.append((adapter.project.number, "variant"))
-            return {}, {}
+            return {'route': {'target': {'resource': {'resource_id': 'foundry-worker-a:gpt-6-sol:high'}}}}, {}
 
         def preactivation(adapter, trust, key, retained, verify):
             self.assertEqual(b"fresh-trust", trust)
@@ -225,16 +255,16 @@ class WiringTests(unittest.TestCase):
              mock.patch.object(entry, "_security_negatives", side_effect=lambda a: events.append((a.project.number, "security"))), \
              mock.patch.object(entry, "_client", return_value="key"), \
              mock.patch.object(entry, "_control", side_effect=lambda a, h, f, x, verify_only=False: Control(a, verify_only)), \
-             mock.patch.object(entry, "assert_input_boundary", side_effect=lambda a, k, c, mi_enabled: events.append((a.project.number, "bound" if mi_enabled else "unbound"))), \
+             mock.patch.object(entry, "assert_input_boundary", side_effect=lambda a, k, c, mi_enabled: (events.append((a.project.number, "bound" if mi_enabled else "unbound")) or {'route': {'target': {'resource': {'resource_id': 'foundry-worker-a:gpt-6-sol:high'}}}})), \
              mock.patch.object(entry, "_execution", side_effect=lambda a, h, f, x: events.append((a.project.number, "execution"))), \
              mock.patch.object(entry, "_bound_selection", return_value={"retained": True}), \
              mock.patch.object(entry, "run_variant_reload_acceptance", side_effect=variant), \
              mock.patch.object(entry, "run_stale_installed", side_effect=lambda a, *x, **kw: events.append((a.project.number, "stale"))), \
              mock.patch.object(entry, "run_preactivation_failure", side_effect=preactivation), \
              mock.patch.object(entry, "start_live_worker", return_value=worker_control) as start_worker, \
-             mock.patch.object(entry, "run_lifecycle_acceptance", side_effect=migration):
-            entry._run_phases(args, prepared=(b'fixture', b'fixture', cuts), evidence=None,
-                              _capability=entry._ORCHESTRATION)
+             mock.patch.object(entry, "run_lifecycle_acceptance", side_effect=migration), \
+             mocked_full_run(args):
+            entry.run(args)
         self.assertEqual('resume', start_worker.call_args.kwargs['migration'])
         self.assertIs(worker_archive, start_worker.call_args.kwargs['worker_archive'])
         self.assertEqual(6, len(projects))
@@ -262,11 +292,8 @@ class WiringTests(unittest.TestCase):
              mock.patch.object(entry, '_discover_engine') as discover, \
              mock.patch.object(entry.build, 'DockerExecutor') as executor, \
              mock.patch.object(entry.host_mi_provenance, 'generate_cuts') as producer:
-            self.assertFalse(hasattr(entry, 'run_draft'))
-            with self.assertRaisesRegex(ValueError, 'authorized orchestration'):
-                entry._run_phases(args, prepared=prepared, evidence=None)
-            with self.assertRaisesRegex(ValueError, 'authorized orchestration'):
-                entry._run_authorized(args, b'', (), prepared, None)
+            for name in ('run_draft', '_run_phases', '_run_authorized', '_ORCHESTRATION'):
+                self.assertFalse(hasattr(entry, name))
             with self.assertRaises(TypeError):
                 entry.run(args, prepared=prepared)
         project.assert_not_called()
@@ -305,10 +332,8 @@ class WiringTests(unittest.TestCase):
             events.append(kwargs["revision"])
             return "image" + str(executor.number)
 
-        def phases(received, *, prepared, evidence, _capability):
+        def phases(received, **kwargs):
             self.assertEqual(("image0", "image1"), (received.old_image_id, received.new_image_id))
-            self.assertEqual((b'fixture', b'fixture', 'cuts'), prepared)
-            self.assertIs(_capability, entry._ORCHESTRATION)
             self.assertNotIn("exit0", events)
             self.assertNotIn("exit1", events)
             raise RuntimeError("phase failure")
@@ -319,7 +344,7 @@ class WiringTests(unittest.TestCase):
 
         def produce(*_args):
             events.append('producer')
-            return 'cuts'
+            return {'fresh': (b'cut', b'trust')}
 
         with mock.patch.object(entry.Path, "is_dir", return_value=True), \
              mock.patch.object(entry.provenance, "dockerfile"), \
@@ -331,7 +356,7 @@ class WiringTests(unittest.TestCase):
              mock.patch.object(entry, "_discover_engine", return_value="engine"), \
              mock.patch.object(entry.build, "DockerExecutor", Executor), \
              mock.patch.object(entry.build, "build_verified", side_effect=verified), \
-             mock.patch.object(entry, "_run_phases", side_effect=phases):
+             mock.patch.object(entry, "_project", side_effect=phases):
             with self.assertRaisesRegex(RuntimeError, "phase failure"):
                 entry.run(args)
         self.assertEqual(['reviewed', 'producer', "enter", "preflight0", entry.provenance.OLD_SR, "enter", "preflight1", entry.provenance.NEW_SR,
@@ -364,14 +389,17 @@ class WiringTests(unittest.TestCase):
                                worker_sha256='a' * 64, fake_appserver='/fake', fake_sha256='b' * 64, mi_python='/python', mi_wheel='/wheel',
                                zai_python=None, zai_output_dir=None, authorize_zai_source_reads=False,
                                evidence_dir='/tmp/kilo/full')
-        evidence = mock.Mock(data={'preflight': {}})
-        with mock.patch.object(entry, '_read_preflight', return_value='verified-engine-id'), \
-             mock.patch.object(entry.Path, 'is_dir', return_value=True), \
-             mock.patch.object(entry.provenance, 'dockerfile'), \
-             mock.patch.object(entry, '_prepare'), \
-             mock.patch.object(entry, 'Evidence', return_value=evidence), \
-             mock.patch.object(entry, '_run_authorized'):
-            entry.run(args)
+        with mocked_full_run(args) as evidence, \
+             mock.patch.object(entry, '_prepare', return_value=(b'helper', b'fake', {'fresh': (b'cut', b'trust')})), \
+             mock.patch.object(entry, '_validate_cuts'), \
+             mock.patch.object(entry, '_project') as project:
+            project.return_value.__enter__.return_value = mock.Mock()
+            with mock.patch.object(entry, '_security_negatives'), mock.patch.object(entry, '_client'), \
+                 mock.patch.object(entry, '_control'), mock.patch.object(entry, 'assert_input_boundary', return_value={'route': {'target': {'resource': {'resource_id': 'foundry-worker-a:gpt-6-sol:high'}}}}), \
+                 mock.patch.object(entry, '_execution'), mock.patch.object(entry, 'run_variant_reload_acceptance', return_value=({'route': {'target': {'resource': {'resource_id': 'foundry-worker-a:gpt-6-sol:high'}}}}, None)), \
+                 mock.patch.object(entry, 'run_stale_installed'), mock.patch.object(entry, '_bound_selection'), \
+                 mock.patch.object(entry, 'run_preactivation_failure'), mock.patch.object(entry, 'run_lifecycle_acceptance'):
+                entry.run(args)
         self.assertEqual('synthetic_acceptance_passed', evidence.data['status'])
 
     def test_preflight_only_reports_probe_without_build_or_acceptance(self):
@@ -390,7 +418,6 @@ class WiringTests(unittest.TestCase):
              mock.patch.object(entry.build, 'DockerExecutor', return_value=executor), \
              mock.patch.object(entry.build, 'build_verified') as build, \
              mock.patch.object(entry, '_prepare') as prepare, \
-             mock.patch.object(entry, '_run_authorized') as full_run, \
              mock.patch.object(entry.subprocess, 'run') as source:
             entry.run(args)
         evidence_factory.assert_called_once_with(args.evidence_dir, preflight_only=True)
@@ -401,7 +428,6 @@ class WiringTests(unittest.TestCase):
         self.assertNotIn('untrusted_extra', evidence.data['preflight']['probe'])
         build.assert_not_called()
         prepare.assert_not_called()
-        full_run.assert_not_called()
         source.assert_not_called()
 
     def test_preflight_requires_its_own_authorization(self):

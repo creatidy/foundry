@@ -30,10 +30,6 @@ from installed_worker_control import assert_input_boundary, run_stale_installed,
 
 RUNNER = b"import json, sys\nfrom worker_mi_acceptance import run_in_container\nprint(json.dumps(run_in_container(json.load(sys.stdin)), separators=(',', ':')))\n"
 
-# An internal wiring guard, not a security boundary against Python callers who
-# can inspect or modify this process. Operator and host trust remain external.
-_ORCHESTRATION = object()
-
 PHASE_CHECKS = {
     'baseline': ['missing_and_invalid_credentials_rejected', 'admin_csrf_and_inference_separation', 'untrusted_and_wrong_hostname_tls_rejected', 'mi_disabled_4097_admitted'],
     'execution': ['worker_execution_scenario_completed'],
@@ -232,85 +228,6 @@ def _execution(adapter, helper, fake, args):
     if len(sources) != 2:
         raise ValueError('worker evidence must identify both synthetic sources')
     return result
-
-
-def _run_phases(args, *, prepared, evidence, _capability=None):
-    """Execute phases only after the full runner's verified build sequence."""
-    if _capability is not _ORCHESTRATION:
-        raise ValueError("installed phases require authorized orchestration")
-    helper, fake, cuts = prepared
-    _validate_cuts(cuts)
-    fresh_publication, fresh_trust = cuts["fresh"]
-
-    with _project(args, baseline=True, phase='baseline', evidence=evidence, cuts=cuts) as adapter:
-        adapter.start_old()  # The project's "old" image is the current image in this phase.
-        _security_negatives(adapter)
-        key = _client(adapter, "MI-disabled baseline")
-        control = _control(adapter, helper, fake, args)
-        try:
-            response = assert_input_boundary(adapter, key, control, mi_enabled=False)
-            if evidence is not None:
-                resource = response['route']['target']['resource']['resource_id']
-                if resource not in ('foundry-worker-a:gpt-6-sol:high', 'foundry-worker-b:gpt-6-sol:high'):
-                    raise ValueError('unexpected synthetic resource')
-                evidence.data['phases']['baseline']['selected_resource_id'] = resource
-                evidence.save()
-        finally:
-            control.close()
-
-    with _project(args, phase='execution', evidence=evidence, cuts=cuts) as adapter:
-        adapter.start_new_with_cut(fresh_publication, fresh_trust, fixture.EXPECTED_SHA256)
-        result = _execution(adapter, helper, fake, args)
-        if evidence is not None:
-            evidence.data['phases']['execution']['worker'] = result
-            evidence.save()
-
-    with _project(args, phase='variant_reload', evidence=evidence, cuts=cuts) as adapter:
-        adapter.start_new_with_cut(fresh_publication, fresh_trust, fixture.EXPECTED_SHA256)
-        key = _client(adapter, "fresh variant reload")
-        control = _control(adapter, helper, fake, args)
-        try:
-            assert_input_boundary(adapter, key, control, mi_enabled=True)
-            retained, _ = run_variant_reload_acceptance(adapter, key, cuts, control.worker_ready, control.verify_cut)
-            if evidence is not None:
-                resource = retained['route']['target']['resource']['resource_id']
-                if resource not in ('foundry-worker-a:gpt-6-sol:high', 'foundry-worker-b:gpt-6-sol:high'):
-                    raise ValueError('unexpected synthetic resource')
-                evidence.data['phases']['variant_reload']['selected_resource_id'] = resource
-                evidence.save()
-        finally:
-            control.close()
-
-    with _project(args, phase='stale_startup', evidence=evidence, cuts=cuts) as adapter:
-        run_stale_installed(adapter, cuts, helper, fake,
-                            helper_sha256=args.worker_sha256, fake_sha256=args.fake_sha256)
-
-    with _project(args, phase='preactivation', evidence=evidence, cuts=cuts) as adapter:
-        adapter.start_new_with_cut(fresh_publication, fresh_trust, fixture.EXPECTED_SHA256)
-        key = _client(adapter, "preactivation retained client")
-        control = _control(adapter, helper, fake, args)
-        try:
-            retained = _bound_selection(adapter, key, blocked=False, worker_ready=control.worker_ready,
-                                        verify_cut=control.verify_cut, digest=fixture.EXPECTED_SHA256)
-        finally:
-            control.close()
-        adapter.stop()
-
-        def verify_cut(client_key, response, digest):
-            verifier = _control(adapter, helper, fake, args, verify_only=True)
-            try:
-                return verifier.verify_cut(client_key, response, digest)
-            finally:
-                verifier.close()
-
-        run_preactivation_failure(adapter, fresh_trust, key, retained, verify_cut)
-
-    with _project(args, phase='migration_backup_restore', evidence=evidence, cuts=cuts) as adapter:
-        run_lifecycle_acceptance(
-            adapter, fresh_publication,
-            start_worker=lambda mode, archive: start_live_worker(
-                adapter.project, adapter.admin, helper, fake, helper_sha256=args.worker_sha256,
-                fake_sha256=args.fake_sha256, migration=mode, worker_archive=archive))
 
 
 def _prepare(args):
@@ -518,10 +435,138 @@ def run(args):
         if not Path(args.zai_python).is_absolute() or not Path(args.zai_python).is_file():
             raise ValueError("absolute existing real-source Python required")
         zai.check_directory(args.zai_output_dir)
+    def _run_phases():
+        helper, fake, cuts = prepared
+        _validate_cuts(cuts)
+        fresh_publication, fresh_trust = cuts["fresh"]
+
+        with _project(args, baseline=True, phase='baseline', evidence=evidence, cuts=cuts) as adapter:
+            adapter.start_old()  # The project's "old" image is the current image in this phase.
+            _security_negatives(adapter)
+            key = _client(adapter, "MI-disabled baseline")
+            control = _control(adapter, helper, fake, args)
+            try:
+                response = assert_input_boundary(adapter, key, control, mi_enabled=False)
+                if evidence is not None:
+                    resource = response['route']['target']['resource']['resource_id']
+                    if resource not in ('foundry-worker-a:gpt-6-sol:high', 'foundry-worker-b:gpt-6-sol:high'):
+                        raise ValueError('unexpected synthetic resource')
+                    evidence.data['phases']['baseline']['selected_resource_id'] = resource
+                    evidence.save()
+            finally:
+                control.close()
+
+        with _project(args, phase='execution', evidence=evidence, cuts=cuts) as adapter:
+            adapter.start_new_with_cut(fresh_publication, fresh_trust, fixture.EXPECTED_SHA256)
+            result = _execution(adapter, helper, fake, args)
+            if evidence is not None:
+                evidence.data['phases']['execution']['worker'] = result
+                evidence.save()
+
+        with _project(args, phase='variant_reload', evidence=evidence, cuts=cuts) as adapter:
+            adapter.start_new_with_cut(fresh_publication, fresh_trust, fixture.EXPECTED_SHA256)
+            key = _client(adapter, "fresh variant reload")
+            control = _control(adapter, helper, fake, args)
+            try:
+                assert_input_boundary(adapter, key, control, mi_enabled=True)
+                retained, _ = run_variant_reload_acceptance(adapter, key, cuts, control.worker_ready, control.verify_cut)
+                if evidence is not None:
+                    resource = retained['route']['target']['resource']['resource_id']
+                    if resource not in ('foundry-worker-a:gpt-6-sol:high', 'foundry-worker-b:gpt-6-sol:high'):
+                        raise ValueError('unexpected synthetic resource')
+                    evidence.data['phases']['variant_reload']['selected_resource_id'] = resource
+                    evidence.save()
+            finally:
+                control.close()
+
+        with _project(args, phase='stale_startup', evidence=evidence, cuts=cuts) as adapter:
+            run_stale_installed(adapter, cuts, helper, fake,
+                                helper_sha256=args.worker_sha256, fake_sha256=args.fake_sha256)
+
+        with _project(args, phase='preactivation', evidence=evidence, cuts=cuts) as adapter:
+            adapter.start_new_with_cut(fresh_publication, fresh_trust, fixture.EXPECTED_SHA256)
+            key = _client(adapter, "preactivation retained client")
+            control = _control(adapter, helper, fake, args)
+            try:
+                retained = _bound_selection(adapter, key, blocked=False, worker_ready=control.worker_ready,
+                                            verify_cut=control.verify_cut, digest=fixture.EXPECTED_SHA256)
+            finally:
+                control.close()
+            adapter.stop()
+
+            def verify_cut(client_key, response, digest):
+                verifier = _control(adapter, helper, fake, args, verify_only=True)
+                try:
+                    return verifier.verify_cut(client_key, response, digest)
+                finally:
+                    verifier.close()
+
+            run_preactivation_failure(adapter, fresh_trust, key, retained, verify_cut)
+
+        with _project(args, phase='migration_backup_restore', evidence=evidence, cuts=cuts) as adapter:
+            run_lifecycle_acceptance(
+                adapter, fresh_publication,
+                start_worker=lambda mode, archive: start_live_worker(
+                    adapter.project, adapter.admin, helper, fake, helper_sha256=args.worker_sha256,
+                    fake_sha256=args.fake_sha256, migration=mode, worker_archive=archive))
+
+
+    def _run_authorized():
+        args.engine_id = _discover_engine(args)
+        evidence.data['engine_id'] = args.engine_id
+        evidence.save()
+        if all(real_source):
+            result = subprocess.run([args.zai_python, "-I", str(ROOT / "tests" / "zai_real_source_check.py"),
+                                     "--output-dir", args.zai_output_dir, "--authorization", zai.AUTHORIZATION],
+                                    env={"PATH": os.defpath, "HOME": args.zai_output_dir, "LANG": "C.UTF-8"},
+                                    stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                    timeout=zai.PROCESS_TIMEOUT + 15, check=False)
+            if result.returncode or result.stderr or len(result.stdout) > 8192:
+                raise RuntimeError("real-source applicability check failed")
+            summary = json.loads(result.stdout)
+            blocker_names = {'scope_channel', 'subject_channel', 'subject_configuration', 'reasoning_effort',
+                             'configuration_mismatch', 'unknown_freshness'}
+            if (not isinstance(summary, dict) or summary.get("source_revision") != zai.MI_REVISION or
+                    summary.get("router_applicability") != "not-established" or
+                    summary.get("router_binding") is not None or summary.get('integrity_not_authenticity') is not True or
+                    summary.get('retrieved_sources') != len(zai.EXPECTED_SOURCES) or
+                    not isinstance(summary.get('cut_sha256'), str) or not re.fullmatch(r'[0-9a-f]{64}', summary['cut_sha256']) or
+                    type(summary.get('model_claims')) is not int or summary['model_claims'] < 1 or
+                    not isinstance(summary.get('blockers'), dict) or set(summary['blockers']) != blocker_names or
+                    any(type(value) is not int or value < 0 or value > summary['model_claims']
+                        for value in summary['blockers'].values())):
+                raise ValueError("invalid real-source applicability report")
+            evidence.data['real_source'] = {key: summary[key] for key in ('source_revision', 'cut_sha256', 'retrieved_sources', 'router_applicability', 'router_binding', 'integrity_not_authenticity', 'model_claims', 'blockers')}
+            evidence.data['real_source'].update(scope='separate_source_publication', installed_mi_revision=provenance.MI,
+                                                installed_image_compatibility='not_tested')
+            evidence.save()
+        with _executor(args, evidence, 'old') as old_executor:
+            evidence.data['preflight']['old'] = 'running'
+            evidence.save()
+            old_executor.preflight(base_digest=args.base_digest)
+            evidence.data['preflight']['old'] = 'passed'
+            evidence.save()
+            args.old_image_id = build.build_verified(old_executor, source=source, revision=provenance.OLD_SR,
+                                                     base_digest=args.base_digest, sr_repo=args.sr_repo, mi_repo=args.mi_repo)
+            evidence.data['images']['old'] = {'id': args.old_image_id, 'sr_revision': provenance.OLD_SR, 'mi_revision': provenance.MI, 'base_digest': args.base_digest}
+            evidence.save()
+            with _executor(args, evidence, 'new') as new_executor:
+                evidence.data['preflight']['new'] = 'running'
+                evidence.save()
+                new_executor.preflight(base_digest=args.base_digest)
+                evidence.data['preflight']['new'] = 'passed'
+                evidence.save()
+                args.new_image_id = build.build_verified(new_executor, source=source, revision=provenance.NEW_SR,
+                                                         base_digest=args.base_digest, sr_repo=args.sr_repo, mi_repo=args.mi_repo)
+                evidence.data['images']['new'] = {'id': args.new_image_id, 'sr_revision': provenance.NEW_SR, 'mi_revision': provenance.MI, 'base_digest': args.base_digest}
+                evidence.save()
+                _run_phases()
+
+
     prepared = _prepare(args)
     evidence = Evidence(args.evidence_dir)
     try:
-        _run_authorized(args, source, real_source, prepared, evidence, _capability=_ORCHESTRATION)
+        _run_authorized()
     except BaseException:
         evidence.data['status'] = 'failed'
         for name, status in evidence.data['preflight'].items():
@@ -535,60 +580,6 @@ def run(args):
             evidence.save()
         finally:
             evidence.close()
-
-
-def _run_authorized(args, source, real_source, prepared, evidence, *, _capability=None):
-    if _capability is not _ORCHESTRATION:
-        raise ValueError("installed builds require authorized orchestration")
-    args.engine_id = _discover_engine(args)
-    evidence.data['engine_id'] = args.engine_id
-    evidence.save()
-    if all(real_source):
-        result = subprocess.run([args.zai_python, "-I", str(ROOT / "tests" / "zai_real_source_check.py"),
-                                 "--output-dir", args.zai_output_dir, "--authorization", zai.AUTHORIZATION],
-                                env={"PATH": os.defpath, "HOME": args.zai_output_dir, "LANG": "C.UTF-8"},
-                                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                timeout=zai.PROCESS_TIMEOUT + 15, check=False)
-        if result.returncode or result.stderr or len(result.stdout) > 8192:
-            raise RuntimeError("real-source applicability check failed")
-        summary = json.loads(result.stdout)
-        blocker_names = {'scope_channel', 'subject_channel', 'subject_configuration', 'reasoning_effort',
-                         'configuration_mismatch', 'unknown_freshness'}
-        if (not isinstance(summary, dict) or summary.get("source_revision") != zai.MI_REVISION or
-                summary.get("router_applicability") != "not-established" or
-                summary.get("router_binding") is not None or summary.get('integrity_not_authenticity') is not True or
-                summary.get('retrieved_sources') != len(zai.EXPECTED_SOURCES) or
-                not isinstance(summary.get('cut_sha256'), str) or not re.fullmatch(r'[0-9a-f]{64}', summary['cut_sha256']) or
-                type(summary.get('model_claims')) is not int or summary['model_claims'] < 1 or
-                not isinstance(summary.get('blockers'), dict) or set(summary['blockers']) != blocker_names or
-                any(type(value) is not int or value < 0 or value > summary['model_claims']
-                    for value in summary['blockers'].values())):
-            raise ValueError("invalid real-source applicability report")
-        evidence.data['real_source'] = {key: summary[key] for key in ('source_revision', 'cut_sha256', 'retrieved_sources', 'router_applicability', 'router_binding', 'integrity_not_authenticity', 'model_claims', 'blockers')}
-        evidence.data['real_source'].update(scope='separate_source_publication', installed_mi_revision=provenance.MI,
-                                            installed_image_compatibility='not_tested')
-        evidence.save()
-    with _executor(args, evidence, 'old') as old_executor:
-        evidence.data['preflight']['old'] = 'running'
-        evidence.save()
-        old_executor.preflight(base_digest=args.base_digest)
-        evidence.data['preflight']['old'] = 'passed'
-        evidence.save()
-        args.old_image_id = build.build_verified(old_executor, source=source, revision=provenance.OLD_SR,
-                                                 base_digest=args.base_digest, sr_repo=args.sr_repo, mi_repo=args.mi_repo)
-        evidence.data['images']['old'] = {'id': args.old_image_id, 'sr_revision': provenance.OLD_SR, 'mi_revision': provenance.MI, 'base_digest': args.base_digest}
-        evidence.save()
-        with _executor(args, evidence, 'new') as new_executor:
-            evidence.data['preflight']['new'] = 'running'
-            evidence.save()
-            new_executor.preflight(base_digest=args.base_digest)
-            evidence.data['preflight']['new'] = 'passed'
-            evidence.save()
-            args.new_image_id = build.build_verified(new_executor, source=source, revision=provenance.NEW_SR,
-                                                     base_digest=args.base_digest, sr_repo=args.sr_repo, mi_repo=args.mi_repo)
-            evidence.data['images']['new'] = {'id': args.new_image_id, 'sr_revision': provenance.NEW_SR, 'mi_revision': provenance.MI, 'base_digest': args.base_digest}
-            evidence.save()
-            _run_phases(args, prepared=prepared, evidence=evidence, _capability=_ORCHESTRATION)
 
 
 def main():

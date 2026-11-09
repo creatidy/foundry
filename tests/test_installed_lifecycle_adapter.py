@@ -118,7 +118,8 @@ class OfflineLifecycleTests(unittest.TestCase):
              mock.patch.object(entry, "_control", return_value=mock.Mock()), mock.patch.object(entry, "assert_input_boundary"), \
              mock.patch.object(entry, "_execution", side_effect=RuntimeError("worker failed")):
             with self.assertRaisesRegex(RuntimeError, "worker failed"):
-                entry.run_draft(args)
+                entry._run_phases(args, prepared=(b"fixture", b"fixture", {"fresh": (b"fresh", b"trust")}),
+                                  evidence=None, _capability=entry._ORCHESTRATION)
             self.assertEqual(2, project.cleanup.call_count)
 
     def test_complete_entrypoint_requires_external_boundaries(self):

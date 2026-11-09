@@ -233,7 +233,8 @@ class WiringTests(unittest.TestCase):
              mock.patch.object(entry, "run_preactivation_failure", side_effect=preactivation), \
              mock.patch.object(entry, "start_live_worker", return_value=worker_control) as start_worker, \
              mock.patch.object(entry, "run_lifecycle_acceptance", side_effect=migration):
-            entry.run_draft(args)
+            entry._run_phases(args, prepared=(b'fixture', b'fixture', cuts), evidence=None,
+                              _capability=entry._ORCHESTRATION)
         self.assertEqual('resume', start_worker.call_args.kwargs['migration'])
         self.assertIs(worker_archive, start_worker.call_args.kwargs['worker_archive'])
         self.assertEqual(6, len(projects))
@@ -251,6 +252,27 @@ class WiringTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "authorization"):
                 entry.run(args)
         executor.assert_not_called()
+
+    def test_direct_helpers_refuse_caller_supplied_inputs_before_docker(self):
+        args = SimpleNamespace(authorize_disposable_linux_engine=True,
+                               old_image_id='sha256:' + 'a' * 64,
+                               new_image_id='sha256:' + 'b' * 64)
+        prepared = (b'helper', b'fake', {})
+        with mock.patch.object(entry, 'InstalledProject') as project, \
+             mock.patch.object(entry, '_discover_engine') as discover, \
+             mock.patch.object(entry.build, 'DockerExecutor') as executor, \
+             mock.patch.object(entry.host_mi_provenance, 'generate_cuts') as producer:
+            self.assertFalse(hasattr(entry, 'run_draft'))
+            with self.assertRaisesRegex(ValueError, 'authorized orchestration'):
+                entry._run_phases(args, prepared=prepared, evidence=None)
+            with self.assertRaisesRegex(ValueError, 'authorized orchestration'):
+                entry._run_authorized(args, b'', (), prepared, None)
+            with self.assertRaises(TypeError):
+                entry.run(args, prepared=prepared)
+        project.assert_not_called()
+        discover.assert_not_called()
+        executor.assert_not_called()
+        producer.assert_not_called()
 
     def test_verified_images_live_through_phases_and_cleanup_on_failure(self):
         args = SimpleNamespace(authorize_disposable_linux_engine=True, authorize_image_build=True,
@@ -283,25 +305,36 @@ class WiringTests(unittest.TestCase):
             events.append(kwargs["revision"])
             return "image" + str(executor.number)
 
-        def phases(received, *, prepared, evidence):
+        def phases(received, *, prepared, evidence, _capability):
             self.assertEqual(("image0", "image1"), (received.old_image_id, received.new_image_id))
-            self.assertEqual("prepared", prepared)
+            self.assertEqual((b'fixture', b'fixture', 'cuts'), prepared)
+            self.assertIs(_capability, entry._ORCHESTRATION)
             self.assertNotIn("exit0", events)
             self.assertNotIn("exit1", events)
             raise RuntimeError("phase failure")
 
+        def reviewed(*_args):
+            events.append('reviewed')
+            return 'engine'
+
+        def produce(*_args):
+            events.append('producer')
+            return 'cuts'
+
         with mock.patch.object(entry.Path, "is_dir", return_value=True), \
              mock.patch.object(entry.provenance, "dockerfile"), \
-             mock.patch.object(entry, "_prepare", return_value="prepared"), \
+             mock.patch.object(entry, '_checked_file', return_value=b'fixture'), \
+             mock.patch.object(entry.host_mi_provenance, 'generate_cuts', side_effect=produce), \
+             mock.patch.object(entry, '_validate_cuts'), \
              mock.patch.object(entry, "Evidence", return_value=evidence), \
-             mock.patch.object(entry, "_read_preflight", return_value="engine"), \
+             mock.patch.object(entry, "_read_preflight", side_effect=reviewed), \
              mock.patch.object(entry, "_discover_engine", return_value="engine"), \
              mock.patch.object(entry.build, "DockerExecutor", Executor), \
              mock.patch.object(entry.build, "build_verified", side_effect=verified), \
-             mock.patch.object(entry, "run_draft", side_effect=phases):
+             mock.patch.object(entry, "_run_phases", side_effect=phases):
             with self.assertRaisesRegex(RuntimeError, "phase failure"):
                 entry.run(args)
-        self.assertEqual(["enter", "preflight0", entry.provenance.OLD_SR, "enter", "preflight1", entry.provenance.NEW_SR,
+        self.assertEqual(['reviewed', 'producer', "enter", "preflight0", entry.provenance.OLD_SR, "enter", "preflight1", entry.provenance.NEW_SR,
                           "exit1", "exit0"], events)
         self.assertEqual({'old': 'passed', 'new': 'passed'}, evidence.data['image_cleanup'])
         self.assertEqual('failed', evidence.data['status'])

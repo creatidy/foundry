@@ -30,6 +30,10 @@ from installed_worker_control import assert_input_boundary, run_stale_installed,
 
 RUNNER = b"import json, sys\nfrom worker_mi_acceptance import run_in_container\nprint(json.dumps(run_in_container(json.load(sys.stdin)), separators=(',', ':')))\n"
 
+# An internal wiring guard, not a security boundary against Python callers who
+# can inspect or modify this process. Operator and host trust remain external.
+_ORCHESTRATION = object()
+
 PHASE_CHECKS = {
     'baseline': ['missing_and_invalid_credentials_rejected', 'admin_csrf_and_inference_separation', 'untrusted_and_wrong_hostname_tls_rejected', 'mi_disabled_4097_admitted'],
     'execution': ['worker_execution_scenario_completed'],
@@ -230,12 +234,10 @@ def _execution(adapter, helper, fake, args):
     return result
 
 
-def run_draft(args, *, prepared=None, evidence=None):
-    """Execute the six isolated installed acceptance phases."""
-    if not args.authorize_disposable_linux_engine:
-        raise ValueError("explicit approval of a bounded disposable Linux engine required")
-    if prepared is None:
-        prepared = _prepare(args)
+def _run_phases(args, *, prepared, evidence, _capability=None):
+    """Execute phases only after the full runner's verified build sequence."""
+    if _capability is not _ORCHESTRATION:
+        raise ValueError("installed phases require authorized orchestration")
     helper, fake, cuts = prepared
     _validate_cuts(cuts)
     fresh_publication, fresh_trust = cuts["fresh"]
@@ -519,7 +521,7 @@ def run(args):
     prepared = _prepare(args)
     evidence = Evidence(args.evidence_dir)
     try:
-        _run_authorized(args, source, real_source, prepared, evidence)
+        _run_authorized(args, source, real_source, prepared, evidence, _capability=_ORCHESTRATION)
     except BaseException:
         evidence.data['status'] = 'failed'
         for name, status in evidence.data['preflight'].items():
@@ -535,7 +537,9 @@ def run(args):
             evidence.close()
 
 
-def _run_authorized(args, source, real_source, prepared, evidence):
+def _run_authorized(args, source, real_source, prepared, evidence, *, _capability=None):
+    if _capability is not _ORCHESTRATION:
+        raise ValueError("installed builds require authorized orchestration")
     args.engine_id = _discover_engine(args)
     evidence.data['engine_id'] = args.engine_id
     evidence.save()
@@ -584,7 +588,7 @@ def _run_authorized(args, source, real_source, prepared, evidence):
                                                      base_digest=args.base_digest, sr_repo=args.sr_repo, mi_repo=args.mi_repo)
             evidence.data['images']['new'] = {'id': args.new_image_id, 'sr_revision': provenance.NEW_SR, 'mi_revision': provenance.MI, 'base_digest': args.base_digest}
             evidence.save()
-            run_draft(args, prepared=prepared, evidence=evidence)
+            _run_phases(args, prepared=prepared, evidence=evidence, _capability=_ORCHESTRATION)
 
 
 def main():

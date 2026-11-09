@@ -11,16 +11,14 @@ import stat
 import subprocess
 import sys
 import tarfile
-import tempfile
 import uuid
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 from local_tls_init import no_acl, open_parent
 from local_tls_up import validate_mi
 from installed_admin import AdminSession
-from installed_provisioning import LABEL, CommandFailure, verify_mi_metadata
+from installed_provisioning import LABEL, CommandFailure
 import mi_publication_fixture as fixture
-import host_mi_provenance
 
 
 def write_mi_in_place(destination, filename, data):
@@ -153,13 +151,10 @@ class InstalledLifecycleAdapter:
             raise ValueError("MI trust exceeds limit")
         kind = "fresh" if expected_digest == fixture.EXPECTED_SHA256 else next(
             name for name, digest in fixture.VARIANT_SHA256.items() if digest == expected_digest)
-        host_mi_provenance.require_verified_host_mi()
-        verify_mi_metadata()
-        with tempfile.TemporaryDirectory(prefix="foundry-cut-verify-") as scratch:
-            expected_trust = fixture.publish_fixture(Path(scratch), publication_path="/run/foundry/mi/publication.json",
-                                                     kind=kind)
-            if json.loads(trust) != expected_trust:
-                raise ValueError("MI trust does not match the pinned fixture")
+        fixture.validate_cut(kind, (publication, trust))
+        if (not isinstance(self.project.mi_cuts, dict) or
+                self.project.mi_cuts.get(kind) != (publication, trust)):
+            raise ValueError("MI cut does not match the verified fixture")
         def configure(directory):
             write_mi_in_place(directory, "publication.json", publication)
             write_mi_in_place(directory, "trust.json", trust)

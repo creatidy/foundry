@@ -105,13 +105,13 @@ class OfflineLifecycleTests(unittest.TestCase):
     def test_entrypoint_always_requests_cleanup_on_worker_failure(self):
         args = SimpleNamespace(authorize_disposable_linux_engine=True, socket="/private/sock", engine_id="engine-id",
                                old_image_id="old", new_image_id="new", worker_sha256="a" * 64,
-                               fake_appserver="fake", fake_sha256="b" * 64)
+                               fake_appserver="fake", fake_sha256="b" * 64, mi_python="/python", mi_wheel="/mi.whl", mi_repo="/mi")
         project = mock.Mock(token="c" * 32)
         adapter = mock.Mock()
         adapter.admin.cookie, adapter.admin.csrf = "cookie", "csrf"
-        with mock.patch.object(entry.host_mi_provenance, "require_verified_host_mi"), \
-             mock.patch.object(entry, "_checked_file", return_value=b"fixture"), \
-             mock.patch.object(entry, "verify_mi_metadata"), mock.patch.object(entry, "controlled_cuts", return_value={"fresh": (b"fresh", b"trust")}), \
+        with mock.patch.object(entry, "_checked_file", return_value=b"fixture"), \
+             mock.patch.object(entry.host_mi_provenance, "generate_cuts", return_value={"fresh": (b"fresh", b"trust")}), \
+             mock.patch.object(entry, "_validate_cuts"), \
              mock.patch.object(entry, "InstalledProject", return_value=project), \
              mock.patch.object(entry, "InstalledLifecycleAdapter", return_value=adapter), \
              mock.patch.object(entry, "_security_negatives"), mock.patch.object(entry, "_client", return_value="key"), \
@@ -181,6 +181,7 @@ class OfflineLifecycleTests(unittest.TestCase):
         trust = json.dumps({"publication": "/run/foundry/mi/publication.json",
                             "reference": {"sha256": digest}}).encode()
         project = mock.Mock(root=None, image_id=old, port=None)
+        project.mi_cuts = {"stale": (data, trust)}
         adapter = lifecycle.InstalledLifecycleAdapter(project, old, new)
         with tempfile.TemporaryDirectory() as tmp:
             directory = Path(tmp) / "mi"
@@ -190,9 +191,7 @@ class OfflineLifecycleTests(unittest.TestCase):
                 (directory / name).write_bytes(b"old")
                 (directory / name).chmod(0o640)
             with mock.patch.dict(lifecycle.fixture.VARIANT_SHA256, {"stale": digest}), \
-                 mock.patch.object(lifecycle.host_mi_provenance, "require_verified_host_mi"), \
-                 mock.patch.object(lifecycle, "verify_mi_metadata"), \
-                 mock.patch.object(lifecycle.fixture, "publish_fixture", return_value=json.loads(trust)), \
+                 mock.patch.dict(lifecycle.fixture.TRUST_SHA256, {"stale": hashlib.sha256(trust).hexdigest()}), \
                  mock.patch.object(adapter.admin, "bootstrap"), mock.patch.object(adapter.admin, "login"):
                 project.start.side_effect = lambda **kwargs: kwargs["configure_mi"](directory)
                 adapter.start_new_with_cut(data, trust, digest)
@@ -209,17 +208,17 @@ class OfflineLifecycleTests(unittest.TestCase):
             adapter.start_new_with_cut(b"untrusted", b"{}", hashlib.sha256(b"untrusted").hexdigest())
         project.start.assert_not_called()
 
-    def test_new_cut_refuses_unverified_host_mi(self):
+    def test_new_cut_refuses_mismatched_verified_cut(self):
         old, new = "sha256:" + "a" * 64, "sha256:" + "b" * 64
         project = mock.Mock(root=None, image_id=old, port=None)
+        project.mi_cuts = {}
         adapter = lifecycle.InstalledLifecycleAdapter(project, old, new)
         data = b"synthetic"
         digest = hashlib.sha256(data).hexdigest()
         with mock.patch.dict(lifecycle.fixture.VARIANT_SHA256, {"stale": digest}), \
-             mock.patch.object(lifecycle, "verify_mi_metadata") as metadata:
-            with self.assertRaisesRegex(RuntimeError, "host MI execution disabled"):
+             mock.patch.dict(lifecycle.fixture.TRUST_SHA256, {"stale": hashlib.sha256(b"{}").hexdigest()}):
+            with self.assertRaisesRegex(ValueError, "verified fixture"):
                 adapter.start_new_with_cut(data, b"{}", digest)
-        metadata.assert_not_called()
         project.start.assert_not_called()
 
     def test_expected_mi_failure_requires_new_matching_exited_container(self):

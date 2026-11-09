@@ -18,35 +18,23 @@ import local_tls_up
 
 
 class FixturePreparationTests(unittest.TestCase):
-    def setUp(self):
-        patcher = mock.patch.object(provisioning.host_mi_provenance, "require_verified_host_mi")
-        patcher.start()
-        self.addCleanup(patcher.stop)
-
-    def test_prepare_refuses_unverified_mi_before_side_effects(self):
-        with tempfile.TemporaryDirectory() as tmp, \
-             mock.patch.object(provisioning.host_mi_provenance, "require_verified_host_mi", side_effect=RuntimeError("unverified")), \
-             mock.patch.object(provisioning, "verify_mi_metadata") as metadata:
+    def test_prepare_refuses_missing_cut_before_side_effects(self):
+        with tempfile.TemporaryDirectory() as tmp:
             destination = Path(tmp) / "inputs"
-            with self.assertRaisesRegex(RuntimeError, "unverified"):
-                provisioning.prepare_mi(destination)
+            with self.assertRaisesRegex(ValueError, "independently pinned"):
+                provisioning.prepare_mi(destination, None)
             self.assertFalse(destination.exists())
-            metadata.assert_not_called()
 
     def test_protected_inputs_and_no_reuse(self):
         payload = b"synthetic test payload"
         digest = hashlib.sha256(payload).hexdigest()
 
-        def publish(directory, *, publication_path):
-            (directory / (digest + ".json")).write_bytes(payload)
-            return {"publication": publication_path, "reference": {"sha256": digest}}
-
-        with tempfile.TemporaryDirectory() as tmp, \
-             mock.patch.object(provisioning, "verify_mi_metadata"), \
-             mock.patch.object(provisioning.fixture, "publish_fixture", side_effect=publish), \
-             mock.patch.object(provisioning.fixture, "EXPECTED_SHA256", digest):
+        trust = json.dumps({"publication": "/run/foundry/mi/publication.json", "reference": {"sha256": digest}}).encode()
+        cut = (payload, trust)
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(provisioning.fixture, "EXPECTED_SHA256", digest), \
+             mock.patch.dict(provisioning.fixture.TRUST_SHA256, {"fresh": hashlib.sha256(trust).hexdigest()}):
             destination = Path(tmp) / "inputs"
-            self.assertEqual(digest, provisioning.prepare_mi(destination))
+            self.assertEqual(digest, provisioning.prepare_mi(destination, cut))
             self.assertEqual(0o750, stat.S_IMODE(destination.stat().st_mode))
             for name in ("trust.json", "publication.json"):
                 info = (destination / name).stat()
@@ -56,56 +44,18 @@ class FixturePreparationTests(unittest.TestCase):
             self.assertEqual(digest, json.loads((destination / "trust.json").read_text())["reference"]["sha256"])
             local_tls_up.validate_mi(str(destination), digest)
             with self.assertRaises(FileExistsError):
-                provisioning.prepare_mi(destination)
+                provisioning.prepare_mi(destination, cut)
             self.assertEqual(payload, (destination / "publication.json").read_bytes())
 
-    def test_bad_digest_and_provenance_fail_before_creating_destination(self):
+    def test_bad_digest_and_reference_fail_before_creating_destination(self):
         with tempfile.TemporaryDirectory() as tmp:
             destination = Path(tmp) / "inputs"
-            with mock.patch.object(provisioning, "verify_mi_metadata", side_effect=ValueError("provenance")):
-                with self.assertRaisesRegex(ValueError, "provenance"):
-                    provisioning.prepare_mi(destination)
-            self.assertFalse(destination.exists())
-
-            def corrupt(directory, *, publication_path):
-                (directory / (provisioning.fixture.EXPECTED_SHA256 + ".json")).write_bytes(b"bad")
-                return {"publication": publication_path, "reference": {"sha256": provisioning.fixture.EXPECTED_SHA256}}
-
-            with mock.patch.object(provisioning, "verify_mi_metadata"), \
-                 mock.patch.object(provisioning.fixture, "publish_fixture", side_effect=corrupt):
+            with mock.patch.object(provisioning.fixture, "EXPECTED_SHA256", hashlib.sha256(b"good").hexdigest()):
                 with self.assertRaisesRegex(ValueError, "reference mismatch"):
-                    provisioning.prepare_mi(destination)
+                    provisioning.prepare_mi(destination, (b"bad", b"{}"))
+                with self.assertRaisesRegex(ValueError, "reference mismatch"):
+                    provisioning.prepare_mi(destination, (b"good", b"{}"))
             self.assertEqual([], list(Path(tmp).iterdir()))
-
-    def test_metadata_requires_expected_vcs_and_matching_import(self):
-        class Distribution:
-            def __init__(self, record):
-                self.record = record
-
-            def read_text(self, _):
-                return json.dumps(self.record)
-
-            def locate_file(self, name):
-                return Path("/test/dist") / name
-
-        record = {"url": "https://forgejo.creatidy.com/Creatidy/model-intelligence.git",
-                  "vcs_info": {"vcs": "git", "commit_id": provisioning.fixture.MI_REVISION}}
-        with mock.patch.object(provisioning.importlib.metadata, "distribution", return_value=Distribution(record)), \
-             mock.patch.object(provisioning.importlib.util, "find_spec") as spec:
-            spec.return_value.origin = "/test/dist/model_intelligence/__init__.py"
-            provisioning.verify_mi_metadata()
-            record["vcs_info"]["commit_id"] = "0" * 40
-            with self.assertRaises(ValueError):
-                provisioning.verify_mi_metadata()
-            record["vcs_info"]["commit_id"] = provisioning.fixture.MI_REVISION
-            record["dir_info"] = {"editable": True}
-            with self.assertRaises(ValueError):
-                provisioning.verify_mi_metadata()
-            del record["dir_info"]
-            spec.return_value.origin = "/elsewhere/model_intelligence/__init__.py"
-            with self.assertRaises(ValueError):
-                provisioning.verify_mi_metadata()
-
 
 class SocketValidationTests(unittest.TestCase):
     def validate(self, *, directories=None, endpoint=None, accessible=True, xattr_error=errno.ENODATA):
@@ -177,7 +127,7 @@ class OrchestrationTests(unittest.TestCase):
     def project(self):
         return provisioning.InstalledProject(socket_path="/private/docker.sock", engine_id="disposable-id-123",
                                              image_id="sha256:" + "a" * 64,
-                                             authorization="disposable-linux-engine-approved")
+                                             authorization="disposable-linux-engine-approved", mi_cuts={"fresh": (b"x", b"y")})
 
     def test_authorization_and_socket_are_required(self):
         with self.assertRaises(ValueError):

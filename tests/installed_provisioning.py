@@ -5,8 +5,6 @@ or of an image. Runtime operations require explicit separate operator approval.
 """
 
 import hashlib
-import importlib.metadata
-import importlib.util
 import json
 import os
 from pathlib import Path
@@ -23,7 +21,6 @@ import time
 import uuid
 
 import mi_publication_fixture as fixture
-import host_mi_provenance
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 from local_tls_init import no_acl, open_parent
@@ -98,7 +95,7 @@ class InstalledProject:
     storage quotas. Docker metadata alone cannot prove these properties.
     """
 
-    def __init__(self, *, socket_path, engine_id, image_id, authorization):
+    def __init__(self, *, socket_path, engine_id, image_id, authorization, mi_cuts=None):
         if authorization != "disposable-linux-engine-approved":
             raise ValueError("explicit disposable engine authorization required")
         if not re.fullmatch(r"sha256:[0-9a-f]{64}", image_id):
@@ -122,6 +119,7 @@ class InstalledProject:
         self.env = None
         self._engine_blocked = False
         self._inspection_only = False
+        self.mi_cuts = mi_cuts
 
     def _run(self, args, timeout=20, input_data=None, *, binary=False, merge_output=False, output_limit=None):
         global _ENGINE_VERIFICATION_FAILED
@@ -242,6 +240,8 @@ class InstalledProject:
     def start(self, *, mi_enabled=True, configure_mi=None, mi_digest=fixture.EXPECTED_SHA256):
         if self.root is not None:
             raise ValueError("project has already been started")
+        if not isinstance(self.mi_cuts, dict) or "fresh" not in self.mi_cuts:
+            raise ValueError("verified synthetic MI cuts required")
         self.root = Path(tempfile.mkdtemp(prefix="foundry-accept-"))
         os.chmod(self.root, 0o700)
         for name in ("compose.yaml", "scripts/local_tls_up.py", "scripts/local_tls_init.py",
@@ -262,7 +262,7 @@ class InstalledProject:
                     "FOUNDRY_TEST_DOCKER_HOST": "unix://" + str(self.socket_path)}
         self._verify_engine()
         self._run([sys.executable, "scripts/local_tls_init.py"], timeout=30)
-        prepare_mi(self.root / "mi")
+        prepare_mi(self.root / "mi", self.mi_cuts["fresh"])
         if configure_mi is not None:
             configure_mi(self.root / "mi")
         return self.launch(self.image_id, mi_enabled=mi_enabled, adopt=False, mi_digest=mi_digest)
@@ -529,62 +529,43 @@ class InstalledProject:
         self.port = None
 
 
-def verify_mi_metadata():
-    """Reject anything but the declared direct VCS revision and package location."""
-    dist = importlib.metadata.distribution("model-intelligence")
-    direct = json.loads(dist.read_text("direct_url.json") or "null")
-    if (not isinstance(direct, dict) or
-            direct.get("url") != "https://forgejo.creatidy.com/Creatidy/model-intelligence.git" or
-            direct.get("vcs_info", {}).get("vcs") != "git" or
-            direct.get("vcs_info", {}).get("commit_id") != fixture.MI_REVISION or
-            direct.get("dir_info", {}).get("editable", False)):
-        raise ValueError("MI distribution provenance does not match the pinned revision")
-    spec = importlib.util.find_spec("model_intelligence")
-    expected = Path(dist.locate_file("model_intelligence/__init__.py")).resolve()
-    if spec is None or spec.origin is None or Path(spec.origin).resolve() != expected:
-        raise ValueError("MI import does not resolve to the declared distribution")
-
-
-def prepare_mi(destination):
+def prepare_mi(destination, cut):
     """Create protected local_tls_up inputs in a new directory under a 0700 parent.
 
     The returned digest is independently fixed in the fixture. No existing
     destination is adopted, and no TLS, container, network or volume is created.
     """
-    host_mi_provenance.require_verified_host_mi()
-    verify_mi_metadata()
+    fixture.validate_cut("fresh", cut)
+    data, trust_data = cut
+    if (not isinstance(data, bytes) or not isinstance(trust_data, bytes) or
+            len(data) > fixture.MAX_BYTES or len(trust_data) > 256 * 1024 or
+            hashlib.sha256(data).hexdigest() != fixture.EXPECTED_SHA256):
+        raise ValueError("MI publication reference mismatch")
+    trust = json.loads(trust_data)
+    if (not isinstance(trust, dict) or trust.get("reference", {}).get("sha256") != fixture.EXPECTED_SHA256 or
+            trust.get("publication") != "/run/foundry/mi/publication.json"):
+        raise ValueError("MI publication reference mismatch")
     destination = os.fspath(destination)
     parent, name = open_parent(destination)
     directory = None
     created = False
     written = []
     try:
-        # The publisher's scratch directory remains private and is discarded.
-        with tempfile.TemporaryDirectory(prefix="mi-fixture-", dir=os.path.dirname(destination)) as scratch:
-            trust = fixture.publish_fixture(Path(scratch), publication_path="/run/foundry/mi/publication.json")
-            data = (Path(scratch) / (fixture.EXPECTED_SHA256 + ".json")).read_bytes()
-            if (len(data) > fixture.MAX_BYTES or hashlib.sha256(data).hexdigest() != fixture.EXPECTED_SHA256 or
-                    trust.get("reference", {}).get("sha256") != fixture.EXPECTED_SHA256 or
-                    trust.get("publication") != "/run/foundry/mi/publication.json"):
-                raise ValueError("MI publication reference mismatch")
-            trust_data = json.dumps(trust, sort_keys=True, separators=(",", ":")).encode("utf-8")
-            if len(trust_data) > 256 * 1024:
-                raise ValueError("MI trust configuration too large")
-            os.mkdir(name, 0o700, dir_fd=parent)
-            created = True
-            directory = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent)
-            os.fchown(directory, -1, os.getegid())
-            os.fchmod(directory, 0o750)
-            no_acl(directory)
-            for filename, content in (("trust.json", trust_data), ("publication.json", data)):
-                fd = os.open(filename, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
-                             0o600, dir_fd=directory)
-                written.append(filename)
-                with os.fdopen(fd, "wb") as stream:
-                    os.fchown(stream.fileno(), -1, os.getegid())
-                    os.fchmod(stream.fileno(), 0o640)
-                    no_acl(stream.fileno())
-                    stream.write(content)
+        os.mkdir(name, 0o700, dir_fd=parent)
+        created = True
+        directory = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent)
+        os.fchown(directory, -1, os.getegid())
+        os.fchmod(directory, 0o750)
+        no_acl(directory)
+        for filename, content in (("trust.json", trust_data), ("publication.json", data)):
+            fd = os.open(filename, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                         0o600, dir_fd=directory)
+            written.append(filename)
+            with os.fdopen(fd, "wb") as stream:
+                os.fchown(stream.fileno(), -1, os.getegid())
+                os.fchmod(stream.fileno(), 0o640)
+                no_acl(stream.fileno())
+                stream.write(content)
         return fixture.EXPECTED_SHA256
     except BaseException:
         if created:

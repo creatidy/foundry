@@ -22,9 +22,9 @@ import host_mi_provenance
 import mi_publication_fixture as fixture
 import zai_real_source_check as zai
 from installed_lifecycle_adapter import InstalledLifecycleAdapter
-from installed_mi_lifecycle_scenario import (_bound_selection, controlled_cuts, run_lifecycle_acceptance,
+from installed_mi_lifecycle_scenario import (_bound_selection, run_lifecycle_acceptance,
                                              run_preactivation_failure, run_variant_reload_acceptance)
-from installed_provisioning import CommandFailure, InstalledProject, ROOT, validate_engine_socket, verify_mi_metadata
+from installed_provisioning import CommandFailure, InstalledProject, ROOT, validate_engine_socket
 from installed_worker_control import assert_input_boundary, run_stale_installed, start_live_worker
 
 
@@ -105,10 +105,10 @@ def _checked_file(path, expected):
 
 
 @contextmanager
-def _project(args, *, baseline=False, phase=None, evidence=None):
+def _project(args, *, baseline=False, phase=None, evidence=None, cuts=None):
     old, new = (args.new_image_id, args.old_image_id) if baseline else (args.old_image_id, args.new_image_id)
     project = InstalledProject(socket_path=args.socket, engine_id=args.engine_id, image_id=old,
-                               authorization="disposable-linux-engine-approved")
+                               authorization="disposable-linux-engine-approved", mi_cuts=cuts)
     record = None
     if evidence is not None:
         record = evidence.data['phases'][phase] = {'status': 'running', 'cleanup': 'pending'}
@@ -237,9 +237,10 @@ def run_draft(args, *, prepared=None, evidence=None):
     if prepared is None:
         prepared = _prepare(args)
     helper, fake, cuts = prepared
+    _validate_cuts(cuts)
     fresh_publication, fresh_trust = cuts["fresh"]
 
-    with _project(args, baseline=True, phase='baseline', evidence=evidence) as adapter:
+    with _project(args, baseline=True, phase='baseline', evidence=evidence, cuts=cuts) as adapter:
         adapter.start_old()  # The project's "old" image is the current image in this phase.
         _security_negatives(adapter)
         key = _client(adapter, "MI-disabled baseline")
@@ -255,14 +256,14 @@ def run_draft(args, *, prepared=None, evidence=None):
         finally:
             control.close()
 
-    with _project(args, phase='execution', evidence=evidence) as adapter:
+    with _project(args, phase='execution', evidence=evidence, cuts=cuts) as adapter:
         adapter.start_new_with_cut(fresh_publication, fresh_trust, fixture.EXPECTED_SHA256)
         result = _execution(adapter, helper, fake, args)
         if evidence is not None:
             evidence.data['phases']['execution']['worker'] = result
             evidence.save()
 
-    with _project(args, phase='variant_reload', evidence=evidence) as adapter:
+    with _project(args, phase='variant_reload', evidence=evidence, cuts=cuts) as adapter:
         adapter.start_new_with_cut(fresh_publication, fresh_trust, fixture.EXPECTED_SHA256)
         key = _client(adapter, "fresh variant reload")
         control = _control(adapter, helper, fake, args)
@@ -278,11 +279,11 @@ def run_draft(args, *, prepared=None, evidence=None):
         finally:
             control.close()
 
-    with _project(args, phase='stale_startup', evidence=evidence) as adapter:
+    with _project(args, phase='stale_startup', evidence=evidence, cuts=cuts) as adapter:
         run_stale_installed(adapter, cuts, helper, fake,
                             helper_sha256=args.worker_sha256, fake_sha256=args.fake_sha256)
 
-    with _project(args, phase='preactivation', evidence=evidence) as adapter:
+    with _project(args, phase='preactivation', evidence=evidence, cuts=cuts) as adapter:
         adapter.start_new_with_cut(fresh_publication, fresh_trust, fixture.EXPECTED_SHA256)
         key = _client(adapter, "preactivation retained client")
         control = _control(adapter, helper, fake, args)
@@ -302,7 +303,7 @@ def run_draft(args, *, prepared=None, evidence=None):
 
         run_preactivation_failure(adapter, fresh_trust, key, retained, verify_cut)
 
-    with _project(args, phase='migration_backup_restore', evidence=evidence) as adapter:
+    with _project(args, phase='migration_backup_restore', evidence=evidence, cuts=cuts) as adapter:
         run_lifecycle_acceptance(
             adapter, fresh_publication,
             start_worker=lambda mode, archive: start_live_worker(
@@ -311,11 +312,41 @@ def run_draft(args, *, prepared=None, evidence=None):
 
 
 def _prepare(args):
-    host_mi_provenance.require_verified_host_mi()
     helper = _checked_file(ROOT / "tests" / "worker_mi_acceptance.py", args.worker_sha256)
     fake = _checked_file(args.fake_appserver, args.fake_sha256)
-    verify_mi_metadata()
-    return helper, fake, controlled_cuts()
+    cuts = host_mi_provenance.generate_cuts(args.mi_python, args.mi_wheel, args.mi_repo)
+    _validate_cuts(cuts)
+    return helper, fake, cuts
+
+
+def _validate_cuts(cuts):
+    expected = {"fresh": fixture.EXPECTED_SHA256, **fixture.VARIANT_SHA256}
+    if not isinstance(cuts, dict) or set(cuts) != set(expected):
+        raise ValueError("invalid verified MI cuts")
+    configuration = {"reasoning_effort": "high", "variant": "high"}
+    for kind, digest in expected.items():
+        cut = cuts[kind]
+        if (not isinstance(cut, tuple) or len(cut) != 2 or
+                not all(isinstance(part, bytes) and len(part) <= fixture.MAX_BYTES for part in cut) or
+                hashlib.sha256(cut[0]).hexdigest() != digest):
+            raise ValueError("invalid verified MI publication")
+        trust = {
+            "schema_version": 1, "publication": "/run/foundry/mi/publication.json",
+            "reference": {"format_version": 1, "payload_schema": fixture.PAYLOAD_SCHEMA, "sha256": digest},
+            "scope": {"scope_id": "foundry-incompatible-fixture/1" if kind == "incompatible" else "foundry-controlled-fixture/1",
+                      "channel": "worker_bridged", "configuration": configuration,
+                      "source_ids": ["foundry-synthetic-source"]},
+            "bindings": [{"identity": {"provider": "openai", "model": "gpt-6-sol", "variant": "high"},
+                          "subject": {"model_id": "foundry-synthetic-id", "provider_id": "openai",
+                                      "provider_model_id": "gpt-6-sol", "physical_model_id": None,
+                                      "revision": "fixture-1", "channel": "worker_bridged",
+                                      "interface_id": "foundry-synthetic-api", "interface_provider_id": "foundry-synthetic-provider",
+                                      "interface_version": "1", "configuration": configuration},
+                          "dimension": "foundry.input", "meaning": "input-allowance", "basis": "fixture-basis"}],
+            "max_bytes": fixture.MAX_BYTES,
+        }
+        if cut[1] != json.dumps(trust, sort_keys=True, separators=(",", ":")).encode():
+            raise ValueError("verified MI trust mismatch")
 
 
 def _discover_engine(args):
@@ -469,8 +500,9 @@ def run(args):
     if args.engine_id is not None and args.engine_id != expected_engine:
         raise ValueError('expected engine differs from reviewed preflight')
     args.engine_id = expected_engine
-    if not all((args.sr_repo, args.mi_repo, args.worker_sha256, args.fake_appserver, args.fake_sha256)):
-        raise ValueError('full acceptance requires source repositories and pinned worker fixture inputs')
+    if not all((args.sr_repo, args.mi_repo, args.worker_sha256, args.fake_appserver, args.fake_sha256,
+                args.mi_python, args.mi_wheel)):
+        raise ValueError('full acceptance requires source repositories, verified MI wheel inputs and pinned worker fixtures')
     for path in (args.sr_repo, args.mi_repo):
         if not Path(path).is_absolute() or not Path(path).is_dir():
             raise ValueError("absolute existing authenticated source repositories required")
@@ -568,6 +600,8 @@ def main():
     parser.add_argument("--base-digest", required=True)
     parser.add_argument("--sr-repo")
     parser.add_argument("--mi-repo")
+    parser.add_argument("--mi-python", help="absolute trusted Python used for the isolated synthetic MI producer")
+    parser.add_argument("--mi-wheel", help="absolute path to the independently pinned synthetic MI wheel")
     parser.add_argument("--worker-sha256")
     parser.add_argument("--fake-appserver")
     parser.add_argument("--fake-sha256")

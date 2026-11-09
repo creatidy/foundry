@@ -2,6 +2,7 @@
 
 from types import SimpleNamespace
 import json
+import hashlib
 import os
 from pathlib import Path
 import shutil
@@ -15,15 +16,45 @@ import run_installed_acceptance as entry
 
 
 class WiringTests(unittest.TestCase):
-    def test_prepare_fails_before_loading_unverified_host_mi(self):
-        with mock.patch.object(entry, '_checked_file') as checked, \
-             mock.patch.object(entry, 'verify_mi_metadata') as metadata, \
-             mock.patch.object(entry, 'controlled_cuts') as cuts:
-            with self.assertRaisesRegex(RuntimeError, 'host MI execution disabled'):
-                entry._prepare(SimpleNamespace())
-        checked.assert_not_called()
-        metadata.assert_not_called()
-        cuts.assert_not_called()
+    def test_cut_validation_rejects_changed_trust_and_publication(self):
+        digests = {kind: hashlib.sha256(kind.encode()).hexdigest() for kind in
+                   ('fresh', 'stale', 'withdrawn', 'incompatible')}
+        configuration = {'reasoning_effort': 'high', 'variant': 'high'}
+        def trust(kind):
+            return {'schema_version': 1, 'publication': '/run/foundry/mi/publication.json',
+                    'reference': {'format_version': 1, 'payload_schema': entry.fixture.PAYLOAD_SCHEMA, 'sha256': digests[kind]},
+                    'scope': {'scope_id': 'foundry-incompatible-fixture/1' if kind == 'incompatible' else 'foundry-controlled-fixture/1',
+                              'channel': 'worker_bridged', 'configuration': configuration, 'source_ids': ['foundry-synthetic-source']},
+                    'bindings': [{'identity': {'provider': 'openai', 'model': 'gpt-6-sol', 'variant': 'high'},
+                                  'subject': {'model_id': 'foundry-synthetic-id', 'provider_id': 'openai',
+                                              'provider_model_id': 'gpt-6-sol', 'physical_model_id': None,
+                                              'revision': 'fixture-1', 'channel': 'worker_bridged',
+                                              'interface_id': 'foundry-synthetic-api', 'interface_provider_id': 'foundry-synthetic-provider',
+                                              'interface_version': '1', 'configuration': configuration},
+                                  'dimension': 'foundry.input', 'meaning': 'input-allowance', 'basis': 'fixture-basis'}],
+                    'max_bytes': entry.fixture.MAX_BYTES}
+        cuts = {kind: (kind.encode(), json.dumps(trust(kind), sort_keys=True, separators=(',', ':')).encode()) for kind in digests}
+        with mock.patch.object(entry.fixture, 'EXPECTED_SHA256', digests['fresh']), \
+             mock.patch.object(entry.fixture, 'VARIANT_SHA256', {k: v for k, v in digests.items() if k != 'fresh'}):
+            entry._validate_cuts(cuts)
+            changed = dict(cuts)
+            changed['fresh'] = (b'wrong', cuts['fresh'][1])
+            with self.assertRaisesRegex(ValueError, 'publication'):
+                entry._validate_cuts(changed)
+            altered = trust('fresh')
+            altered['bindings'][0]['identity']['model'] = 'other'
+            changed['fresh'] = (cuts['fresh'][0], json.dumps(altered, sort_keys=True, separators=(',', ':')).encode())
+            with self.assertRaisesRegex(ValueError, 'trust mismatch'):
+                entry._validate_cuts(changed)
+
+    def test_prepare_uses_verified_producer_and_propagates_failure(self):
+        args = SimpleNamespace(worker_sha256='a' * 64, fake_appserver='/fake', fake_sha256='b' * 64,
+                               mi_python='/python', mi_wheel='/wheel', mi_repo='/mi')
+        with mock.patch.object(entry, '_checked_file', return_value=b'fixture'), \
+             mock.patch.object(entry.host_mi_provenance, 'generate_cuts', side_effect=ValueError('bad wheel')) as cuts:
+            with self.assertRaisesRegex(ValueError, 'bad wheel'):
+                entry._prepare(args)
+        cuts.assert_called_once_with('/python', '/wheel', '/mi')
 
     def test_project_preserves_original_error_when_cleanup_is_blocked(self):
         args = SimpleNamespace(new_image_id='new', old_image_id='old', socket='/run/docker.sock', engine_id='engine')
@@ -186,10 +217,10 @@ class WiringTests(unittest.TestCase):
 
         args = SimpleNamespace(authorize_disposable_linux_engine=True, socket="/private/sock", engine_id="engine",
                                old_image_id="old", new_image_id="new", worker_sha256="a" * 64,
-                               fake_appserver="fake", fake_sha256="b" * 64)
-        with mock.patch.object(entry.host_mi_provenance, "require_verified_host_mi"), \
-             mock.patch.object(entry, "_checked_file", return_value=b"fixture"), \
-             mock.patch.object(entry, "verify_mi_metadata"), mock.patch.object(entry, "controlled_cuts", return_value=cuts), \
+                               fake_appserver="fake", fake_sha256="b" * 64, mi_python="/python", mi_wheel="/wheel", mi_repo="/mi")
+        with mock.patch.object(entry, "_checked_file", return_value=b"fixture"), \
+             mock.patch.object(entry.host_mi_provenance, "generate_cuts", return_value=cuts), \
+             mock.patch.object(entry, "_validate_cuts"), \
              mock.patch.object(entry, "InstalledProject", Project), mock.patch.object(entry, "InstalledLifecycleAdapter", Adapter), \
              mock.patch.object(entry, "_security_negatives", side_effect=lambda a: events.append((a.project.number, "security"))), \
              mock.patch.object(entry, "_client", return_value="key"), \
@@ -226,7 +257,7 @@ class WiringTests(unittest.TestCase):
                                confirm_external_boundaries=True, sr_repo="/sr", mi_repo="/mi",
                                base_digest="sha256:" + "a" * 64, socket="/private/sock", engine_id="engine",
                                zai_python=None, zai_output_dir=None, authorize_zai_source_reads=False,
-                               worker_sha256='a' * 64, fake_appserver='/fake', fake_sha256='b' * 64,
+                               worker_sha256='a' * 64, fake_appserver='/fake', fake_sha256='b' * 64, mi_python='/python', mi_wheel='/wheel',
                                preflight_evidence='/tmp/kilo/preflight/acceptance.json',
                                evidence_dir="/tmp/kilo/test-report")
         events = []
@@ -280,7 +311,7 @@ class WiringTests(unittest.TestCase):
                                confirm_external_boundaries=True, sr_repo="/sr", mi_repo="/mi",
                                base_digest="sha256:" + "a" * 64, zai_python="/venv/bin/python",
                                zai_output_dir=None, authorize_zai_source_reads=False,
-                               worker_sha256='a' * 64, fake_appserver='/fake', fake_sha256='b' * 64,
+                               worker_sha256='a' * 64, fake_appserver='/fake', fake_sha256='b' * 64, mi_python='/python', mi_wheel='/wheel',
                                preflight_evidence='/tmp/kilo/preflight/acceptance.json', socket='/private/sock', engine_id=None)
         with mock.patch.object(entry.Path, "is_dir", return_value=True), \
              mock.patch.object(entry, "_read_preflight", return_value="engine"), \
@@ -297,7 +328,7 @@ class WiringTests(unittest.TestCase):
                                confirm_external_boundaries=True, sr_repo='/sr', mi_repo='/mi',
                                base_digest='sha256:' + 'a' * 64, socket='/sock', engine_id=None,
                                preflight_evidence='/tmp/kilo/probe/acceptance.json',
-                               worker_sha256='a' * 64, fake_appserver='/fake', fake_sha256='b' * 64,
+                               worker_sha256='a' * 64, fake_appserver='/fake', fake_sha256='b' * 64, mi_python='/python', mi_wheel='/wheel',
                                zai_python=None, zai_output_dir=None, authorize_zai_source_reads=False,
                                evidence_dir='/tmp/kilo/full')
         evidence = mock.Mock(data={'preflight': {}})

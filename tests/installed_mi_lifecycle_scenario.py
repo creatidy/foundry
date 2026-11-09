@@ -11,12 +11,9 @@ from __future__ import annotations
 import re
 import hashlib
 import json
-from pathlib import Path
-import tempfile
 from typing import Callable, Protocol
 
 import mi_publication_fixture as fixture
-import host_mi_provenance
 from mi_publication_fixture import EXPECTED_SHA256
 
 
@@ -38,25 +35,6 @@ class LifecycleAdapter(Protocol):
                  headers: dict[str, str], *, admin: bool) -> tuple[int, object]: ...
     def block_engine(self) -> None: ...
     def require_unblocked(self) -> None: ...
-
-
-def controlled_cuts() -> dict[str, tuple[bytes, bytes]]:
-    """Generate distinct synthetic inputs, checking independently fixed references."""
-    host_mi_provenance.require_verified_host_mi()
-    result = {}
-    with tempfile.TemporaryDirectory(prefix="foundry-mi-cuts-") as tmp:
-        for kind in ("fresh", "stale", "withdrawn", "incompatible"):
-            directory = Path(tmp) / kind
-            directory.mkdir()
-            digest = EXPECTED_SHA256 if kind == "fresh" else fixture.VARIANT_SHA256[kind]
-            trust = fixture.publish_fixture(directory, publication_path="/run/foundry/mi/publication.json", kind=kind)
-            publication = (directory / (digest + ".json")).read_bytes()
-            if (hashlib.sha256(publication).hexdigest() != digest or
-                    trust["reference"]["sha256"] != digest or
-                    trust["publication"] != "/run/foundry/mi/publication.json"):
-                raise ValueError("synthetic cut reference mismatch")
-            result[kind] = (publication, json.dumps(trust, sort_keys=True, separators=(",", ":")).encode())
-    return result
 
 
 def run_preactivation_failure(adapter: LifecycleAdapter, fresh_trust: bytes,

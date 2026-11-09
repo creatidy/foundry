@@ -7,6 +7,7 @@ or authenticate dependencies, start services, or assert anything about real mode
 from datetime import datetime, timezone
 from dataclasses import replace
 from decimal import Decimal
+import hashlib
 from pathlib import Path
 
 MI_REVISION = "d65891668b7e79f7b666c021f02a1b4bf8c4ca9c"
@@ -19,7 +20,23 @@ VARIANT_SHA256 = {
     "withdrawn": "c7090c7fdf6670fec532bef0ada37cad74b734d398f8d167dc98fecd1b878c12",
     "incompatible": "e8fdf18ef2b2b77586b237b8cc490af6293e60c651741874dbf3e4782599b1aa",
 }
+TRUST_SHA256 = {
+    "fresh": "1ece5e277ee0296701f111f08f765f5da27642ce206cd4bb6f68fc9959c32f99",
+    "stale": "bea868e5cfbf88f9b1aa2a641516e3dfe29862f0f252fd57ddbd5c07a6875a99",
+    "withdrawn": "898b621ba176b2fe0b957809125d189f6b7ad0609a9f60d25f5a010e98eac056",
+    "incompatible": "9f3c6ef8fede8875ca9343b39ef6c37f4c2fe3171b031dd7a590e1ff68cae117",
+}
 PAYLOAD_SCHEMA = "mi.public-evidence-working/2"
+
+
+def validate_cut(kind, cut):
+    """Validate both independently pinned inputs at installed boundaries."""
+    expected = {"fresh": EXPECTED_SHA256, **VARIANT_SHA256}
+    if (kind not in expected or not isinstance(cut, tuple) or len(cut) != 2 or
+            not all(isinstance(part, bytes) and len(part) <= MAX_BYTES for part in cut) or
+            hashlib.sha256(cut[0]).hexdigest() != expected[kind] or
+            hashlib.sha256(cut[1]).hexdigest() != TRUST_SHA256[kind]):
+        raise ValueError("invalid independently pinned MI publication or trust reference mismatch")
 
 
 def evidence():

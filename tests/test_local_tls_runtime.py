@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -12,6 +13,22 @@ import uuid
 
 
 ROOT = Path(__file__).resolve().parents[1]
+RUNTIME_FILES = ("Makefile", "compose.yaml", "scripts/local_tls_init.py", "scripts/local_tls_up.py",
+                 "scripts/docker_socket_validation.py")
+
+
+class RuntimeFixtureTests(unittest.TestCase):
+    def test_copied_startup_script_imports_without_docker(self):
+        with tempfile.TemporaryDirectory(prefix="foundry-runtime-files-") as tmp:
+            root = Path(tmp)
+            for name in RUNTIME_FILES:
+                destination = root / name
+                destination.parent.mkdir(exist_ok=True, parents=True)
+                shutil.copyfile(ROOT / name, destination)
+            result = subprocess.run([sys.executable, "-I", "-c",
+                                     "import sys; sys.path.insert(0, sys.argv[1]); import local_tls_up",
+                                     str(root / "scripts")], capture_output=True, text=True, timeout=10)
+            self.assertEqual(0, result.returncode, result.stderr)
 
 
 @unittest.skipUnless(os.environ.get("FOUNDRY_TEST_SR_IMAGE"), "set FOUNDRY_TEST_SR_IMAGE for runtime tests")
@@ -20,7 +37,7 @@ class LocalTLSRuntimeTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory(prefix="foundry-runtime-")
         self.addCleanup(self.temp.cleanup)
         self.project = Path(self.temp.name)
-        for name in ("Makefile", "compose.yaml", "scripts/local_tls_init.py", "scripts/local_tls_up.py"):
+        for name in RUNTIME_FILES:
             dest = self.project / name
             dest.parent.mkdir(exist_ok=True, parents=True)
             shutil.copyfile(ROOT / name, dest)

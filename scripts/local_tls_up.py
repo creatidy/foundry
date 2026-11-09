@@ -11,6 +11,7 @@ import sys
 import tempfile
 
 from local_tls_init import no_acl, open_parent
+from docker_socket_validation import validate_engine_socket
 
 
 def validate_mi(destination, expected):
@@ -100,21 +101,109 @@ def validate(destination):
         os.close(parent)
 
 
+class TestEngineRefusal(Exception):
+    pass
+
+
+def verify_test_engine():
+    """Recheck the selected test daemon immediately before each Docker call."""
+    if not os.environ.get("FOUNDRY_TEST_RUN_ID"):
+        return
+    expected = os.environ.get("FOUNDRY_TEST_ENGINE_ID", "")
+    host = os.environ.get("FOUNDRY_TEST_DOCKER_HOST", "")
+    if (not re.fullmatch(r"[A-Za-z0-9:._-]{12,128}", expected) or
+            not host.startswith("unix:///") or os.environ.get("DOCKER_HOST") != host or
+            any(key in os.environ for key in ("DOCKER_CONTEXT", "DOCKER_TLS_VERIFY", "DOCKER_CERT_PATH"))):
+        raise TestEngineRefusal("test engine configuration invalid")
+    try:
+        validate_engine_socket(host[len("unix://"):])
+        result = subprocess.run(["docker", "info", "--format", "{{json .}}"],
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True,
+                                timeout=20 if os.environ.get("FOUNDRY_TEST_RUN_ID") else None)
+        data = json.loads(result.stdout)
+        if (data.get("ID") != expected or data.get("OSType") != "linux" or
+                not data.get("CgroupDriver") or data["CgroupDriver"] == "none" or
+                not all(data.get(key) is True for key in ("MemoryLimit", "SwapLimit", "PidsLimit", "CpuCfsQuota"))):
+            raise TestEngineRefusal("test engine identity or controls changed")
+    except (OSError, ValueError, TypeError, AttributeError, subprocess.SubprocessError) as exc:
+        raise TestEngineRefusal("test engine identity or controls unavailable") from exc
+
+
 def check_project(project, config):
     label = "label=com.docker.compose.project=" + project
     existing = False
     for kind, args in (("container", ["container", "ls", "--all"]),
                        ("network", ["network", "ls"]),
                        ("volume", ["volume", "ls"])):
+        verify_test_engine()
         result = subprocess.run(["docker", *args, "--filter", label, "--quiet"],
-                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True,
+                                timeout=20 if os.environ.get("FOUNDRY_TEST_RUN_ID") else None)
         existing |= bool(result.stdout.strip())
     for kind, section in (("network", "networks"), ("volume", "volumes")):
         names = {entry["name"] for entry in config.get(section, {}).values()}
+        verify_test_engine()
         result = subprocess.run(["docker", kind, "ls", "--format", "{{.Name}}"],
-                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True, text=True)
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True, text=True,
+                                timeout=20 if os.environ.get("FOUNDRY_TEST_RUN_ID") else None)
         existing |= bool(names.intersection(result.stdout.splitlines()))
     return existing
+
+
+def test_override(project, token, command, volume_name=None):
+    """Fixed test-only configuration; never accepts an arbitrary override file."""
+    if not re.fullmatch(r"[0-9a-f]{32}", token) or project != "foundry-test-" + token:
+        raise ValueError("invalid test project identity")
+    label = {"org.creatidy.foundry.test-run": token}
+    volume = {"labels": label}
+    if volume_name:
+        if not re.fullmatch(re.escape(project) + r"_restore_[0-9a-f]{32}", volume_name):
+            raise ValueError("invalid test volume name")
+        volume["name"] = volume_name
+    return {
+        "services": {"router": {
+            "command": command + ["--worker-listen-host=127.0.0.1", "--worker-listen-port=8788",
+                                  "--worker-tls-certfile=/run/foundry/tls/server.crt",
+                                  "--worker-tls-keyfile=/run/foundry/tls/server.key",
+                                  "--worker-tls-reload-hostname=127.0.0.1",
+                                  "--worker-tls-reload-ca-cert=/run/foundry/tls/server.crt"],
+            "cpus": 1.0, "mem_limit": "512m", "memswap_limit": "512m", "pids_limit": 128,
+            "restart": "no", "labels": label,
+            "logging": {"driver": "json-file", "options": {"max-size": "1m", "max-file": "2"}},
+        }},
+        "networks": {"backend": {"internal": True, "labels": label}},
+        "volumes": {"router-data": volume},
+    }
+
+
+def check_test_ownership(project, token):
+    """Do not let test-only adoption take over another project's resources."""
+    volumes = set()
+    for kind in ("container", "network", "volume"):
+        base = ["docker", kind, "ls", "--quiet"]
+        if kind == "container":
+            base.append("--all")
+        def listed(label):
+            verify_test_engine()
+            result = subprocess.run(base + ["--filter", "label=" + label], check=True,
+                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=20)
+            return set(result.stdout.decode().splitlines())
+        project_ids = listed("com.docker.compose.project=" + project)
+        run_ids = listed("org.creatidy.foundry.test-run=" + token)
+        if project_ids != run_ids or len(project_ids) > 8:
+            raise ValueError("test ownership labels do not match")
+        if kind == "volume":
+            volumes = project_ids
+        for identifier in project_ids:
+            verify_test_engine()
+            result = subprocess.run(["docker", kind, "inspect", identifier], check=True,
+                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=20)
+            item = json.loads(result.stdout)[0]
+            labels = item.get("Config", {}).get("Labels", {}) if kind == "container" else item.get("Labels", {})
+            if (labels.get("com.docker.compose.project") != project or
+                    labels.get("org.creatidy.foundry.test-run") != token):
+                raise ValueError("unowned test resource")
+    return volumes
 
 
 def main():
@@ -135,13 +224,16 @@ def main():
             if not re.fullmatch(r"sha256:[0-9a-f]{64}", image_id):
                 raise ValueError("independent MI image ID required")
         base = ["docker", "compose", "-p", project, "--env-file", ".env", "-f", "compose.yaml"]
+        verify_test_engine()
         result = subprocess.run(base + ["config", "--format", "json", "--no-path-resolution"],
-                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True,
+                                timeout=20 if os.environ.get("FOUNDRY_TEST_RUN_ID") else None)
         config = json.loads(result.stdout)
         if config["name"] != project:
             raise ValueError("unexpected Compose project")
         router = config["services"]["router"]
         if mi_dir:
+            verify_test_engine()
             result = subprocess.run(["docker", "image", "inspect", router["image"]],
                                     stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True, timeout=30)
             images = json.loads(result.stdout)
@@ -174,6 +266,15 @@ def main():
                  "bind": {"create_host_path": False}}
                 for name in ("trust.json", "publication.json")
             ]
+        token = os.environ.get("FOUNDRY_TEST_RUN_ID", "")
+        if token:
+            if os.environ.get("FOUNDRY_TEST_AUTHORIZATION") != "disposable-linux-engine-approved":
+                raise ValueError("test startup requires explicit authorization")
+            bounded = test_override(project, token, override["services"]["router"]["command"],
+                                    os.environ.get("FOUNDRY_TEST_VOLUME"))
+            override["services"]["router"].update(bounded["services"]["router"])
+            override["networks"] = bounded["networks"]
+            override["volumes"] = bounded["volumes"]
         with tempfile.TemporaryDirectory(prefix="foundry-local-tls-") as tmp:
             path = os.path.join(tmp, "override.json")
             with open(path, "x", encoding="utf-8") as stream:
@@ -185,11 +286,26 @@ def main():
             if check_project(project, config):
                 if not adoption:
                     raise ValueError("project resources already exist")
+            if token:
+                selected_volume = os.environ.get("FOUNDRY_TEST_VOLUME")
+                if selected_volume and not adoption:
+                    raise ValueError("restored volume requires test project adoption")
+                if adoption:
+                    volumes = check_test_ownership(project, token)
+                    if selected_volume and selected_volume not in volumes:
+                        raise ValueError("restored volume is not owned by test project")
             command = base + ["-f", path, "up", "-d", "--no-build", "--pull", "never"]
-            if mi_dir:
+            if mi_dir or token:
                 command += ["--force-recreate", "--wait", "--wait-timeout", "60"]
+                verify_test_engine()
                 return subprocess.run(command, timeout=90).returncode
             return subprocess.run(command).returncode
+    except TestEngineRefusal:
+        print("Test engine identity verification failed.", file=sys.stderr)
+        return 70
+    except subprocess.TimeoutExpired:
+        print("Local TLS startup timed out.", file=sys.stderr)
+        return 124 if os.environ.get("FOUNDRY_TEST_RUN_ID") else 1
     except (OSError, ValueError, KeyError, TypeError, AttributeError, IndexError, subprocess.SubprocessError):
         print("Local TLS startup refused: check the project, protected TLS/MI inputs, Compose configuration and Docker.", file=sys.stderr)
         return 1

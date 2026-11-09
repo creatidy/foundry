@@ -145,6 +145,18 @@ The independent digest check is a startup check, not publisher authentication or
 
 SR activates and may persist the candidate MI cut in its durable store before it creates the TLS context or binds the HTTP listener. Consequently, a later TLS or bind failure can leave the candidate persisted even when startup fails; `--wait` does not roll back state. Inspect and back up the relevant project data before an adoption or retry, and do not infer that a failed startup left durable state unchanged.
 
+## Installed Acceptance Draft
+
+Foundry issue #1 has a **draft**, unexecuted installed SR–MI acceptance harness in `tests/run_installed_acceptance.py`. It constructs a test-only upgrade-candidate image from canonical SR `8fc4f91ff1aa4c52f4738d436fc2ac12d0b8acb1`, whose MI dependency is pinned to `d65891668b7e79f7b666c021f02a1b4bf8c4ca9c`. This is not the older SR revision currently pinned by `Dockerfile.mi`, and it is not evidence that upgrading Foundry or migrating existing data is safe. Do not use an owner installation or volume with the harness. The old image rejects the newer store schema; rollback requires a verified pre-upgrade backup, not just an image change.
+
+The harness uses the canonical Compose configuration with an explicit test-only override. Its worker runs in the server container's network namespace with a synthetic backend and fake spawner; it does not establish native worker deployment, a working Codex sandbox, real model capabilities, live-provider execution or target-host acceptance. Synthetic worker credentials exist in memory and isolated container scratch during migration tests; secure erasure is not established. Controlled synthetic MI evidence is separate from the optional Z.ai source publication, which uses MI `e8a6b81546994438038d22fd08fc041c6901d9cd` and does not establish applicability or compatibility with the image's pinned MI package.
+
+**Do not run the installed harness on the ROG Docker Desktop environment.** The operator must first provide an approved test environment with demonstrably enforced aggregate build CPU, memory, PID and storage limits, independently verified source and image trust, and a safe test-owned cleanup boundary. The available preflight only measures a probe container and available filesystem capacity; it does not prove a whole-build quota, daemon isolation, or safe cleanup of shared build cache. Obtain explicit approval for the exact host-interacting batch before running it. The CLI's authorization flags are acknowledgments, not proof that these boundaries exist. Offline fixture and mocked orchestration tests are not installed acceptance; see issue #1 for the remaining gate.
+
+Some offline component tests use whichever SR and MI packages are importable in the test environment. Their results do not independently verify package revisions or establish compatibility with the pinned image. Test reports must identify the actual source or package provenance used and retain that qualification.
+
+The full runner currently refuses before executing host-installed MI code: a verified producer execution path has not yet been implemented. The optional Z.ai acquisition is likewise disabled. Resolving that source-level gate is separate from, and does not replace, the installed-environment approval and verification gate.
+
 See [architecture](docs/architecture.md), [milestones](docs/milestones.md), and [repository migration](docs/repository-migration.md).
 
 **Publishing status:** The bootstrap is published in canonical Forgejo at `Creatidy/foundry`. Publication does not establish integrated operation or production readiness.

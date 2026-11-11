@@ -160,15 +160,15 @@ class Evidence:
                 os.close(directory_fd)
         finally:
             os.close(parent)
-        self.data = {'schema_version': 1, 'synthetic_evidence': not preflight_only, 'status': 'running',
+        self.data = {'schema_version': 2, 'synthetic_evidence': not preflight_only, 'status': 'running',
                      'scope': 'preflight_only' if preflight_only else 'synthetic_upgrade_candidate_installed_acceptance',
                      'daemon_host_isolation': 'not_established', 'builder_storage_quota': 'not_established',
                      'images': {}, 'cuts': {} if preflight_only else {'fresh': fixture.EXPECTED_SHA256, **fixture.VARIANT_SHA256},
                      'phases': {} if preflight_only else {name: {'status': 'pending', 'cleanup': 'not_started'} for name in PHASE_CHECKS},
                      'preflight': {}, 'image_cleanup': {}}
         if not preflight_only:
-            self.data['foundry_image_sr_revision'] = provenance.OLD_SR
-            self.data['candidate_image_sr_revision'] = provenance.NEW_SR
+            self.data['old_test_image_sr_revision'] = provenance.OLD_SR
+            self.data['new_test_image_sr_revision'] = provenance.NEW_SR
             self.data['foundry_image_upgrade_compatibility'] = 'not_established'
             self.data['worker_backend_scope'] = 'synthetic; native worker sandbox not verified'
             self.data['host_https_path'] = 'test TCP proxy with end-to-end router TLS; direct Docker publication not verified'
@@ -527,6 +527,7 @@ def run(args):
             raise ValueError("absolute existing authenticated source repositories required")
     manifest = _file_manifest()
     source = (ROOT / "Dockerfile.mi").read_bytes()
+    product_revision = provenance.product_revision(source)
     for revision in (provenance.OLD_SR, provenance.NEW_SR):
         provenance.dockerfile(source, revision, args.base_digest)
     real_source = (args.zai_python, args.zai_output_dir, args.authorize_zai_source_reads)
@@ -542,7 +543,7 @@ def run(args):
         fresh_publication, fresh_trust = cuts["fresh"]
 
         with _project(args, baseline=True, phase='baseline', evidence=evidence, cuts=cuts) as adapter:
-            adapter.start_old()  # The project's "old" image is the current image in this phase.
+            adapter.start_old()  # Baseline uses the new test image without MI.
             _security_negatives(adapter)
             key = _client(adapter, "MI-disabled baseline")
             control = _control(adapter, helper, fake, args)
@@ -671,6 +672,7 @@ def run(args):
     evidence = Evidence(args.evidence_dir)
     try:
         evidence.data['foundry_provenance'] = input_provenance
+        evidence.data['product_dockerfile_sr_revision'] = product_revision
         evidence.save()
         _run_authorized()
         if _file_manifest() != manifest:

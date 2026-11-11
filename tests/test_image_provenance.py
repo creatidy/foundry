@@ -30,17 +30,27 @@ class ImageProvenanceTests(unittest.TestCase):
         return p.verify_build(**values)
 
     def test_both_exact_definitions(self):
-        for revision in (p.OLD_SR, p.NEW_SR):
-            definition = p.dockerfile(self.source, revision, self.base).decode()
-            self.assertEqual(definition.count(revision), 2)
-            self.assertEqual(definition.count("FROM python:3.12-slim@" + self.base), 2)
-            self.assertIn(p.MI, definition)
-            self.assertIn("pip install --no-compile", definition)
-            self.assertIn("PYTHONDONTWRITEBYTECODE=1", definition)
-            self.assertIn("PYTHONSAFEPATH=1", definition)
-            self.assertIn("PYTHONNOUSERSITE=1", definition)
-        self.assertNotEqual(p.dockerfile(self.source, p.OLD_SR, self.base),
-                            p.dockerfile(self.source, p.NEW_SR, self.base))
+        actual = p.product_revision(self.source)
+        sources = {revision: self.source.replace(actual.encode(), revision.encode())
+                   for revision in (p.OLD_SR, p.NEW_SR)}
+        definitions = {}
+        for source_revision, source in sources.items():
+            self.assertEqual(p.DOCKERFILE_SHA256[source_revision], hashlib.sha256(source).hexdigest())
+            self.assertEqual(source_revision, p.product_revision(source))
+            for revision in sources:
+                with self.subTest(source=source_revision, target=revision):
+                    definition = p.dockerfile(source, revision, self.base)
+                    if revision in definitions:
+                        self.assertEqual(definitions[revision], definition)
+                    definitions[revision] = definition
+                    text = definition.decode()
+                    self.assertEqual(text.count(revision), 2)
+                    self.assertNotIn(p.NEW_SR if revision == p.OLD_SR else p.OLD_SR, text)
+                    self.assertEqual(text.count("FROM python:3.12-slim@" + self.base), 2)
+                    for expected in (p.MI, "pip install --no-compile", "PYTHONDONTWRITEBYTECODE=1",
+                                     "PYTHONSAFEPATH=1", "PYTHONNOUSERSITE=1"):
+                        self.assertIn(expected, text)
+        self.assertNotEqual(definitions[p.OLD_SR], definitions[p.NEW_SR])
 
     def test_mock_build_and_inspect_are_bounded(self):
         self.assertEqual(self.verify(), self.image)
@@ -50,7 +60,13 @@ class ImageProvenanceTests(unittest.TestCase):
                                                       output_limit=p.MAX_OUTPUT)
 
     def test_unknown_build_inputs_fail_before_execution(self):
-        for overrides in ({"source": self.source + b"\n"}, {"revision": "0" * 40},
+        source_revision = p.product_revision(self.source)
+        other = p.NEW_SR if source_revision == p.OLD_SR else p.OLD_SR
+        for overrides in ({"source": self.source + b"\n"},
+                          {"source": self.source.replace(source_revision.encode(), other.encode(), 1)},
+                          {"source": self.source.replace(b"FROM ", b"FROM malicious/", 1)},
+                          {"source": self.source + b"\xff"}, {"source": self.source.decode()},
+                          {"revision": "0" * 40},
                           {"base_digest": "sha256:" + "A" * 64}, {"expected_sr": {}},
                           {"expected_mi": {"../x": "a" * 64}}):
             with self.subTest(overrides=overrides), self.assertRaises(ValueError):

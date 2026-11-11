@@ -371,6 +371,31 @@ class DockerExecutorTests(unittest.TestCase):
                 ex.build(dockerfile=p.dockerfile(source, p.NEW_SR, base), timeout=p.MAX_SECONDS,
                          output_limit=p.MAX_OUTPUT)
 
+    def test_build_admits_only_definitions_from_reviewed_product_bytes(self):
+        base = "sha256:" + "a" * 64
+        source = (Path(__file__).resolve().parents[1] / "Dockerfile.mi").read_bytes()
+        actual = p.product_revision(source)
+        with patch.object(e, "InstalledProject") as cls:
+            ex = e.DockerExecutor(socket_path="/private/docker.sock", engine_id="engine", authorization="approved",
+                                  build_authorization="disposable-linux-image-build-approved")
+            ex.temp, ex.preflight_base = object(), base
+            cls.return_value._docker.side_effect = RuntimeError("mock inspection reached")
+            for revision in (p.OLD_SR, p.NEW_SR):
+                variant = source.replace(actual.encode(), revision.encode())
+                definition = p.dockerfile(variant, revision, base)
+                with self.subTest(revision=revision), patch.object(Path, "read_bytes", return_value=variant):
+                    with self.assertRaisesRegex(RuntimeError, "mock inspection reached"):
+                        ex.build(dockerfile=definition, timeout=p.MAX_SECONDS, output_limit=p.MAX_OUTPUT)
+                    cls.return_value._docker.reset_mock()
+                    with self.assertRaises(ValueError):
+                        ex.build(dockerfile=definition + b"\nRUN malicious\n", timeout=p.MAX_SECONDS,
+                                 output_limit=p.MAX_OUTPUT)
+                    cls.return_value._docker.assert_not_called()
+                with patch.object(Path, "read_bytes", return_value=variant + b"\n"):
+                    with self.assertRaises(ValueError):
+                        ex.build(dockerfile=definition, timeout=p.MAX_SECONDS, output_limit=p.MAX_OUTPUT)
+                    cls.return_value._docker.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

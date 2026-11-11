@@ -22,6 +22,7 @@ import time
 import uuid
 
 import mi_publication_fixture as fixture
+import image_provenance as provenance
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 from local_tls_init import no_acl, open_parent
@@ -98,14 +99,8 @@ def test_image_dockerfile(base_digest):
     The caller independently verifies base_digest, source and resulting image.
     Apt and transitive dependencies in the existing Dockerfile remain unpinned.
     """
-    if not re.fullmatch(r"sha256:[0-9a-f]{64}", base_digest):
-        raise ValueError("independently pinned base manifest digest required")
-    source = (ROOT / "Dockerfile.mi").read_text(encoding="utf-8")
-    if (source.count(SR_OLD_REVISION) != 2 or source.count("FROM python:3.12-slim") != 2 or
-            source.count(fixture.MI_REVISION) != 1):
-        raise ValueError("Dockerfile.mi does not match the inspected source contract")
-    return source.replace(SR_OLD_REVISION, SR_TEST_REVISION).replace(
-        "FROM python:3.12-slim", "FROM python:3.12-slim@" + base_digest)
+    source = (ROOT / "Dockerfile.mi").read_bytes()
+    return provenance.pinned_dockerfile(source, SR_TEST_REVISION, base_digest)
 
 
 class InstalledProject:

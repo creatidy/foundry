@@ -609,6 +609,20 @@ class OrchestrationTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             provisioning.test_image_dockerfile("python:latest")
 
+    def test_legacy_derivation_accepts_only_reviewed_variants(self):
+        source = (provisioning.ROOT / "Dockerfile.mi").read_bytes()
+        provenance = provisioning.provenance
+        actual = provenance.product_revision(source)
+        base = "sha256:" + "a" * 64
+        expected = provenance.pinned_dockerfile(source, provenance.NEW_SR, base)
+        for revision in (provenance.OLD_SR, provenance.NEW_SR):
+            variant = source.replace(actual.encode(), revision.encode())
+            with self.subTest(revision=revision), mock.patch.object(Path, "read_bytes", return_value=variant):
+                self.assertEqual(expected, provisioning.test_image_dockerfile(base))
+        with mock.patch.object(Path, "read_bytes", return_value=source + b"# injected\n"):
+            with self.assertRaises(ValueError):
+                provisioning.test_image_dockerfile(base)
+
     def test_startup_rejects_mismatched_adoption_labels(self):
         result = mock.Mock(stdout=b"foreign\n")
         empty = mock.Mock(stdout=b"")

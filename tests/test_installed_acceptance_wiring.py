@@ -81,6 +81,19 @@ class WiringTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             entry._input_provenance(manifest, b'changed', (helper, fake, {}), args)
 
+    def test_provenance_records_actual_reviewed_product_variant(self):
+        source = (entry.ROOT / 'Dockerfile.mi').read_bytes()
+        actual = entry.provenance.product_revision(source)
+        helper, fake = b'helper', b'fake'
+        digest = lambda data: hashlib.sha256(data).hexdigest()
+        args = SimpleNamespace(worker_sha256=digest(helper), fake_sha256=digest(fake))
+        for revision in (entry.provenance.OLD_SR, entry.provenance.NEW_SR):
+            variant = source.replace(actual.encode(), revision.encode())
+            manifest = {'tests/worker_mi_acceptance.py': digest(helper), 'Dockerfile.mi': digest(variant)}
+            with self.subTest(revision=revision):
+                record = entry._input_provenance(manifest, variant, (helper, fake, {}), args)
+                self.assertEqual(entry.provenance.DOCKERFILE_SHA256[revision], record['file_sha256']['Dockerfile.mi'])
+
     def test_manifest_rejects_symlinked_parent_directory(self):
         with tempfile.TemporaryDirectory() as directory, tempfile.TemporaryDirectory() as outside:
             root = Path(directory)
@@ -215,8 +228,10 @@ class WiringTests(unittest.TestCase):
             document = json.loads(path.read_text())
             self.assertEqual('running', document['status'])
             self.assertEqual('synthetic_upgrade_candidate_installed_acceptance', document['scope'])
-            self.assertEqual(entry.provenance.OLD_SR, document['foundry_image_sr_revision'])
-            self.assertEqual(entry.provenance.NEW_SR, document['candidate_image_sr_revision'])
+            self.assertEqual(2, document['schema_version'])
+            self.assertEqual(entry.provenance.OLD_SR, document['old_test_image_sr_revision'])
+            self.assertEqual(entry.provenance.NEW_SR, document['new_test_image_sr_revision'])
+            self.assertNotIn('foundry_image_sr_revision', document)
             self.assertEqual('not_established', document['foundry_image_upgrade_compatibility'])
             self.assertIn('sandbox not verified', document['worker_backend_scope'])
             self.assertTrue(all(item['status'] == 'pending' for item in document['phases'].values()))
@@ -459,6 +474,8 @@ class WiringTests(unittest.TestCase):
                  mock.patch.object(entry, 'run_preactivation_failure'), mock.patch.object(entry, 'run_lifecycle_acceptance'):
                 entry.run(args)
         self.assertEqual('synthetic_acceptance_passed', evidence.data['status'])
+        source = (entry.ROOT / 'Dockerfile.mi').read_bytes()
+        self.assertEqual(entry.provenance.product_revision(source), evidence.data['product_dockerfile_sr_revision'])
 
     def test_preflight_only_reports_probe_without_build_or_acceptance(self):
         args = SimpleNamespace(preflight_only=True, authorize_engine_preflight=True,

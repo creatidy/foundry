@@ -12,7 +12,10 @@ OLD_SR = "f96d58e6d7d0fffdbe70476850d824efa5de2fb5"
 NEW_SR = "8fc4f91ff1aa4c52f4738d436fc2ac12d0b8acb1"
 MI = "d65891668b7e79f7b666c021f02a1b4bf8c4ca9c"
 MI_URL = "https://forgejo.creatidy.com/Creatidy/model-intelligence.git"
-DOCKERFILE_SHA256 = "274e359a8b4c499f53c64119a1b4b9aff7b7b64848a51b91fb9bcd082fa7860f"
+DOCKERFILE_SHA256 = {
+    OLD_SR: "274e359a8b4c499f53c64119a1b4b9aff7b7b64848a51b91fb9bcd082fa7860f",
+    NEW_SR: "0eb66c6cb0fc53b25f610dcdf20f84419412d9c3f63c9e0b0bb8654806fdfd76",
+}
 MAX_FILES = 10000
 MAX_SECONDS = 900
 MAX_OUTPUT = 1024 * 1024
@@ -20,19 +23,36 @@ _DIGEST = re.compile(r"sha256:[0-9a-f]{64}\Z")
 _HASH = re.compile(r"[0-9a-f]{64}\Z")
 
 
-def dockerfile(source, revision, base_digest):
-    """Return the exact test-only Dockerfile bytes for an allowlisted revision."""
+def product_revision(source):
+    if not isinstance(source, bytes):
+        raise ValueError("unrecognized Dockerfile.mi")
+    digest = hashlib.sha256(source).hexdigest()
+    for revision, expected in DOCKERFILE_SHA256.items():
+        if digest == expected:
+            return revision
+    raise ValueError("unrecognized Dockerfile.mi")
+
+
+def pinned_dockerfile(source, revision, base_digest):
+    """Derive either reviewed pin from either exact reviewed product file."""
     if revision not in (OLD_SR, NEW_SR) or not isinstance(base_digest, str) or not _DIGEST.fullmatch(base_digest):
         raise ValueError("unknown revision or invalid base digest")
-    if not isinstance(source, bytes) or hashlib.sha256(source).hexdigest() != DOCKERFILE_SHA256:
-        raise ValueError("unrecognized Dockerfile.mi")
+    source_revision = product_revision(source)
     text = source.decode("utf-8")
-    if (text.count(OLD_SR) != 2 or text.count("FROM python:3.12-slim") != 2 or text.count(MI) != 1 or
+    if (text.count(source_revision) != 2 or text.count("FROM python:3.12-slim") != 2 or text.count(MI) != 1 or
             text.count("/opt/sr/bin/pip install '/src[mi]'") != 1 or
             text.count('ENV PATH="/opt/sr/bin:$PATH" PYTHONUNBUFFERED=1') != 1):
         raise ValueError("unexpected Dockerfile structure")
-    text = text.replace(OLD_SR, revision).replace(
+    text = text.replace(source_revision, revision)
+    if hashlib.sha256(text.encode("utf-8")).hexdigest() != DOCKERFILE_SHA256[revision]:
+        raise ValueError("derived Dockerfile does not match reviewed variant")
+    return text.replace(
         "FROM python:3.12-slim", "FROM python:3.12-slim@" + base_digest)
+
+
+def dockerfile(source, revision, base_digest):
+    """Return the exact test-only Dockerfile bytes for an allowlisted revision."""
+    text = pinned_dockerfile(source, revision, base_digest)
     text = text.replace("/opt/sr/bin/pip install '/src[mi]'", "/opt/sr/bin/pip install --no-compile '/src[mi]'")
     text = text.replace("PYTHONUNBUFFERED=1", "PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1 "
                         "PYTHONNOUSERSITE=1 PYTHONSAFEPATH=1")

@@ -38,6 +38,7 @@ def mocked_full_run(args):
             (entry, '_read_preflight', {'return_value': args.engine_id}),
             (entry, '_discover_engine', {'return_value': args.engine_id}),
             (entry, 'Evidence', {'return_value': evidence}),
+            (entry, '_input_provenance', {'return_value': {'source_commit': 'not_established'}}),
             (entry.build, 'DockerExecutor', {'return_value': executor}),
             (entry.build, 'build_verified', {'side_effect': ['old', 'new']}),
         ):
@@ -46,6 +47,60 @@ def mocked_full_run(args):
 
 
 class WiringTests(unittest.TestCase):
+    def test_manifest_is_fixed_content_only_and_detects_changes_in_archive(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / 'relevant.py').write_bytes(b'original')
+            (root / 'untracked-secret').write_bytes(b'secret')
+            with mock.patch.object(entry, 'ROOT', root), mock.patch.object(entry, 'PROVENANCE_FILES', ('relevant.py',)):
+                first = entry._file_manifest()
+                self.assertEqual({'relevant.py': hashlib.sha256(b'original').hexdigest()}, first)
+                (root / 'relevant.py').write_bytes(b'dirty')
+                self.assertNotEqual(first, entry._file_manifest())
+                (root / 'relevant.py').unlink()
+                (root / 'relevant.py').symlink_to(root / 'untracked-secret')
+                with self.assertRaises(OSError):
+                    entry._file_manifest()
+
+    def test_provenance_binds_verified_bytes_and_rejects_invalid_hashes(self):
+        helper, fake, source = b'helper', b'fake', b'dockerfile'
+        digest = lambda data: hashlib.sha256(data).hexdigest()
+        manifest = {'tests/worker_mi_acceptance.py': digest(helper), 'Dockerfile.mi': digest(source)}
+        args = SimpleNamespace(worker_sha256=digest(helper), fake_sha256=digest(fake))
+        record = entry._input_provenance(manifest, source, (helper, fake, {}), args)
+        self.assertEqual('not_established', record['source_commit'])
+        self.assertEqual({'worker_sha256': digest(helper), 'fake_sha256': digest(fake)}, record['verified_fixture_sha256'])
+        self.assertNotIn('helper', json.dumps(record))
+        for value in (None, 'A' * 64, 'a' * 63, 'a' * 64 + '\n', 123):
+            args.fake_sha256 = value
+            with self.assertRaises(ValueError):
+                entry._input_provenance(manifest, source, (helper, fake, {}), args)
+        args.fake_sha256 = digest(fake)
+        with self.assertRaises(ValueError):
+            entry._input_provenance(manifest, source, (b'changed', fake, {}), args)
+        with self.assertRaises(ValueError):
+            entry._input_provenance(manifest, b'changed', (helper, fake, {}), args)
+
+    def test_manifest_rejects_symlinked_parent_directory(self):
+        with tempfile.TemporaryDirectory() as directory, tempfile.TemporaryDirectory() as outside:
+            root = Path(directory)
+            (Path(outside) / 'worker.py').write_bytes(b'external')
+            (root / 'tests').symlink_to(outside, target_is_directory=True)
+            with mock.patch.object(entry, 'ROOT', root), mock.patch.object(entry, 'PROVENANCE_FILES', ('tests/worker.py',)):
+                with self.assertRaises(OSError):
+                    entry._file_manifest()
+
+    def test_manifest_change_during_preparation_blocks_engine(self):
+        args = SimpleNamespace(socket='/sock', engine_id='engine', worker_sha256='a' * 64,
+                               fake_appserver='/fake', fake_sha256='b' * 64, mi_python='/python', mi_wheel='/wheel')
+        with mocked_full_run(args), \
+             mock.patch.object(entry, '_file_manifest', side_effect=[{'file': 'before'}, {'file': 'after'}]), \
+             mock.patch.object(entry, '_prepare', return_value=(b'helper', b'fake', {})), \
+             mock.patch.object(entry, '_discover_engine') as discover:
+            with self.assertRaisesRegex(ValueError, 'changed during preparation'):
+                entry.run(args)
+        discover.assert_not_called()
+
     def test_cut_validation_rejects_changed_trust_and_publication(self):
         digests = {kind: hashlib.sha256(kind.encode()).hexdigest() for kind in
                    ('fresh', 'stale', 'withdrawn', 'incompatible')}
@@ -353,6 +408,7 @@ class WiringTests(unittest.TestCase):
              mock.patch.object(entry, '_checked_file', return_value=b'fixture'), \
              mock.patch.object(entry.host_mi_provenance, 'generate_cuts', side_effect=produce), \
              mock.patch.object(entry, '_validate_cuts'), \
+             mock.patch.object(entry, '_input_provenance', return_value={}), \
              mock.patch.object(entry, "Evidence", return_value=evidence), \
              mock.patch.object(entry, "_read_preflight", side_effect=reviewed), \
              mock.patch.object(entry, "_discover_engine", return_value="engine"), \

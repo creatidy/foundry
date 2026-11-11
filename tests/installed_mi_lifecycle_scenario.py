@@ -188,6 +188,8 @@ def run_stale_startup_acceptance(adapter: LifecycleAdapter, cuts: dict[str, tupl
     run Foundry's guarded start with the supplied independent digest, and create
     a new admin. start_worker must configure a real routable source matching the
     fresh baseline, with no alternative models, and return a liveness probe.
+    After stop_worker and restart, start_worker must resume the same sources and
+    worker identities rather than provisioning fresh ones.
     """
     publication, trust = cuts["stale"]
     digest = fixture.VARIANT_SHA256["stale"]
@@ -204,13 +206,31 @@ def run_stale_startup_acceptance(adapter: LifecycleAdapter, cuts: dict[str, tupl
     try:
         retained = _bound_selection(adapter, key, blocked=True, worker_ready=ready,
                                     verify_cut=verify_cut, digest=digest)
-    finally:
+    except BaseException as error:
+        try:
+            stop_worker()
+        except BaseException as cleanup_error:
+            error.add_note(f"worker cleanup also failed: {type(cleanup_error).__name__}")
+        raise
+    else:
         stop_worker()
     adapter.stop()
     adapter.restart_current_cut()
-    _verify_retained(adapter, key, retained)
-    if verify_cut(key, retained, digest) is not True:
-        raise AssertionError("stale projection cut did not survive restart")
+    ready = start_worker()
+    try:
+        _verify_retained(adapter, key, retained)
+        if verify_cut(key, retained, digest) is not True:
+            raise AssertionError("stale projection cut did not survive restart")
+        _bound_selection(adapter, key, blocked=True, worker_ready=ready,
+                         verify_cut=verify_cut, digest=digest)
+    except BaseException as error:
+        try:
+            stop_worker()
+        except BaseException as cleanup_error:
+            error.add_note(f"worker cleanup also failed: {type(cleanup_error).__name__}")
+        raise
+    else:
+        stop_worker()
 
 
 def run_lifecycle_acceptance(adapter: LifecycleAdapter, fresh_publication: bytes, *, start_worker=None) -> None:

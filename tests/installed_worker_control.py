@@ -269,17 +269,26 @@ def run_variant_installed(adapter, client_key, cuts, helper, fake, *, helper_sha
 
 
 def run_stale_with_worker(adapter, cuts, start_control):
-    """Restart the verifier after SR restarts, without pretending workers survived."""
+    """Resume the preserved worker identity after the SR restart."""
     from installed_mi_lifecycle_scenario import run_stale_startup_acceptance
     active = [None]
+    archive = [None]
 
     def start_worker():
-        active[0] = start_control(False)
+        if active[0] is not None:
+            raise RuntimeError("worker control already active")
+        migration = "initialize" if archive[0] is None else "resume"
+        active[0] = start_control(False, migration=migration, worker_archive=archive[0])
         return active[0].worker_ready
 
     def stop_worker():
-        active[0].close()
+        if active[0] is None:
+            raise RuntimeError("worker control not active")
+        session = active[0]
         active[0] = None
+        session.close()
+        if archive[0] is None:
+            archive[0] = session.snapshot_worker()
 
     def verify_cut(key, response, digest):
         if active[0] is None:
@@ -287,18 +296,25 @@ def run_stale_with_worker(adapter, cuts, start_control):
         return active[0].verify_cut(key, response, digest)
 
     try:
-        return run_stale_startup_acceptance(adapter, cuts, start_worker, stop_worker, verify_cut)
-    finally:
+        result = run_stale_startup_acceptance(adapter, cuts, start_worker, stop_worker, verify_cut)
+    except BaseException as error:
         if active[0] is not None:
-            active[0].close()
+            try:
+                stop_worker()
+            except BaseException as cleanup_error:
+                error.add_note(f"worker cleanup also failed: {type(cleanup_error).__name__}")
+        raise
+    if active[0] is not None:
+        stop_worker()
+    return result
 
 
 def run_stale_installed(adapter, cuts, helper, fake, *, helper_sha256, fake_sha256):
     """Provision live workers, then a verifier after the controlled restart."""
-    def start(verify_only):
+    def start(verify_only, *, migration=None, worker_archive=None):
         return start_live_worker(adapter.project, adapter.admin, helper, fake,
                                  helper_sha256=helper_sha256, fake_sha256=fake_sha256,
-                                 verify_only=verify_only)
+                                 verify_only=verify_only, migration=migration, worker_archive=worker_archive)
     return run_stale_with_worker(adapter, cuts, start)
 
 

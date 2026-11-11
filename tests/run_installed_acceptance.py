@@ -69,10 +69,73 @@ PHASE_CHECKS = {
     'baseline': ['missing_and_invalid_credentials_rejected', 'admin_csrf_and_inference_separation', 'untrusted_and_wrong_hostname_tls_rejected', 'mi_disabled_4097_admitted'],
     'execution': ['worker_execution_scenario_completed'],
     'variant_reload': ['mi_enabled_4097_blocked', 'stale_reload_rejected', 'incompatible_reload_rejected', 'withdrawal_reload_blocks', 'retained_projection_verified'],
-    'stale_startup': ['stale_cut_blocks', 'stale_projection_survives_restart'],
+    'stale_startup': ['stale_cut_4096_no_solution', 'stale_projection_survives_restart',
+                      'stale_cut_4096_no_solution_after_restart'],
     'preactivation': ['incompatible_activation_rejected', 'fresh_cut_and_projection_recovered'],
     'migration_backup_restore': ['old_worker_routes_and_executes', 'upgraded_worker_routes_and_executes', 'unauthorized_reload_rejected', 'invalid_reload_preserves_projection', 'restart_retains_projection', 'restored_worker_routes_and_executes', 'post_backup_client_rejected', 'rollback_worker_routes_and_executes'],
 }
+
+# Fixed allowlist only: never enumerate a checkout or include file contents/paths
+# supplied by the operator in the report.
+PROVENANCE_FILES = (
+    'Dockerfile.mi', 'compose.yaml', 'scripts/docker_socket_validation.py',
+    'scripts/local_tls_init.py', 'scripts/local_tls_up.py',
+    'tests/host_mi_provenance.py', 'tests/image_build_executor.py',
+    'tests/image_provenance.py', 'tests/installed_admin.py',
+    'tests/installed_lifecycle_adapter.py', 'tests/installed_mi_lifecycle_scenario.py',
+    'tests/installed_provisioning.py', 'tests/installed_worker_control.py',
+    'tests/mi_publication_fixture.py', 'tests/run_installed_acceptance.py',
+    'tests/verified_mi_child.py', 'tests/worker_mi_acceptance.py',
+    'tests/zai_real_source_check.py',
+)
+
+
+def _file_manifest():
+    result = {}
+    for name in PROVENANCE_FILES:
+        parent = os.open(ROOT, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            parts = Path(name).parts
+            if not parts or any(part in ('', '.', '..') for part in parts) or Path(name).is_absolute():
+                raise ValueError('invalid provenance path')
+            for part in parts[:-1]:
+                child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent)
+                old_parent, parent = parent, child
+                os.close(old_parent)
+            fd = os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent)
+        finally:
+            os.close(parent)
+        try:
+            before = os.fstat(fd)
+            if not stat.S_ISREG(before.st_mode) or before.st_size > 1024 * 1024:
+                raise ValueError('invalid provenance file')
+            with os.fdopen(os.dup(fd), 'rb') as stream:
+                data = stream.read(1024 * 1024 + 1)
+            after = os.fstat(fd)
+            if (len(data) != before.st_size or len(data) > 1024 * 1024 or
+                    (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns, before.st_ctime_ns) !=
+                    (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns)):
+                raise ValueError('provenance file changed while reading')
+            result[name] = hashlib.sha256(data).hexdigest()
+        finally:
+            os.close(fd)
+    return result
+
+
+def _input_provenance(manifest, source, prepared, args):
+    helper, fake, _ = prepared
+    hashes = {'worker_sha256': hashlib.sha256(helper).hexdigest(),
+              'fake_sha256': hashlib.sha256(fake).hexdigest()}
+    if (any(not isinstance(value, str) or re.fullmatch(r'[0-9a-f]{64}', value) is None
+            for value in (args.worker_sha256, args.fake_sha256)) or
+            hashes['worker_sha256'] != args.worker_sha256 or hashes['fake_sha256'] != args.fake_sha256 or
+            hashes['worker_sha256'] != manifest['tests/worker_mi_acceptance.py'] or
+            hashlib.sha256(source).hexdigest() != manifest['Dockerfile.mi']):
+        raise ValueError('verified inputs differ from provenance manifest')
+    return {'source_commit': 'not_established', 'file_sha256': manifest,
+            'verified_fixture_sha256': hashes,
+            'limitations': ['file_contents_sampled_not_full_repository_identity',
+                            'loaded_code_and_transient_changes_not_verified']}
 
 
 class Evidence:
@@ -124,7 +187,7 @@ class Evidence:
 
 
 def _checked_file(path, expected):
-    if not re.fullmatch(r"[0-9a-f]{64}", expected):
+    if not isinstance(expected, str) or not re.fullmatch(r"[0-9a-f]{64}", expected):
         raise ValueError("independently supplied file digest required")
     fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     try:
@@ -462,6 +525,7 @@ def run(args):
     for path in (args.sr_repo, args.mi_repo):
         if not Path(path).is_absolute() or not Path(path).is_dir():
             raise ValueError("absolute existing authenticated source repositories required")
+    manifest = _file_manifest()
     source = (ROOT / "Dockerfile.mi").read_bytes()
     for revision in (provenance.OLD_SR, provenance.NEW_SR):
         provenance.dockerfile(source, revision, args.base_digest)
@@ -601,9 +665,16 @@ def run(args):
 
 
     prepared = _prepare(args)
+    input_provenance = _input_provenance(manifest, source, prepared, args)
+    if _file_manifest() != manifest:
+        raise ValueError('provenance files changed during preparation')
     evidence = Evidence(args.evidence_dir)
     try:
+        evidence.data['foundry_provenance'] = input_provenance
+        evidence.save()
         _run_authorized()
+        if _file_manifest() != manifest:
+            raise ValueError('provenance files changed during acceptance')
     except BaseException as exc:
         evidence.data['status'] = 'failed'
         if isinstance(exc, CommandFailure) and WORKER_DIAGNOSTIC_RE.fullmatch(exc.stderr):

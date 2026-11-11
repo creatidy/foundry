@@ -199,24 +199,56 @@ class ScenarioWiringTests(unittest.TestCase):
         self.assertEqual(1, self.adapter.write_trust_in_place.call_count)
         self.adapter.start_new.assert_not_called()
 
-    def test_stale_startup_retains_projection_after_restart(self):
+    def test_stale_startup_checks_new_selection_after_restart(self):
         data = b"stale test"
         digest = hashlib.sha256(data).hexdigest()
         patcher = mock.patch.object(scenario.fixture, "VARIANT_SHA256", {"stale": digest})
         patcher.start()
         self.addCleanup(patcher.stop)
         trust = json.dumps({"reference": {"sha256": digest}}).encode()
-        selection = {"route": {"status": "no_solution", "target": None}, "decision": {},
-                     "mi_utilization": {}, "mi_projection": {}}
-        self.adapter.exchange.side_effect = [(200, {"api_key": "key"}), (200, selection),
-                                             (200, {"valid": True}), (200, {"valid": True})]
-        stop_worker = mock.Mock()
-        scenario.run_stale_startup_acceptance(self.adapter, {"stale": (data, trust)},
-                                               lambda: lambda: True, stop_worker, lambda *args: True)
-        self.adapter.start_new_with_cut.assert_called_once_with(data, trust, digest)
-        stop_worker.assert_called_once_with()
-        self.adapter.stop.assert_called_once_with()
-        self.adapter.restart_current_cut.assert_called_once_with()
+        def selection(name, blocked=True):
+            return {"route": {"status": "no_solution" if blocked else "selected", "target": None},
+                    "decision": {"id": name}, "mi_utilization": {}, "mi_projection": {}}
+
+        for failure in (None, "route", "worker", "cut", "cleanup", "route_cleanup"):
+            with self.subTest(failure=failure):
+                adapter = mock.Mock()
+                before = selection("before")
+                after = selection("after", blocked=failure not in ("route", "route_cleanup"))
+                adapter.exchange.side_effect = [(200, {"api_key": "key"}), (200, before),
+                                                (200, {"valid": True}), (200, {"valid": True}),
+                                                (200, after), (200, {"valid": True})]
+                events = []
+                adapter.stop.side_effect = lambda: events.append("stop router")
+                adapter.restart_current_cut.side_effect = lambda: events.append("restart router")
+                starts = mock.Mock(side_effect=[lambda: True, lambda: failure != "worker"])
+                def start_worker():
+                    events.append("start worker")
+                    return starts()
+                def stop():
+                    events.append("stop worker")
+                    if failure in ("cleanup", "route_cleanup") and events.count("stop worker") == 2:
+                        raise RuntimeError("cleanup failed")
+                verify = mock.Mock(side_effect=lambda key, response, cut: not (
+                    failure == "cut" and response is after))
+                if failure is None:
+                    scenario.run_stale_startup_acceptance(adapter, {"stale": (data, trust)},
+                                                          start_worker, stop, verify)
+                    self.assertEqual([mock.call("key", before, digest), mock.call("key", before, digest),
+                                      mock.call("key", after, digest)], verify.call_args_list)
+                    self.assertEqual(2, sum(call.args[1] == "/v1/select"
+                                            for call in adapter.exchange.call_args_list))
+                else:
+                    expected = RuntimeError if failure == "cleanup" else AssertionError
+                    with self.assertRaises(expected) as raised:
+                        scenario.run_stale_startup_acceptance(adapter, {"stale": (data, trust)},
+                                                              start_worker, stop, verify)
+                    if failure == "route_cleanup":
+                        self.assertIn("controlled model was not blocked", str(raised.exception))
+                        self.assertIn("worker cleanup also failed: RuntimeError", raised.exception.__notes__)
+                adapter.start_new_with_cut.assert_called_once_with(data, trust, digest)
+                self.assertEqual(["start worker", "stop worker", "stop router", "restart router",
+                                  "start worker", "stop worker"], events)
 
 
 if __name__ == "__main__":

@@ -170,23 +170,57 @@ class LiveProtocolTests(unittest.TestCase):
         with self.assertRaises(AssertionError):
             control.assert_input_boundary(adapter, "key", session, mi_enabled=True)
 
-    def test_stale_wiring_reopens_verifier_after_worker_stops(self):
-        live, verifier = mock.Mock(), mock.Mock()
-        live.worker_ready.return_value = True
-        live.verify_cut.return_value = verifier.verify_cut.return_value = True
-        factory = mock.Mock(side_effect=[live, verifier])
+    def test_stale_wiring_resumes_worker_identity_after_restart(self):
+        live, resumed = mock.Mock(), mock.Mock()
+        saved = object()
+        live.snapshot_worker.return_value = saved
+        live.worker_ready.return_value = resumed.worker_ready.return_value = True
+        live.verify_cut.return_value = resumed.verify_cut.return_value = True
+        factory = mock.Mock(side_effect=[live, resumed])
 
         def scenario(adapter, cuts, start, stop, verify):
             self.assertTrue(start()())
             self.assertTrue(verify("key", {}, "cut"))
             stop()
+            self.assertTrue(start()())
             self.assertTrue(verify("key", {}, "cut"))
+            stop()
 
         with mock.patch("installed_mi_lifecycle_scenario.run_stale_startup_acceptance", side_effect=scenario):
             control.run_stale_with_worker("adapter", "cuts", factory)
-        self.assertEqual(factory.call_args_list, [mock.call(False), mock.call(True)])
+        self.assertEqual(factory.call_args_list, [mock.call(False, migration="initialize", worker_archive=None),
+                                                  mock.call(False, migration="resume", worker_archive=saved)])
         live.close.assert_called_once_with()
-        verifier.close.assert_called_once_with()
+        live.snapshot_worker.assert_called_once_with()
+        resumed.close.assert_called_once_with()
+
+    def test_stale_wiring_preserves_primary_error_if_cleanup_fails(self):
+        live = mock.Mock()
+        live.worker_ready.return_value = True
+        live.close.side_effect = RuntimeError("cleanup failed")
+
+        def scenario(adapter, cuts, start, stop, verify):
+            start()
+            raise ValueError("primary failure")
+
+        with mock.patch("installed_mi_lifecycle_scenario.run_stale_startup_acceptance", side_effect=scenario):
+            with self.assertRaisesRegex(ValueError, "primary failure") as caught:
+                control.run_stale_with_worker("adapter", "cuts", mock.Mock(return_value=live))
+        self.assertEqual(["worker cleanup also failed: RuntimeError"], caught.exception.__notes__)
+        live.close.assert_called_once_with()
+
+    def test_stale_wiring_does_not_retry_failed_stop(self):
+        live = mock.Mock()
+        live.close.side_effect = RuntimeError("cleanup failed")
+
+        def scenario(adapter, cuts, start, stop, verify):
+            start()
+            stop()
+
+        with mock.patch("installed_mi_lifecycle_scenario.run_stale_startup_acceptance", side_effect=scenario):
+            with self.assertRaisesRegex(RuntimeError, "cleanup failed"):
+                control.run_stale_with_worker("adapter", "cuts", mock.Mock(return_value=live))
+        live.close.assert_called_once_with()
 
     def test_installed_variant_starts_real_control_adapter_path(self):
         adapter, session = mock.Mock(), mock.Mock()

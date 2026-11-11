@@ -40,6 +40,43 @@ orchestrator, model selector, facts producer or shared authority database.
 - Do not turn an incidental implementation constraint into a permanent product
   requirement; reject new infrastructure unless a concrete need is demonstrated.
 
+## Test and evidence discipline
+
+- During development run checks relevant to the change. Use CI for one full
+  required verification of the exact commit or explicitly identified merge tree;
+  repeat the full suite locally only when diagnosing a failure or when CI cannot
+  provide required evidence. A CI result does not itself authorize host-interacting
+  tests or replace acceptance on the actual target host.
+- Avoid running the same scenario twice without a distinct evidentiary purpose.
+  Preserve the combined assertions when consolidating duplicates; document distinct
+  boundaries such as source checkout versus installed package. Define scenario
+  cases once rather than maintaining manually copied matrices in separate runners.
+- Build an identical artifact once per run and share it only after checking its
+  identity and provenance. Artifacts from different versions or build paths, such
+  as a checkout wheel and a wheel rebuilt from an sdist, may provide distinct
+  evidence. Share artifacts, not mutable test state: isolate databases, workdirs,
+  ports, process identifiers and test data unless sharing is itself under test.
+- Parallelize only after establishing isolation, preferably in separate processes;
+  serialize or actually isolate tests that use host-global state, shared containers,
+  fixed markers or signals. Do not mask races with longer timeouts or retries. If
+  the suite is split into phases or shards, automatically verify their collected
+  test identities, including parameters, form a complete and disjoint partition;
+  matching counts alone are insufficient.
+- When testing an installed artifact, verify import or execution provenance in
+  workers and representative child processes too, so checkout code cannot be
+  mistaken for the artifact. Retain separate evidence that it works without
+  undeclared runtime dependencies when that boundary is relevant.
+- Before integration verify the actual checkout or explicitly identified merge
+  tree, results of all required checks, and current HEAD and base. Independent
+  review examines the code, assertions and evidence from the exact CI run; repeat
+  checks only when needed to resolve a risk. Current canonical policy determines
+  required review, CI and merge authority.
+- When changing test execution or performance, measure before and after: total
+  wall-clock time, major phases, test counts including skips, and runner conditions.
+  Treat an individual measurement as an observation, not a future guarantee.
+  Report missing tools, access, environments or evidence as UNPROVED, not success,
+  especially for native, security, external integration and failure behavior.
+
 ## Host security and test execution
 
 - The owner's Windows workstation is not disposable. Starting Windows-native

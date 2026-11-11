@@ -66,8 +66,9 @@ class AdminSession:
 
     def bootstrap(self):
         project = self.project
-        if project.port is None or project._owned("container") != [project.container_id]:
-            raise ValueError("expected running owned container required")
+        if project.port is None:
+            raise ValueError("expected running owned router and proxy required")
+        project.require_roles()
         try:
             claim = project._docker("exec", project.container_id, "python", "-m",
                                     "scarcity_router.control_server", "--data-dir", "/data",

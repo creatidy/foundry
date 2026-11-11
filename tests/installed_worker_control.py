@@ -60,8 +60,9 @@ def start_live_worker(project, admin, helper, fake, *, helper_sha256, fake_sha25
                 hashlib.sha256(worker_archive.data).hexdigest() != worker_archive.sha256):
             raise ValueError("worker archive identity or digest mismatch")
         expected_manifest = _worker_manifest(worker_archive.data)
-    if project.port is None or project._owned("container") != [project.container_id]:
-        raise ValueError("one running owned container is required")
+    if project.port is None:
+        raise ValueError("running owned router and proxy are required")
+    project.require_roles()
     if not admin.cookie or not admin.csrf:
         raise ValueError("authenticated admin session required")
     for data, digest in ((helper, helper_sha256), (fake, fake_sha256)):
@@ -94,8 +95,7 @@ def start_live_worker(project, admin, helper, fake, *, helper_sha256, fake_sha25
         actual = _worker_manifest(copied)
         if {k: v for k, v in actual.items() if k != "."} != {k: v for k, v in expected_manifest.items() if k != "."}:
             raise ValueError("restored worker archive mismatch")
-    if project._owned("container") != [project.container_id]:
-        raise ValueError("worker container ownership changed")
+    project.require_roles()
     project._verify_engine()
     process = subprocess.Popen(["docker", "exec", "-i", "-e", "PYTHONPATH=" + target, project.container_id,
                                 "timeout", "--signal=TERM", "--kill-after=5s", "600s",
@@ -200,8 +200,7 @@ class WorkerControl:
         if not self.closed or not hasattr(self, "migration_project"):
             raise ValueError("closed migration worker required")
         project = self.migration_project
-        if project._owned("container") != [project.container_id]:
-            raise ValueError("worker container ownership changed")
+        project.require_roles()
         data = project._docker("cp", project.container_id + ":" + self.migration_target + "/scratch/.", "-",
                                timeout=60, binary=True)
         _worker_manifest(data)

@@ -40,8 +40,8 @@ class AdminTests(unittest.TestCase):
                 session.assert_auth_boundaries()
 
     def test_bootstrap_and_admin_header_separation(self):
-        project = mock.Mock(port=1234, container_id="owned")
-        project._owned.return_value = ["owned"]
+        project = mock.Mock(port=1234, container_id="owned", proxy_id="proxy")
+        project._roles.return_value = {"router": "owned", "proxy": "proxy"}
         project._docker.return_value = "a" * 43
         session = installed_admin.AdminSession(project)
         responses = [(200, b"{}", [("Set-Cookie", "scarcity-router-admin=session123; HttpOnly")]),
@@ -58,11 +58,18 @@ class AdminTests(unittest.TestCase):
                 session.exchange("GET", "/control/state", None, {"cookie": "override"}, admin=False)
 
     def test_claim_failure_does_not_include_command_output(self):
-        project = mock.Mock(port=1234, container_id="owned")
-        project._owned.return_value = ["owned"]
+        project = mock.Mock(port=1234, container_id="owned", proxy_id="proxy")
+        project._roles.return_value = {"router": "owned", "proxy": "proxy"}
         project._docker.side_effect = RuntimeError("secret output")
         with self.assertRaisesRegex(RuntimeError, "^bootstrap claim issuance failed$"):
             installed_admin.AdminSession(project).bootstrap()
+
+    def test_bootstrap_rejects_unexpected_proxy_before_exec(self):
+        project = mock.Mock(port=1234, container_id="owned", proxy_id="proxy")
+        project.require_roles.side_effect = ValueError("owned router or proxy identity changed")
+        with self.assertRaisesRegex(ValueError, "identity changed"):
+            installed_admin.AdminSession(project).bootstrap()
+        project._docker.assert_not_called()
 
 
 class OfflineLifecycleTests(unittest.TestCase):
@@ -230,24 +237,32 @@ class OfflineLifecycleTests(unittest.TestCase):
         adapter = lifecycle.InstalledLifecycleAdapter(project, old, new)
         adapter._initialized = True
         project.root = Path("/protected")
-        project._owned.side_effect = lambda kind: {"container": ["new-id"], "volume": ["test_router-data"], "network": ["network"]}[kind]
+        project._owned.side_effect = lambda kind: {"volume": ["test_router-data"], "network": ["backend", "ingress"]}[kind]
+        project._roles.return_value = {"router": "new-id", "proxy": "proxy-id"}
         project.launch.side_effect = lifecycle.CommandFailure("startup", 1)
-        info = [{"Image": new, "RestartCount": 0, "State": {"Status": "exited", "ExitCode": 2, "Running": False, "Restarting": False,
+        info = [{"Id": "new-id", "Image": new, "RestartCount": 0, "State": {"Status": "exited", "ExitCode": 2, "Running": False, "Restarting": False,
                                         "StartedAt": "2026-11-08T20:00:00Z", "FinishedAt": "2026-11-08T20:00:01Z"},
                  "HostConfig": {"NanoCpus": 1000000000, "Memory": 536870912, "MemorySwap": 536870912,
-                                "PidsLimit": 128, "Privileged": False, "NetworkMode": "internal", "RestartPolicy": {"Name": "no"},
-                                "PortBindings": {"8787/tcp": [{"HostIp": "127.0.0.1", "HostPort": "1234"}]}},
+                                "PidsLimit": 128, "Privileged": False, "NetworkMode": "test_backend", "RestartPolicy": {"Name": "no"},
+                                "PortBindings": {}},
                  "Config": {"Cmd": ["--mi-config=/run/foundry/mi/trust.json"]},
                  "Mounts": [{"Destination": "/data", "Type": "volume", "Name": "test_router-data"},
                             {"Destination": "/run/foundry/tls", "Type": "bind", "RW": False, "Source": "/protected/tls"},
                             *[{"Destination": "/run/foundry/mi/" + name, "Type": "bind", "RW": False,
                                "Source": "/protected/mi/" + name} for name in ("trust.json", "publication.json")]]}]
-        project._docker.side_effect = lambda *args, **kwargs: (json.dumps(info) if args[0] == "container" else
-            json.dumps([{"Internal": True, "Name": "internal"}]) if args[0] == "network" else "server: mi_publication_activation_failed\n")
+        proxy = [{"Id": "proxy-id", "NetworkSettings": {"Networks": {"backend": {"NetworkID": "backend"}, "ingress": {"NetworkID": "ingress"}}}}]
+        nets = {"backend": {"Id": "backend", "Internal": True, "Name": "test_backend", "Containers": {"proxy-id": {}}},
+                "ingress": {"Id": "ingress", "Internal": False, "Name": "test_ingress", "Containers": {"proxy-id": {}}}}
+        project._docker.side_effect = lambda *args, **kwargs: (json.dumps(info if args[-1] == "new-id" else proxy) if args[0] == "container" else
+            json.dumps([nets[args[-1]]]) if args[0] == "network" else "server: mi_publication_activation_failed\n")
         with mock.patch.object(adapter, "_stopped"), mock.patch.object(lifecycle, "validate_mi"):
             adapter.start_new_expect_mi_failure("mi_publication_activation_failed")
         self.assertEqual("new-id", project.container_id)
         project.finish_expected_inspection.assert_called_once_with(verified=True)
+        project.stop.assert_called_once_with()
+        nets["backend"]["Containers"]["unexpected"] = {}
+        with self.assertRaisesRegex(AssertionError, "network is not internal"):
+            adapter._inspect_expected_mi_failure("old-id")
 
     def test_expected_failure_rejects_preflight_timeout_and_old_container(self):
         old, new = "sha256:" + "a" * 64, "sha256:" + "b" * 64
@@ -286,20 +301,24 @@ class OfflineLifecycleTests(unittest.TestCase):
         adapter = lifecycle.InstalledLifecycleAdapter(project, old, new)
         adapter._initialized = True
         project.root = Path("/protected")
-        project._owned.side_effect = lambda kind: {"container": ["new-id"], "volume": ["test_router-data"], "network": ["network"]}[kind]
+        project._owned.side_effect = lambda kind: {"volume": ["test_router-data"], "network": ["backend", "ingress"]}[kind]
+        project._roles.return_value = {"router": "new-id", "proxy": "proxy-id"}
         project.launch.side_effect = lifecycle.CommandFailure("startup", 1)
-        info = [{"Image": new, "RestartCount": 0, "State": {"Status": "exited", "ExitCode": 1, "Running": False, "Restarting": False,
+        info = [{"Id": "new-id", "Image": new, "RestartCount": 0, "State": {"Status": "exited", "ExitCode": 1, "Running": False, "Restarting": False,
                                         "StartedAt": "2026-11-08T20:00:00Z", "FinishedAt": "2026-11-08T20:00:01Z"},
                  "HostConfig": {"NanoCpus": 1000000000, "Memory": 536870912, "MemorySwap": 536870912,
-                                "PidsLimit": 128, "Privileged": False, "NetworkMode": "internal", "RestartPolicy": {"Name": "no"},
-                                "PortBindings": {"8787/tcp": [{"HostIp": "127.0.0.1", "HostPort": "1234"}]}},
+                                "PidsLimit": 128, "Privileged": False, "NetworkMode": "test_backend", "RestartPolicy": {"Name": "no"},
+                                "PortBindings": {}},
                  "Config": {"Cmd": ["--mi-config=/run/foundry/mi/trust.json"]},
                  "Mounts": [{"Destination": "/data", "Type": "volume", "Name": "test_router-data"},
                             {"Destination": "/run/foundry/tls", "Type": "bind", "RW": False, "Source": "/protected/tls"},
                             *[{"Destination": "/run/foundry/mi/" + name, "Type": "bind", "RW": False,
                                "Source": "/protected/mi/" + name} for name in ("trust.json", "publication.json")]]}]
-        project._docker.side_effect = lambda *args, **kwargs: (json.dumps(info) if args[0] == "container" else
-            json.dumps([{"Internal": True, "Name": "internal"}]) if args[0] == "network" else "private-data\nserver: different\n")
+        proxy = [{"Id": "proxy-id", "NetworkSettings": {"Networks": {"backend": {"NetworkID": "backend"}, "ingress": {"NetworkID": "ingress"}}}}]
+        nets = {"backend": {"Id": "backend", "Internal": True, "Name": "test_backend", "Containers": {"proxy-id": {}}},
+                "ingress": {"Id": "ingress", "Internal": False, "Name": "test_ingress", "Containers": {"proxy-id": {}}}}
+        project._docker.side_effect = lambda *args, **kwargs: (json.dumps(info if args[-1] == "new-id" else proxy) if args[0] == "container" else
+            json.dumps([nets[args[-1]]]) if args[0] == "network" else "private-data\nserver: different\n")
         with mock.patch.object(adapter, "_stopped"), mock.patch.object(lifecycle, "validate_mi"):
             with self.assertRaisesRegex(AssertionError, "state mismatch"):
                 adapter.start_new_expect_mi_failure("mi_publication_activation_failed")

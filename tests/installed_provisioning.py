@@ -9,6 +9,7 @@ import json
 import os
 from pathlib import Path
 import re
+import secrets
 import selectors
 import shutil
 import signal
@@ -24,6 +25,7 @@ import mi_publication_fixture as fixture
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 from local_tls_init import no_acl, open_parent
+from local_tls_up import TEST_PROXY
 from docker_socket_validation import validate_engine_socket
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -35,23 +37,41 @@ _EXPECTED_INSPECTION = None
 _CGROUP_FILES = ("/proc/self/cgroup", "/proc/1/cgroup", "/sys/fs/cgroup/memory.max",
                  "/sys/fs/cgroup/memory.swap.max", "/sys/fs/cgroup/pids.max",
                  "/sys/fs/cgroup/cpu.max")
+_WORKER_DIAGNOSTIC_FIELDS = (r"(?:assertion|timeout|value|os|runtime|other):[0-9]{1,5}:[0-9]{1,5}:[0-9]{1,3}:"
+                             r"(?:permission_error|not_found_error|api_error|invalid_request_error|other):"
+                             r"(?:unauthorized_target|pin_target_not_found|target_unavailable|adapter_unavailable|backend_failure|capability_unassessed|other)")
+WORKER_DIAGNOSTIC_RE = re.compile(r"FOUNDRY_WORKER_FAILURE:" + _WORKER_DIAGNOSTIC_FIELDS)
 
 
 class CommandFailure(RuntimeError):
     def __init__(self, command, returncode, *, stderr="", operation="other"):
-        super().__init__("bounded command failed: " + command)
+        message = "bounded command failed: " + command
+        if WORKER_DIAGNOSTIC_RE.fullmatch(stderr):
+            message += " (worker reported " + stderr + ")"
+        super().__init__(message)
         self.returncode = returncode
         self.stderr = stderr
         self.operation = operation
 
 
-def redacted_docker_stderr(args, stderr):
+def redacted_docker_stderr(args, stderr, returncode=None, diagnostic_nonce=None):
     """Preserve only recognized public image errors, never arbitrary daemon text."""
     if not stderr:
         return ""
+    text = bytes(stderr).decode("utf-8", "replace")
+    if (returncode == 1 and isinstance(diagnostic_nonce, str) and
+            re.fullmatch(r"[0-9a-f]{32}", diagnostic_nonce) and
+            len(args) == 12 and args[:4] == ["docker", "exec", "-i", "-e"] and
+            re.fullmatch(r"[0-9a-f]{12,64}", args[5]) and
+            args[6:11] == ["timeout", "--signal=TERM", "--kill-after=5s", "360s", "python"] and
+            re.fullmatch(r"/tmp/foundry-worker-[0-9a-f]{32}/runner\.py", args[11]) and
+            args[4] == "PYTHONPATH=" + args[11].removesuffix("/runner.py")):
+        markers = [match for line in text.splitlines() if (match := re.fullmatch(
+            r"FOUNDRY_WORKER_FAILURE:" + diagnostic_nonce + r":(" + _WORKER_DIAGNOSTIC_FIELDS + r")", line))]
+        if len(markers) == 1:
+            return "FOUNDRY_WORKER_FAILURE:" + markers[0].group(1)
     if len(stderr) > 4096:
         return "Docker stderr redacted: oversized diagnostic"
-    text = bytes(stderr).decode("utf-8", "replace")
     if text.endswith("\r\n"):
         text = text[:-2]
     elif text.endswith("\n"):
@@ -95,7 +115,7 @@ class InstalledProject:
     storage quotas. Docker metadata alone cannot prove these properties.
     """
 
-    def __init__(self, *, socket_path, engine_id, image_id, authorization, mi_cuts=None):
+    def __init__(self, *, socket_path, engine_id, image_id, authorization, mi_cuts=None, base_digest=None):
         if authorization != "disposable-linux-engine-approved":
             raise ValueError("explicit disposable engine authorization required")
         if not re.fullmatch(r"sha256:[0-9a-f]{64}", image_id):
@@ -111,17 +131,23 @@ class InstalledProject:
         self.socket_path = path
         self.engine_id = engine_id
         self.image_id = image_id
+        if base_digest is not None and (not isinstance(base_digest, str) or not re.fullmatch(r"sha256:[0-9a-f]{64}", base_digest)):
+            raise ValueError("pinned test proxy base digest required")
+        self.base_digest = base_digest
+        self.proxy_image_id = None
         self.token = uuid.uuid4().hex
         self.project = "foundry-test-" + self.token
         self.root = None
         self.container_id = None
+        self.proxy_id = None
         self.port = None
         self.env = None
         self._engine_blocked = False
         self._inspection_only = False
         self.mi_cuts = mi_cuts
 
-    def _run(self, args, timeout=20, input_data=None, *, binary=False, merge_output=False, output_limit=None):
+    def _run(self, args, timeout=20, input_data=None, *, binary=False, merge_output=False, output_limit=None,
+             diagnostic_nonce=None):
         global _ENGINE_VERIFICATION_FAILED
         docker = bool(args) and args[0] == "docker"
         # Read-only Docker calls may still time out, but a failed mutation can
@@ -201,15 +227,18 @@ class InstalledProject:
                 self._engine_blocked = True
                 _ENGINE_VERIFICATION_FAILED = True
             operation = "image_inspect" if args[:3] == ["docker", "image", "inspect"] else "other"
-            raise CommandFailure(args[0], proc.returncode, stderr=redacted_docker_stderr(args, err), operation=operation)
+            raise CommandFailure(args[0], proc.returncode, stderr=redacted_docker_stderr(args, err, proc.returncode, diagnostic_nonce), operation=operation)
         if merge_output:
             out.extend(b"\n")
             out.extend(err)
         return bytes(out) if binary else out.decode()
 
-    def _docker(self, *args, timeout=20, input_data=None, binary=False, merge_output=False, output_limit=None):
+    def _docker(self, *args, timeout=20, input_data=None, binary=False, merge_output=False, output_limit=None,
+                diagnostic_nonce=None):
         self._verify_engine()
         kwargs = {"binary": binary, "merge_output": merge_output}
+        if diagnostic_nonce is not None:
+            kwargs["diagnostic_nonce"] = diagnostic_nonce
         if output_limit is not None:
             kwargs["output_limit"] = output_limit
         return self._run(["docker", *args], timeout, input_data, **kwargs)
@@ -242,6 +271,8 @@ class InstalledProject:
             raise ValueError("project has already been started")
         if not isinstance(self.mi_cuts, dict) or "fresh" not in self.mi_cuts:
             raise ValueError("verified synthetic MI cuts required")
+        if self.base_digest is None:
+            raise ValueError("independently authenticated proxy base digest required")
         self.root = Path(tempfile.mkdtemp(prefix="foundry-accept-"))
         os.chmod(self.root, 0o700)
         for name in ("compose.yaml", "scripts/local_tls_up.py", "scripts/local_tls_init.py",
@@ -261,6 +292,15 @@ class InstalledProject:
                     "FOUNDRY_TEST_ENGINE_ID": self.engine_id,
                     "FOUNDRY_TEST_DOCKER_HOST": "unix://" + str(self.socket_path)}
         self._verify_engine()
+        base = json.loads(self._docker("image", "inspect", "python:3.12-slim@" + self.base_digest))
+        if (not isinstance(base, list) or len(base) != 1 or base[0].get("Os") != "linux" or
+                not isinstance(base[0].get("Id"), str) or not re.fullmatch(r"sha256:[0-9a-f]{64}", base[0]["Id"]) or
+                not isinstance(base[0].get("RepoDigests"), list) or
+                not any(value in {"python@" + self.base_digest, "docker.io/library/python@" + self.base_digest}
+                        for value in base[0]["RepoDigests"])):
+            raise ValueError("test proxy base image identity mismatch")
+        self.proxy_image_id = base[0]["Id"]
+        self.env.update(FOUNDRY_TEST_BASE_DIGEST=self.base_digest, FOUNDRY_TEST_PROXY_IMAGE_ID=self.proxy_image_id)
         self._run([sys.executable, "scripts/local_tls_init.py"], timeout=30)
         prepare_mi(self.root / "mi", self.mi_cuts["fresh"])
         if configure_mi is not None:
@@ -280,15 +320,17 @@ class InstalledProject:
         if len(image) != 1 or image[0].get("Id") != image_id or image[0].get("Os") != "linux":
             raise ValueError("pinned Linux image not present")
         if adopt:
-            containers = self._owned("container")
-            if containers:
-                if len(containers) != 1 or containers[0] != self.container_id:
-                    raise ValueError("unexpected existing container")
-                state = json.loads(self._docker("container", "inspect", self.container_id))[0]["State"]
-                if state.get("Running"):
-                    raise ValueError("existing container is still running")
-            self._owned("network")
-            self._owned("volume")
+            try:
+                roles = self.require_roles()
+                for identifier in roles.values():
+                    state = json.loads(self._docker("container", "inspect", identifier))[0]["State"]
+                    if state.get("Running") is not False:
+                        raise ValueError("existing container is still running or state is unknown")
+                self._owned("network")
+                self._owned("volume")
+            except BaseException:
+                self.block_engine()
+                raise
             self.env["LOCAL_TLS_ADOPT_PROJECT"] = self.project
         else:
             self.env.pop("LOCAL_TLS_ADOPT_PROJECT", None)
@@ -329,10 +371,8 @@ class InstalledProject:
             raise
 
     def _validate_started(self, mi_enabled):
-        containers = self._owned("container")
-        if len(containers) != 1:
-            raise ValueError("expected exactly one project container")
-        self.container_id = containers[0]
+        roles = self._roles()
+        self.container_id, self.proxy_id = roles["router"], roles["proxy"]
         data = json.loads(self._docker("container", "inspect", self.container_id))[0]
         host = data["HostConfig"]
         if (data["Image"] != self.image_id or host.get("NanoCpus") != 1_000_000_000 or
@@ -345,7 +385,7 @@ class InstalledProject:
         effective = self._docker("exec", self.container_id, "/bin/cat", *_CGROUP_FILES, timeout=20)
         if effective.splitlines() != ["0::/", "0::/", "536870912", "0", "128", "100000 100000"]:
             raise ValueError("effective workload cgroup limits unverified")
-        if self._owned("container") != [self.container_id]:
+        if self._roles() != roles:
             raise ValueError("workload container ownership changed during cgroup check")
         after = json.loads(self._docker("container", "inspect", self.container_id))
         started = data["State"].get("StartedAt")
@@ -370,21 +410,81 @@ class InstalledProject:
             raise ValueError("container data volume is not the owned selected volume")
         networks = self._owned("network")
         attached = data["NetworkSettings"].get("Networks", {})
-        if len(networks) != 1 or len(attached) != 1:
+        if len(networks) != 2 or len(attached) != 1:
             raise ValueError("container must use exactly one owned internal network")
-        network = json.loads(self._docker("network", "inspect", networks[0]))
         network_id = next(iter(attached.values())).get("NetworkID", "")
-        if (len(network) != 1 or network[0].get("Internal") is not True or
-                not network[0].get("Id", "").startswith(networks[0]) or
-                network_id != network[0].get("Id")):
+        inspected = [json.loads(self._docker("network", "inspect", identifier)) for identifier in networks]
+        if any(len(items) != 1 for items in inspected):
+            raise ValueError("container network isolation is unverified")
+        net = {item[0].get("Id"): item[0] for item in inspected}
+        if (len(net) != 2 or network_id not in net or net[network_id].get("Internal") is not True or
+                net[network_id].get("Name") != self.project + "_backend" or
+                any(not any(full.startswith(short) for short in networks) for full in net)):
             raise ValueError("container network isolation is unverified")
         ports = data["NetworkSettings"]["Ports"]
+        if any(ports.values()) or host.get("PortBindings"):
+            raise ValueError("router must not publish any ports")
+        proxy = json.loads(self._docker("container", "inspect", self.proxy_id))[0]
+        port = self._validate_proxy_inspect(proxy)
+        proxy_started = proxy.get("State", {}).get("StartedAt")
+        effective = self._docker("exec", self.proxy_id, "/bin/cat", *_CGROUP_FILES, timeout=20)
+        after_proxy = json.loads(self._docker("container", "inspect", self.proxy_id))
+        if (effective.splitlines() != ["0::/", "0::/", "134217728", "0", "64", "25000 100000"] or
+                not isinstance(proxy_started, str) or not proxy_started or len(after_proxy) != 1 or
+                after_proxy[0].get("Image") != self.proxy_image_id or
+                after_proxy[0].get("State", {}).get("Running") is not True or
+                after_proxy[0]["State"].get("StartedAt") != proxy_started or self._roles() != roles):
+            raise ValueError("effective proxy cgroup or process identity unverified")
+        proxy_networks = proxy.get("NetworkSettings", {}).get("Networks", {})
+        if ({value.get("NetworkID") for value in proxy_networks.values()} != set(net) or
+                len(proxy_networks) != 2 or
+                next(item for key, item in net.items() if key != network_id).get("Name") != self.project + "_ingress" or
+                next(item for key, item in net.items() if key != network_id).get("Internal") is not False):
+            raise ValueError("proxy network topology mismatch")
+        router_full, proxy_full = data.get("Id"), proxy.get("Id")
+        if (not router_full or not proxy_full or
+                set(net[network_id].get("Containers", {})) != {router_full, proxy_full} or
+                set(next(item for key, item in net.items() if key != network_id).get("Containers", {})) != {proxy_full}):
+            raise ValueError("unexpected network peers")
+        self.port = port
+        return self
+
+    def _validate_proxy_inspect(self, proxy):
+        """Validate a running proxy's inspect data without Docker calls or exec.
+
+        Callers separately verify role ownership, network peers and effective
+        cgroups. This can be used during the read-only failure window.
+        """
+        ph = proxy.get("HostConfig", {})
+        config = proxy.get("Config", {})
+        if (proxy.get("Image") != self.proxy_image_id or not proxy.get("State", {}).get("Running") or
+                ph.get("NanoCpus") != 250_000_000 or ph.get("Memory") != 128 * 1024 * 1024 or
+                ph.get("MemorySwap") != 128 * 1024 * 1024 or ph.get("PidsLimit") != 64 or
+                ph.get("Privileged") is not False or ph.get("ReadonlyRootfs") is not True or
+                ph.get("CgroupnsMode") != "private" or
+                ph.get("CapDrop") != ["ALL"] or ph.get("CapAdd") not in (None, []) or
+                "no-new-privileges:true" not in (ph.get("SecurityOpt") or []) or
+                ph.get("RestartPolicy", {}).get("Name") != "no" or
+                config.get("User") != "65534:65534" or
+                config.get("Entrypoint") != ["python", "-I", "-u", "-c", TEST_PROXY] or
+                config.get("Cmd") not in (None, []) or proxy.get("Mounts") or
+                ph.get("Binds") or ph.get("Devices") or ph.get("NetworkMode") in ("host", "none")):
+            raise ValueError("proxy security settings or image mismatch")
+        ports = proxy["NetworkSettings"]["Ports"]
         bindings = ports.get("8787/tcp") or []
         if (len(bindings) != 1 or bindings[0].get("HostIp") != "127.0.0.1" or
                 any(value for key, value in ports.items() if key != "8787/tcp")):
             raise ValueError("unexpected listener publication")
-        self.port = int(bindings[0]["HostPort"])
-        return self
+        port = bindings[0].get("HostPort", "")
+        if not isinstance(port, str) or not re.fullmatch(r"[0-9]{1,5}", port) or not 1 <= int(port) <= 65535:
+            raise ValueError("invalid Docker allocated host port")
+        configured = ph.get("PortBindings") or {}
+        configured_bindings = configured.get("8787/tcp") or []
+        if (set(configured) != {"8787/tcp"} or len(configured_bindings) != 1 or
+                configured_bindings[0].get("HostIp") != "127.0.0.1" or
+                configured_bindings[0].get("HostPort") not in ("", "0", port)):
+            raise ValueError("proxy configured publication mismatch")
+        return int(port)
 
     def finish_expected_inspection(self, *, verified):
         """End the single read-only classification window, fencing any failure."""
@@ -437,12 +537,13 @@ class InstalledProject:
             raise
 
     def _stop_owned(self):
-        if self.container_id is None or self._owned("container") != [self.container_id]:
-            raise ValueError("expected owned container is not present")
-        self._docker("container", "stop", "--time", "5", self.container_id, timeout=20)
-        info = json.loads(self._docker("container", "inspect", self.container_id))[0]
-        if info["State"].get("Running"):
-            raise RuntimeError("container did not stop")
+        if self._roles() != {"router": self.container_id, "proxy": self.proxy_id}:
+            raise ValueError("expected owned containers are not present")
+        for identifier in (self.proxy_id, self.container_id):
+            self._docker("container", "stop", "--time", "5", identifier, timeout=20)
+            info = json.loads(self._docker("container", "inspect", identifier))[0]
+            if info["State"].get("Running"):
+                raise RuntimeError("container did not stop")
         self.port = None
 
     def run_worker_bundle(self, files, expected_sha256, *, stdin):
@@ -464,8 +565,15 @@ class InstalledProject:
             if (not isinstance(data, bytes) or not re.fullmatch(r"[0-9a-f]{64}", expected_sha256[name]) or
                     hashlib.sha256(data).hexdigest() != expected_sha256[name]):
                 raise ValueError("worker fixture digest mismatch")
-        if self._owned("container") != [self.container_id]:
-            raise ValueError("worker container ownership changed")
+        settings = json.loads(stdin)
+        if not isinstance(settings, dict) or "_foundry_diagnostic_nonce" in settings:
+            raise ValueError("invalid worker diagnostic input")
+        diagnostic_nonce = secrets.token_hex(16)
+        settings["_foundry_diagnostic_nonce"] = diagnostic_nonce
+        stdin = json.dumps(settings, separators=(",", ":")).encode()
+        if len(stdin) > 8192:
+            raise ValueError("worker diagnostic input too large")
+        self.require_roles()
         with tempfile.TemporaryDirectory(prefix="worker-bundle-", dir=self.root) as tmp:
             directory = Path(tmp)
             for name, data in files.items():
@@ -479,7 +587,8 @@ class InstalledProject:
             self._docker("cp", str(directory) + "/.", self.container_id + ":" + target, timeout=30)
             return self._docker("exec", "-i", "-e", "PYTHONPATH=" + target, self.container_id,
                                 "timeout", "--signal=TERM", "--kill-after=5s", "360s",
-                                "python", target + "/runner.py", timeout=375, input_data=stdin)
+                                "python", target + "/runner.py", timeout=375, input_data=stdin,
+                                diagnostic_nonce=diagnostic_nonce)
 
     def _owned(self, kind):
         try:
@@ -488,14 +597,45 @@ class InstalledProject:
             self.block_engine()
             raise
 
+    def _roles(self):
+        """Resolve exactly the two labelled Compose roles, rejecting all others."""
+        try:
+            roles = {}
+            for identifier in self._owned("container"):
+                info = json.loads(self._docker("container", "inspect", identifier))
+                if len(info) != 1:
+                    raise ValueError("invalid container role inspection")
+                labels = info[0].get("Config", {}).get("Labels", {})
+                if (labels.get(LABEL) != self.token or labels.get("com.docker.compose.project") != self.project or
+                        not isinstance(info[0].get("Id"), str) or not info[0]["Id"].startswith(identifier)):
+                    raise ValueError("container role ownership changed")
+                role = labels.get("com.docker.compose.service")
+                if role not in ("router", "proxy") or role in roles:
+                    raise ValueError("unexpected or duplicate container role")
+                roles[role] = identifier
+            if set(roles) != {"router", "proxy"}:
+                raise ValueError("missing test container role")
+            return roles
+        except BaseException:
+            self.block_engine()
+            raise
+
+    def require_roles(self):
+        roles = self._roles()
+        if (not self.container_id or not self.proxy_id or
+                roles != {"router": self.container_id, "proxy": self.proxy_id}):
+            self.block_engine()
+            raise ValueError("owned router or proxy identity changed")
+        return roles
+
     def _owned_verified(self, kind):
         args = [kind, "ls", "-q", "--filter", "label=com.docker.compose.project=" + self.project]
         if kind == "container":
-            args.insert(2, "-a")
+            args[2:2] = ["-a", "--no-trunc"]
         ids = self._docker(*args).splitlines()
         run_args = [kind, "ls", "-q", "--filter", "label=" + LABEL + "=" + self.token]
         if kind == "container":
-            run_args.insert(2, "-a")
+            run_args[2:2] = ["-a", "--no-trunc"]
         if set(ids) != set(self._docker(*run_args).splitlines()):
             raise ValueError("project and test-run labels do not identify the same resources")
         if len(ids) > 8 or len(set(ids)) != len(ids):

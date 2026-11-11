@@ -145,6 +145,8 @@ class LiveProtocolTests(unittest.TestCase):
         project = mock.Mock()
         project.port = 1234
         project.container_id = "owned"
+        project.proxy_id = "proxy"
+        project._roles.return_value = {"router": "owned", "proxy": "proxy"}
         project._owned.return_value = ["owned"]
         admin = mock.Mock(cookie="cookie", csrf="csrf")
         with self.assertRaises(ValueError):

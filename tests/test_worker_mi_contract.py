@@ -172,6 +172,12 @@ class WorkerConfigTests(unittest.TestCase):
                                 (500, {"error": {"type": "api_error", "code": "invalid_state"}}), (403, {})):
             with self.subTest(status=status, payload=payload), self.assertRaises(AssertionError):
                 worker._assert_gateway_error(status, payload, allowed)
+        worker._assert_gateway_error(502, {"error": {"type": "api_error", "code": "backend_failure"}},
+                                     worker.DISCONNECTED_GATEWAY_ERRORS)
+        for status, code in ((200, "backend_failure"), (500, "backend_failure"), (502, "other")):
+            with self.subTest(status=status, code=code), self.assertRaises(AssertionError):
+                worker._assert_gateway_error(status, {"error": {"type": "api_error", "code": code}},
+                                             worker.DISCONNECTED_GATEWAY_ERRORS)
         with tempfile.TemporaryDirectory() as tmp:
             trace = Path(tmp) / "trace"
             workers = {"a": {"trace": trace}}

@@ -87,7 +87,8 @@ class WiringTests(unittest.TestCase):
         cuts.assert_called_once_with('/python', '/wheel', '/mi')
 
     def test_project_preserves_original_error_when_cleanup_is_blocked(self):
-        args = SimpleNamespace(new_image_id='new', old_image_id='old', socket='/run/docker.sock', engine_id='engine')
+        args = SimpleNamespace(new_image_id='new', old_image_id='old', socket='/run/docker.sock', engine_id='engine',
+                               base_digest='sha256:' + 'a' * 64)
         project = mock.Mock()
         project.cleanup.side_effect = ValueError('no retry')
         evidence = mock.Mock(data={'phases': {}})
@@ -102,7 +103,8 @@ class WiringTests(unittest.TestCase):
         self.assertIn('cleanup also failed', caught.exception.__notes__[0])
 
     def test_successful_body_is_not_passed_when_cleanup_fails(self):
-        args = SimpleNamespace(new_image_id='new', old_image_id='old', socket='/run/docker.sock', engine_id='engine')
+        args = SimpleNamespace(new_image_id='new', old_image_id='old', socket='/run/docker.sock', engine_id='engine',
+                               base_digest='sha256:' + 'a' * 64)
         project = mock.Mock()
         project.cleanup.side_effect = ValueError('cleanup failed')
         evidence = mock.Mock(data={'phases': {}})

@@ -24,11 +24,46 @@ import zai_real_source_check as zai
 from installed_lifecycle_adapter import InstalledLifecycleAdapter
 from installed_mi_lifecycle_scenario import (_bound_selection, run_lifecycle_acceptance,
                                              run_preactivation_failure, run_variant_reload_acceptance)
-from installed_provisioning import CommandFailure, InstalledProject, ROOT, validate_engine_socket
+from installed_provisioning import CommandFailure, InstalledProject, ROOT, WORKER_DIAGNOSTIC_RE, validate_engine_socket
 from installed_worker_control import assert_input_boundary, run_stale_installed, start_live_worker
 
 
-RUNNER = b"import json, sys\nfrom worker_mi_acceptance import run_in_container\nprint(json.dumps(run_in_container(json.load(sys.stdin)), separators=(',', ':')))\n"
+RUNNER = b'''import json, sys
+settings = json.load(sys.stdin)
+nonce = settings.pop('_foundry_diagnostic_nonce')
+try:
+    from worker_mi_acceptance import run_in_container
+    print(json.dumps(run_in_container(settings), separators=(',', ':')))
+except Exception as exc:
+    category = next((name for cls, name in ((AssertionError, 'assertion'), (TimeoutError, 'timeout'),
+                    (ValueError, 'value'), (OSError, 'os'), (RuntimeError, 'runtime'))
+                    if isinstance(exc, cls)), 'other')
+    line = 0
+    caller = 0
+    status = 0
+    error_type = 'other'
+    error_code = 'other'
+    tb = exc.__traceback__
+    while tb:
+        if tb.tb_frame.f_code.co_filename.endswith('/worker_mi_acceptance.py'):
+            caller = line
+            line = tb.tb_lineno
+            if tb.tb_frame.f_code.co_name == '_assert_gateway_error':
+                value = tb.tb_frame.f_locals.get('status')
+                if type(value) is int and 100 <= value <= 599:
+                    status = value
+                payload = tb.tb_frame.f_locals.get('payload')
+                error = payload.get('error') if isinstance(payload, dict) else None
+                if isinstance(error, dict):
+                    if error.get('type') in ('permission_error', 'not_found_error', 'api_error', 'invalid_request_error'):
+                        error_type = error['type']
+                    if error.get('code') in ('unauthorized_target', 'pin_target_not_found', 'target_unavailable',
+                                             'adapter_unavailable', 'backend_failure', 'capability_unassessed'):
+                        error_code = error['code']
+        tb = tb.tb_next
+    print(f'FOUNDRY_WORKER_FAILURE:{nonce}:{category}:{line}:{caller}:{status}:{error_type}:{error_code}', file=sys.stderr)
+    raise SystemExit(1) from None
+'''
 
 PHASE_CHECKS = {
     'baseline': ['missing_and_invalid_credentials_rejected', 'admin_csrf_and_inference_separation', 'untrusted_and_wrong_hostname_tls_rejected', 'mi_disabled_4097_admitted'],
@@ -73,6 +108,7 @@ class Evidence:
             self.data['candidate_image_sr_revision'] = provenance.NEW_SR
             self.data['foundry_image_upgrade_compatibility'] = 'not_established'
             self.data['worker_backend_scope'] = 'synthetic; native worker sandbox not verified'
+            self.data['host_https_path'] = 'test TCP proxy with end-to-end router TLS; direct Docker publication not verified'
         self.save()
 
     def save(self):
@@ -108,7 +144,8 @@ def _checked_file(path, expected):
 def _project(args, *, baseline=False, phase=None, evidence=None, cuts=None):
     old, new = (args.new_image_id, args.old_image_id) if baseline else (args.old_image_id, args.new_image_id)
     project = InstalledProject(socket_path=args.socket, engine_id=args.engine_id, image_id=old,
-                               authorization="disposable-linux-engine-approved", mi_cuts=cuts)
+                               authorization="disposable-linux-engine-approved", mi_cuts=cuts,
+                               base_digest=args.base_digest)
     record = None
     if evidence is not None:
         record = evidence.data['phases'][phase] = {'status': 'running', 'cleanup': 'pending'}
@@ -567,8 +604,10 @@ def run(args):
     evidence = Evidence(args.evidence_dir)
     try:
         _run_authorized()
-    except BaseException:
+    except BaseException as exc:
         evidence.data['status'] = 'failed'
+        if isinstance(exc, CommandFailure) and WORKER_DIAGNOSTIC_RE.fullmatch(exc.stderr):
+            evidence.data['worker_diagnostic'] = exc.stderr
         for name, status in evidence.data['preflight'].items():
             if status == 'running':
                 evidence.data['preflight'][name] = 'failed'

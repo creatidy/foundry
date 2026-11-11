@@ -2,10 +2,12 @@
 
 import errno
 import hashlib
+import io
 import json
 import os
 from pathlib import Path
 import stat
+import struct
 import subprocess
 import tempfile
 from types import SimpleNamespace
@@ -15,6 +17,74 @@ from unittest import mock
 import installed_provisioning as provisioning
 import docker_socket_validation
 import local_tls_up
+
+
+class TestMountGroupTests(unittest.TestCase):
+    def test_non_rootless_retains_operator_group(self):
+        with mock.patch.object(local_tls_up.os, "getegid", return_value=1001):
+            self.assertEqual("1001", local_tls_up.test_mount_group({"SecurityOptions": ["name=seccomp"]}))
+
+    def test_rootless_requires_verified_peer_and_mapping(self):
+        peer = mock.MagicMock()
+        peer.__enter__.return_value.getsockopt.return_value = struct.pack("3i", 123, 1001, 1001)
+        response = mock.MagicMock(status=200)
+        response.read.return_value = json.dumps({"ID": "test-engine-id", "SecurityOptions": ["name=rootless"]}).encode()
+        with mock.patch.dict(os.environ, {"FOUNDRY_TEST_DOCKER_HOST": "unix:///run/user/1001/docker.sock",
+                                        "FOUNDRY_TEST_ENGINE_ID": "test-engine-id"}), \
+             mock.patch("socket.socket", return_value=peer), \
+             mock.patch("http.client.HTTPResponse", return_value=response), \
+             mock.patch.object(local_tls_up.os, "geteuid", return_value=1001), \
+             mock.patch.object(local_tls_up.os, "getegid", return_value=1001):
+            with mock.patch("builtins.open", return_value=io.StringIO("0 1001 1\n1 165536 65536\n")):
+                self.assertEqual("0", local_tls_up.test_mount_group({"SecurityOptions": ["name=rootless"]}))
+            with mock.patch("builtins.open", return_value=io.StringIO("0 2000 1\n")):
+                with self.assertRaises(local_tls_up.TestEngineRefusal):
+                    local_tls_up.test_mount_group({"SecurityOptions": ["name=rootless"]})
+            peer.__enter__.return_value.getsockopt.return_value = struct.pack("3i", 123, 0, 0)
+            with self.assertRaises(local_tls_up.TestEngineRefusal):
+                local_tls_up.test_mount_group({"SecurityOptions": ["name=rootless"]})
+
+    def test_rootless_rejects_changed_engine_and_socket_errors(self):
+        peer = mock.MagicMock()
+        peer.__enter__.return_value.getsockopt.return_value = struct.pack("3i", 123, 1001, 1001)
+        response = mock.MagicMock(status=200)
+        response.read.return_value = b'{"ID":"other","SecurityOptions":["name=rootless"]}'
+        with mock.patch.dict(os.environ, {"FOUNDRY_TEST_DOCKER_HOST": "unix:///run/user/1001/docker.sock",
+                                        "FOUNDRY_TEST_ENGINE_ID": "expected"}), \
+             mock.patch("socket.socket", return_value=peer), \
+             mock.patch("http.client.HTTPResponse", return_value=response), \
+             mock.patch.object(local_tls_up.os, "geteuid", return_value=1001):
+            with self.assertRaises(local_tls_up.TestEngineRefusal):
+                local_tls_up.test_mount_group({"SecurityOptions": ["name=rootless"]})
+            peer.__enter__.return_value.connect.side_effect = TimeoutError("socket timeout")
+            with self.assertRaises(local_tls_up.TestEngineRefusal):
+                local_tls_up.test_mount_group({"SecurityOptions": ["name=rootless"]})
+
+    def test_missing_security_options_fail_closed(self):
+        with self.assertRaises(local_tls_up.TestEngineRefusal):
+            local_tls_up.test_mount_group({})
+
+    def test_changed_mapping_refuses_before_compose_up(self):
+        token = "a" * 32
+        project = "foundry-test-" + token
+        config = {"name": project, "services": {"router": {
+            "volumes": [{"type": "bind", "source": "/tls", "target": "/run/foundry/tls", "read_only": True}],
+            "environment": {"SR_HEALTHCHECK_URL": "https://127.0.0.1:8787/healthz"},
+            "command": ["--tls-reload-hostname=127.0.0.1"]}}}
+        env = {"LOCAL_TLS_PROJECT": project, "TLS_DEST": "/tls", "FOUNDRY_TEST_RUN_ID": token,
+               "FOUNDRY_TEST_AUTHORIZATION": "disposable-linux-engine-approved"}
+        result = subprocess.CompletedProcess([], 0, stdout=json.dumps(config).encode())
+        with mock.patch.dict(os.environ, env, clear=True), \
+             mock.patch.object(local_tls_up, "validate"), \
+             mock.patch.object(local_tls_up, "check_project", return_value=False), \
+             mock.patch.object(local_tls_up, "verify_test_engine", return_value={}), \
+             mock.patch.object(local_tls_up, "test_proxy_image"), \
+             mock.patch.object(local_tls_up, "test_mount_group", side_effect=["0", "1001"]), \
+             mock.patch.dict(os.environ, {"FOUNDRY_TEST_PROXY_IMAGE_ID": "sha256:" + "a" * 64}), \
+             mock.patch.object(local_tls_up.subprocess, "run", return_value=result) as run:
+            self.assertEqual(70, local_tls_up.main())
+            self.assertEqual(2, run.call_count)
+            self.assertIn("config", run.call_args.args[0])
 
 
 class FixturePreparationTests(unittest.TestCase):
@@ -56,6 +126,23 @@ class FixturePreparationTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "reference mismatch"):
                     provisioning.prepare_mi(destination, (b"good", b"{}"))
             self.assertEqual([], list(Path(tmp).iterdir()))
+
+
+class ProxyRelayTests(unittest.IsolatedAsyncioTestCase):
+    async def test_relay_preserves_bytes_and_half_closes(self):
+        source = local_tls_up.TEST_PROXY.removesuffix("asyncio.run(main())\n")
+        namespace = {}
+        exec(compile(source, "<fixed-test-proxy>", "exec"), namespace)
+        reader = mock.Mock()
+        reader.read = mock.AsyncMock(side_effect=[b"\x16\x03\x01\x00", b"\xffpayload", b""])
+        writer = mock.Mock()
+        writer.drain = mock.AsyncMock()
+        writer.can_write_eof.return_value = True
+        await namespace["relay"](reader, writer)
+        self.assertEqual([mock.call(b"\x16\x03\x01\x00"), mock.call(b"\xffpayload")], writer.write.call_args_list)
+        self.assertEqual(2, writer.drain.await_count)
+        writer.write_eof.assert_called_once_with()
+
 
 class SocketValidationTests(unittest.TestCase):
     def validate(self, *, directories=None, endpoint=None, accessible=True, xattr_error=errno.ENODATA):
@@ -128,6 +215,54 @@ class OrchestrationTests(unittest.TestCase):
         return provisioning.InstalledProject(socket_path="/private/docker.sock", engine_id="disposable-id-123",
                                              image_id="sha256:" + "a" * 64,
                                              authorization="disposable-linux-engine-approved", mi_cuts={"fresh": (b"x", b"y")})
+
+    def test_changed_role_identity_fences_cleanup(self):
+        project = self.project()
+        project.root = Path("/test/private")
+        project.container_id, project.proxy_id = "router", "proxy"
+        with mock.patch.object(project, "_roles", return_value={"router": "router", "proxy": "replacement"}), \
+             mock.patch.object(project, "_docker") as docker:
+            with self.assertRaisesRegex(ValueError, "identity changed"):
+                project.require_roles()
+            with self.assertRaisesRegex(ValueError, "engine fenced"):
+                project.cleanup()
+            docker.assert_not_called()
+        self.assertTrue(provisioning._ENGINE_VERIFICATION_FAILED)
+
+    def test_worker_diagnostic_only_exposes_allowlisted_marker(self):
+        target = "/tmp/foundry-worker-" + "a" * 32
+        nonce = "c" * 32
+        args = ["docker", "exec", "-i", "-e", "PYTHONPATH=" + target, "b" * 64,
+                "timeout", "--signal=TERM", "--kill-after=5s", "360s", "python", target + "/runner.py"]
+        marker = "assertion:202:580:403:permission_error:unauthorized_target"
+        stderr = ("private-token\nFOUNDRY_WORKER_FAILURE:" + nonce + ":" + marker + "\nother-private-text\n").encode()
+        diagnostic = provisioning.redacted_docker_stderr(args, stderr, 1, nonce)
+        self.assertEqual("FOUNDRY_WORKER_FAILURE:" + marker, diagnostic)
+        self.assertNotIn("private", str(provisioning.CommandFailure("docker", 1, stderr=diagnostic)))
+        self.assertIn(diagnostic, str(provisioning.CommandFailure("docker", 1, stderr=diagnostic)))
+        self.assertNotIn("private", provisioning.redacted_docker_stderr(args, b"FOUNDRY_WORKER_FAILURE:private-token:123\n", 1, nonce))
+        self.assertNotIn(marker, provisioning.redacted_docker_stderr(["docker", "logs", "id"], stderr, 1, nonce))
+        self.assertNotIn(marker, provisioning.redacted_docker_stderr(args, stderr, 124, nonce))
+        self.assertNotIn(marker, provisioning.redacted_docker_stderr(args, stderr, 1, "d" * 32))
+        self.assertNotIn(marker, provisioning.redacted_docker_stderr(args[:6] + ["sh", "-c"] + args[8:], stderr, 1, nonce))
+        self.assertEqual(diagnostic, provisioning.redacted_docker_stderr(args, b"x" * 5000 + b"\n" + stderr, 1, nonce))
+
+    def test_adopt_rejects_running_or_unknown_state_and_fences(self):
+        image = "sha256:" + "a" * 64
+        for state in ({"Running": True}, {}):
+            with self.subTest(state=state), mock.patch.object(provisioning, "_ENGINE_VERIFICATION_FAILED", False):
+                project = self.project()
+                project.root = Path("/test/private")
+                project.container_id, project.proxy_id, project.env = "router", "proxy", {}
+                def docker(*args):
+                    if args[:2] == ("image", "inspect"):
+                        return json.dumps([{"Id": image, "Os": "linux"}])
+                    return json.dumps([{"State": state}])
+                with mock.patch.object(project, "require_roles", return_value={"router": "router", "proxy": "proxy"}), \
+                     mock.patch.object(project, "_docker", side_effect=docker):
+                    with self.assertRaisesRegex(ValueError, "running or state is unknown"):
+                        project.launch(image, mi_enabled=False, adopt=True)
+                self.assertTrue(provisioning._ENGINE_VERIFICATION_FAILED)
 
     def test_authorization_and_socket_are_required(self):
         with self.assertRaises(ValueError):
@@ -272,11 +407,13 @@ class OrchestrationTests(unittest.TestCase):
         project.root = Path("/test/private")
         project.env = {}
         project.container_id = "prior"
+        project.proxy_id = "proxy"
         image = json.dumps([{"Id": project.image_id, "Os": "linux"}])
         def docker(*args, **kwargs):
             return image if args[0] == "image" else json.dumps([{"State": {"Running": False}}])
         with mock.patch.object(project, "_docker", side_effect=docker), \
              mock.patch.object(project, "_owned", side_effect=lambda kind: ["prior"] if kind == "container" else []), \
+             mock.patch.object(project, "_roles", return_value={"router": "prior", "proxy": "proxy"}), \
              mock.patch.object(project, "_verify_engine"), \
              mock.patch.object(project, "_run", side_effect=provisioning.CommandFailure("startup", 1)):
             with self.assertRaises(provisioning.CommandFailure):
@@ -318,11 +455,13 @@ class OrchestrationTests(unittest.TestCase):
                 project.root = Path("/test/private")
                 project.env = {}
                 project.container_id = "prior"
+                project.proxy_id = "proxy"
                 image = json.dumps([{"Id": project.image_id, "Os": "linux"}])
                 def docker(*args, **kwargs):
                     return image if args[0] == "image" else json.dumps([{"State": {"Running": False}}])
                 with mock.patch.object(project, "_docker", side_effect=docker), \
                      mock.patch.object(project, "_owned", side_effect=lambda kind: ["prior"] if kind == "container" else []), \
+                     mock.patch.object(project, "_roles", return_value={"router": "prior", "proxy": "proxy"}), \
                      mock.patch.object(project, "_verify_engine"), \
                      mock.patch.object(project, "_run", side_effect=failure):
                     with self.assertRaises(type(failure)):
@@ -379,7 +518,7 @@ class OrchestrationTests(unittest.TestCase):
 
     def test_test_override_is_narrow_and_bounded(self):
         token = "a" * 32
-        override = local_tls_up.test_override("foundry-test-" + token, token, ["--existing"])
+        override = local_tls_up.test_override("foundry-test-" + token, token, ["--existing"], proxy_image="sha256:" + "a" * 64)
         router = override["services"]["router"]
         self.assertEqual((1.0, "512m", 128), (router["cpus"], router["mem_limit"], router["pids_limit"]))
         self.assertIn("--worker-listen-host=127.0.0.1", router["command"])
@@ -388,9 +527,77 @@ class OrchestrationTests(unittest.TestCase):
         self.assertIs(override["networks"]["backend"]["internal"], True)
         self.assertIn("--worker-tls-reload-ca-cert=/run/foundry/tls/server.crt", router["command"])
         self.assertNotIn("ports", router)
+        proxy = override["services"]["proxy"]
+        self.assertEqual(["127.0.0.1:0:8787"], proxy["ports"])
+        self.assertEqual(["backend", "ingress"], proxy["networks"])
+        self.assertEqual("65534:65534", proxy["user"])
+        self.assertTrue(proxy["read_only"])
+        self.assertEqual(["ALL"], proxy["cap_drop"])
+        self.assertNotIn("volumes", proxy)
+        self.assertEqual("no", proxy["restart"])
+        self.assertEqual(token, override["networks"]["ingress"]["labels"][provisioning.LABEL])
         self.assertEqual(token, override["volumes"]["router-data"]["labels"][provisioning.LABEL])
         with self.assertRaises(ValueError):
             local_tls_up.test_override("some-other-project", token, [])
+
+    def test_proxy_image_requires_exact_digest_and_image_identity(self):
+        digest = "sha256:" + "a" * 64
+        image = "sha256:" + "b" * 64
+        item = {"Id": image, "Os": "linux", "RepoDigests": ["python@" + digest]}
+        with mock.patch.object(local_tls_up, "verify_test_engine"), \
+             mock.patch.object(local_tls_up.subprocess, "run") as run:
+            run.return_value.stdout = json.dumps([item]).encode()
+            local_tls_up.test_proxy_image(digest, image)
+            for changed in ({**item, "Id": "sha256:" + "c" * 64}, {**item, "Os": "windows"},
+                            {**item, "RepoDigests": ["other@" + digest]}, {**item, "RepoDigests": None}):
+                run.return_value.stdout = json.dumps([changed]).encode()
+                with self.subTest(changed=changed), self.assertRaises(ValueError):
+                    local_tls_up.test_proxy_image(digest, image)
+            with self.assertRaises(ValueError):
+                local_tls_up.test_proxy_image("latest", image)
+
+    def test_roles_reject_missing_duplicate_and_foreign_roles(self):
+        for roles in (("router", "proxy"), ("router",), ("router", "router"), ("router", "foreign")):
+            with self.subTest(roles=roles), mock.patch.object(provisioning, "_ENGINE_VERIFICATION_FAILED", False):
+                project = self.project()
+                identifiers = [str(index) for index in range(len(roles))]
+                def docker(*args, **kwargs):
+                    role = roles[int(args[-1])]
+                    return json.dumps([{"Id": args[-1] + "full", "Config": {"Labels": {
+                        "com.docker.compose.service": role, "com.docker.compose.project": project.project,
+                        provisioning.LABEL: project.token}}}])
+                with mock.patch.object(project, "_owned", return_value=identifiers), \
+                     mock.patch.object(project, "_docker", side_effect=docker):
+                    if roles == ("router", "proxy"):
+                        self.assertEqual({"router": "0", "proxy": "1"}, project._roles())
+                    else:
+                        with self.assertRaises(ValueError):
+                            project._roles()
+                        self.assertTrue(project._engine_blocked)
+
+    def test_start_requires_base_before_creating_temporary_files(self):
+        project = self.project()
+        with mock.patch.object(provisioning.tempfile, "mkdtemp") as mkdir:
+            with self.assertRaisesRegex(ValueError, "proxy base digest"):
+                project.start()
+            mkdir.assert_not_called()
+
+    def test_stop_checks_both_roles_and_stops_proxy_first(self):
+        project = self.project()
+        project.container_id, project.proxy_id, project.port = "router", "proxy", 32123
+        roles = {"router": "router", "proxy": "proxy"}
+        with mock.patch.object(project, "_roles", return_value=roles), \
+             mock.patch.object(project, "_docker", return_value=json.dumps([{"State": {"Running": False}}])) as docker:
+            project.stop()
+        stops = [call.args[-1] for call in docker.call_args_list if call.args[:2] == ("container", "stop")]
+        self.assertEqual(["proxy", "router"], stops)
+        self.assertIsNone(project.port)
+        with mock.patch.object(project, "_roles", return_value={"router": "router", "proxy": "foreign"}), \
+             mock.patch.object(project, "_docker") as docker:
+            with self.assertRaises(ValueError):
+                project.stop()
+            docker.assert_not_called()
+            self.assertTrue(project._engine_blocked)
 
     def test_test_image_derivation_does_not_edit_canonical_file(self):
         original = (provisioning.ROOT / "Dockerfile.mi").read_text()
@@ -437,6 +644,16 @@ class OrchestrationTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "labels"):
                 project._owned("container")
 
+    def test_owned_container_listing_uses_full_ids(self):
+        project = self.project()
+        identifier = "a" * 64
+        labels = {"com.docker.compose.project": project.project, provisioning.LABEL: project.token}
+        with mock.patch.object(project, "_docker", side_effect=[identifier + "\n", identifier + "\n",
+                                                                 json.dumps([{"Config": {"Labels": labels}}])]) as docker:
+            self.assertEqual([identifier], project._owned("container"))
+        for call in docker.call_args_list[:2]:
+            self.assertIn("--no-trunc", call.args)
+
     def test_worker_bundle_checks_provenance_and_invokes_bounded_exec(self):
         project = self.project()
         data = b"print('fixture')\n"
@@ -444,7 +661,8 @@ class OrchestrationTests(unittest.TestCase):
             project.root = Path(tmp)
             project.port = 32123
             project.container_id = "container-id"
-            with mock.patch.object(project, "_owned", return_value=["container-id"]), \
+            project.proxy_id = "proxy-id"
+            with mock.patch.object(project, "_roles", return_value={"router": "container-id", "proxy": "proxy-id"}), \
                  mock.patch.object(project, "_docker", return_value="ok") as docker:
                 with self.assertRaises(ValueError):
                     project.run_worker_bundle({"runner.py": data}, {"runner.py": "0" * 64}, stdin=b"{}")
@@ -455,25 +673,53 @@ class OrchestrationTests(unittest.TestCase):
                 self.assertIn("timeout", args)
                 self.assertIn("360s", args)
                 self.assertEqual(375, docker.call_args.kwargs["timeout"])
-                self.assertEqual(b"{}", docker.call_args.kwargs["input_data"])
+                submitted = json.loads(docker.call_args.kwargs["input_data"])
+                self.assertEqual({"_foundry_diagnostic_nonce"}, set(submitted))
+                self.assertRegex(submitted["_foundry_diagnostic_nonce"], r"^[0-9a-f]{32}$")
+                self.assertEqual(submitted["_foundry_diagnostic_nonce"], docker.call_args.kwargs["diagnostic_nonce"])
                 with self.assertRaises(ValueError):
                     project.run_worker_bundle({"../runner.py": data},
                                               {"../runner.py": hashlib.sha256(data).hexdigest()}, stdin=b"{}")
 
     def test_start_checks_running_container_limits_and_loopback(self):
         project = self.project()
-        network = {"Id": "network123", "Internal": True}
-        inspect = [{"Image": project.image_id,
+        project.base_digest = "sha256:" + "b" * 64
+        proxy_image = "sha256:" + "c" * 64
+        network = {"Id": "network123", "Name": project.project + "_backend", "Internal": True,
+                   "Containers": {"router-full": {}, "proxy-full": {}}}
+        ingress = {"Id": "ingress123", "Name": project.project + "_ingress", "Internal": False,
+                   "Containers": {"proxy-full": {}}}
+        inspect = [{"Id": "router-full", "Image": project.image_id,
                     "HostConfig": {"NanoCpus": 1_000_000_000, "Memory": 536870912,
                                    "MemorySwap": 536870912, "PidsLimit": 128, "Privileged": False},
                     "State": {"Running": True, "StartedAt": "2026-01-01T00:00:00Z", "Health": {"Status": "healthy"}},
                     "Mounts": [{"Destination": "/data", "Type": "volume", "Name": project.project + "_router-data"}],
-                    "NetworkSettings": {"Networks": {"backend": {"NetworkID": "network123"}}, "Ports": {"8787/tcp": [{"HostIp": "127.0.0.1", "HostPort": "32123"}]}}}]
+                    "NetworkSettings": {"Networks": {"backend": {"NetworkID": "network123"}}, "Ports": {"8787/tcp": None}}}]
+        proxy = {"Id": "proxy-full", "Image": proxy_image,
+                 "Config": {"User": "65534:65534", "Entrypoint": ["python", "-I", "-u", "-c", local_tls_up.TEST_PROXY], "Cmd": []},
+                 "HostConfig": {"NanoCpus": 250000000, "Memory": 134217728, "MemorySwap": 134217728,
+                                "PidsLimit": 64, "Privileged": False, "ReadonlyRootfs": True, "CapDrop": ["ALL"],
+                                "CgroupnsMode": "private",
+                                "PortBindings": {"8787/tcp": [{"HostIp": "127.0.0.1", "HostPort": "0"}]},
+                                "SecurityOpt": ["no-new-privileges:true"], "RestartPolicy": {"Name": "no"}},
+                 "State": {"Running": True, "StartedAt": "2026-01-01T00:00:00Z"}, "Mounts": [],
+                 "NetworkSettings": {"Networks": {"backend": {"NetworkID": "network123"}, "ingress": {"NetworkID": "ingress123"}},
+                                     "Ports": {"8787/tcp": [{"HostIp": "127.0.0.1", "HostPort": "32123"}]}}}
+        def docker(*args, **kwargs):
+            if args[0] == "exec":
+                return ("0::/\n0::/\n134217728\n0\n64\n25000 100000\n" if args[1] == "proxy" else
+                        "0::/\n0::/\n536870912\n0\n128\n100000 100000\n")
+            if args[:2] == ("image", "inspect"):
+                return json.dumps([{"Id": proxy_image, "Os": "linux", "RepoDigests": ["python@" + project.base_digest]}] if args[2].startswith("python:") else [{"Id": project.image_id, "Os": "linux"}])
+            if args[:2] == ("network", "inspect"):
+                return json.dumps([network if args[2] == "network123" else ingress])
+            return json.dumps([proxy] if args[-1] == "proxy" else inspect)
         with tempfile.TemporaryDirectory() as tmp, \
              mock.patch.object(provisioning.tempfile, "mkdtemp", return_value=tmp), \
              mock.patch.object(project, "_verify_engine"), mock.patch.object(project, "_run"), \
-             mock.patch.object(provisioning, "prepare_mi"), mock.patch.object(project, "_owned", side_effect=lambda kind: ["container"] if kind == "container" else (["network123"] if kind == "network" else [project.project + "_router-data"])), \
-             mock.patch.object(project, "_docker", side_effect=lambda *args, **kwargs: "0::/\n0::/\n536870912\n0\n128\n100000 100000\n" if args[0] == "exec" else (json.dumps([{"Id": project.image_id, "Os": "linux"}]) if args[:2] == ("image", "inspect") else (json.dumps([network]) if args[:2] == ("network", "inspect") else json.dumps(inspect)))):
+             mock.patch.object(provisioning, "prepare_mi"), mock.patch.object(project, "_roles", return_value={"router": "container", "proxy": "proxy"}), \
+             mock.patch.object(project, "_owned", side_effect=lambda kind: ["network123", "ingress123"] if kind == "network" else [project.project + "_router-data"]), \
+             mock.patch.object(project, "_docker", side_effect=docker):
             inspect[0]["Mounts"] += [
                 {"Destination": "/run/foundry/tls", "Type": "bind", "Source": tmp + "/tls", "RW": False},
                 *({"Destination": "/run/foundry/mi/" + name, "Type": "bind", "Source": tmp + "/mi/" + name, "RW": False}
@@ -483,6 +729,36 @@ class OrchestrationTests(unittest.TestCase):
             self.assertEqual("https://127.0.0.1:32123", project.origin)
             self.assertEqual("0", project.env["FOUNDRY_ROUTER_PORT"])
             self.assertNotIn("LOCAL_TLS_ADOPT_PROJECT", project.env)
+            adverse = [
+                (proxy["HostConfig"], "ReadonlyRootfs", False),
+                (proxy["HostConfig"], "CgroupnsMode", "host"),
+                (proxy["HostConfig"], "PortBindings", {"8787/tcp": [{"HostIp": "0.0.0.0", "HostPort": "0"}]}),
+                (proxy["HostConfig"], "CapDrop", []),
+                (proxy["HostConfig"], "CapAdd", ["NET_ADMIN"]),
+                (proxy["HostConfig"], "Memory", 0),
+                (proxy["HostConfig"], "RestartPolicy", {"Name": "always"}),
+                (proxy["Config"], "User", "0"),
+                (proxy["Config"], "Entrypoint", ["sh"]),
+                (proxy["State"], "StartedAt", ""),
+                (proxy, "Image", project.image_id),
+                (proxy, "Mounts", [{"Type": "bind", "Source": "/"}]),
+                (proxy["NetworkSettings"]["Ports"]["8787/tcp"][0], "HostIp", "0.0.0.0"),
+                (proxy["NetworkSettings"]["Ports"]["8787/tcp"][0], "HostPort", "0"),
+                (inspect[0]["HostConfig"], "PortBindings", {"8787/tcp": [{"HostIp": "127.0.0.1"}]}),
+                (network, "Containers", {"router-full": {}, "proxy-full": {}, "foreign": {}}),
+                (ingress, "Internal", True),
+                (ingress, "Containers", {"proxy-full": {}, "foreign": {}}),
+            ]
+            for target, key, value in adverse:
+                missing = object()
+                original = target.get(key, missing)
+                target[key] = value
+                with self.subTest(key=key, value=value), self.assertRaises(ValueError):
+                    project._validate_started(True)
+                if original is missing:
+                    del target[key]
+                else:
+                    target[key] = original
             inspect[0]["Mounts"][1]["RW"] = True
             with self.assertRaisesRegex(ValueError, "writable host mounts"):
                 project.launch(project.image_id, mi_enabled=True, adopt=False)
@@ -496,12 +772,13 @@ class OrchestrationTests(unittest.TestCase):
                 project.launch(project.image_id, mi_enabled=True, adopt=False)
 
         project = self.project()
+        project.base_digest = "sha256:" + "b" * 64
         inspect[0]["HostConfig"]["PidsLimit"] = 0
         with tempfile.TemporaryDirectory() as tmp, \
              mock.patch.object(provisioning.tempfile, "mkdtemp", return_value=tmp), \
              mock.patch.object(project, "_verify_engine"), mock.patch.object(project, "_run"), \
-             mock.patch.object(provisioning, "prepare_mi"), mock.patch.object(project, "_owned", side_effect=lambda kind: ["container"] if kind == "container" else [project.project + "_router-data"]), \
-             mock.patch.object(project, "_docker", side_effect=lambda *args, **kwargs: json.dumps([{"Id": project.image_id, "Os": "linux"}]) if args[:2] == ("image", "inspect") else json.dumps(inspect)):
+             mock.patch.object(provisioning, "prepare_mi"), mock.patch.object(project, "_roles", return_value={"router": "container", "proxy": "proxy"}), \
+             mock.patch.object(project, "_docker", side_effect=docker):
             with self.assertRaisesRegex(ValueError, "limits"):
                 project.start()
             self.assertIsNone(project.port)
@@ -529,7 +806,7 @@ class OrchestrationTests(unittest.TestCase):
                         return output
                     return json.dumps([item])
                 with mock.patch.object(project, "_verify_engine"), mock.patch.object(project, "_run"), \
-                     mock.patch.object(project, "_owned", return_value=["container"]), \
+                     mock.patch.object(project, "_roles", return_value={"router": "container", "proxy": "proxy"}), \
                      mock.patch.object(project, "_docker", side_effect=docker):
                     with self.assertRaisesRegex(ValueError, "effective workload cgroup"):
                         project.launch(project.image_id, mi_enabled=False, adopt=False)
@@ -550,7 +827,7 @@ class OrchestrationTests(unittest.TestCase):
         responses = [json.dumps([{"Id": project.image_id, "Os": "linux"}]), json.dumps([item]),
                      "0::/\n0::/\n536870912\n0\n128\n100000 100000\n", json.dumps([after])]
         with mock.patch.object(project, "_verify_engine"), mock.patch.object(project, "_run"), \
-             mock.patch.object(project, "_owned", return_value=["container"]), \
+             mock.patch.object(project, "_roles", return_value={"router": "container", "proxy": "proxy"}), \
              mock.patch.object(project, "_docker", side_effect=responses):
             with self.assertRaisesRegex(ValueError, "restarted"):
                 project.launch(project.image_id, mi_enabled=False, adopt=False)

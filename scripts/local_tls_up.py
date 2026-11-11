@@ -105,6 +105,67 @@ class TestEngineRefusal(Exception):
     pass
 
 
+TEST_PROXY = '''import asyncio
+
+active = set()
+
+async def relay(reader, writer):
+    while data := await reader.read(65536):
+        writer.write(data)
+        await writer.drain()
+    if writer.can_write_eof():
+        writer.write_eof()
+
+async def handle(reader, writer):
+    task = asyncio.current_task()
+    if len(active) >= 64:
+        writer.close()
+        await writer.wait_closed()
+        return
+    active.add(task)
+    upstream = None
+    pumps = []
+    try:
+        async with asyncio.timeout(120):
+            remote, upstream = await asyncio.open_connection('router', 8787)
+            pumps = [asyncio.create_task(relay(reader, upstream)),
+                     asyncio.create_task(relay(remote, writer))]
+            await asyncio.gather(*pumps)
+    except (OSError, TimeoutError):
+        pass
+    finally:
+        for pump in pumps:
+            pump.cancel()
+        await asyncio.gather(*pumps, return_exceptions=True)
+        if upstream is not None:
+            upstream.close()
+        writer.close()
+        active.remove(task)
+
+async def main():
+    server = await asyncio.start_server(handle, '0.0.0.0', 8787, backlog=64)
+    async with server:
+        await server.serve_forever()
+
+asyncio.run(main())
+'''
+
+
+def test_proxy_image(digest, image_id):
+    """Recheck the independently authenticated base reference on this engine."""
+    if not re.fullmatch(r"sha256:[0-9a-f]{64}", digest) or not re.fullmatch(r"sha256:[0-9a-f]{64}", image_id):
+        raise ValueError("pinned test proxy base digest and image ID required")
+    verify_test_engine()
+    result = subprocess.run(["docker", "image", "inspect", "python:3.12-slim@" + digest],
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True, timeout=30)
+    images = json.loads(result.stdout)
+    if (not isinstance(images, list) or len(images) != 1 or images[0].get("Id") != image_id or
+            images[0].get("Os") != "linux" or not isinstance(images[0].get("RepoDigests"), list) or
+            not any(value in {"python@" + digest, "docker.io/library/python@" + digest}
+                    for value in images[0]["RepoDigests"])):
+        raise ValueError("test proxy base image identity mismatch")
+
+
 def verify_test_engine():
     """Recheck the selected test daemon immediately before each Docker call."""
     if not os.environ.get("FOUNDRY_TEST_RUN_ID"):
@@ -125,8 +186,46 @@ def verify_test_engine():
                 not data.get("CgroupDriver") or data["CgroupDriver"] == "none" or
                 not all(data.get(key) is True for key in ("MemoryLimit", "SwapLimit", "PidsLimit", "CpuCfsQuota"))):
             raise TestEngineRefusal("test engine identity or controls changed")
+        return data
     except (OSError, ValueError, TypeError, AttributeError, subprocess.SubprocessError) as exc:
         raise TestEngineRefusal("test engine identity or controls unavailable") from exc
+
+
+def test_mount_group(data):
+    """Translate the operator's group only for the verified rootless test daemon."""
+    options = data.get("SecurityOptions")
+    if not isinstance(options, list) or not all(isinstance(item, str) for item in options):
+        raise TestEngineRefusal("test engine security options unavailable")
+    if "name=rootless" not in options:
+        return str(os.getegid())
+    try:
+        import http.client
+        import socket
+        import struct
+
+        path = os.environ["FOUNDRY_TEST_DOCKER_HOST"][len("unix://"):]
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
+            connection.settimeout(5)
+            connection.connect(path)
+            pid, uid, _ = struct.unpack("3i", connection.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))
+            if pid <= 0 or uid != os.geteuid():
+                raise ValueError("rootless socket peer is not the operator")
+            connection.sendall(b"GET /info HTTP/1.0\r\nHost: localhost\r\n\r\n")
+            response = http.client.HTTPResponse(connection)
+            response.begin()
+            if response.status != 200:
+                raise ValueError("rootless engine info unavailable")
+            info = json.loads(response.read(1024 * 1024 + 1))
+            if (info.get("ID") != os.environ["FOUNDRY_TEST_ENGINE_ID"] or
+                    "name=rootless" not in info.get("SecurityOptions", [])):
+                raise ValueError("rootless engine identity changed")
+            with open(f"/proc/{pid}/gid_map", encoding="ascii") as stream:
+                mappings = [tuple(map(int, line.split())) for line in stream]
+        if not any(len(entry) == 3 and entry == (0, os.getegid(), 1) for entry in mappings):
+            raise ValueError("rootless group mapping does not match operator")
+        return "0"
+    except (KeyError, OSError, ValueError, TypeError, AttributeError, http.client.HTTPException, struct.error) as exc:
+        raise TestEngineRefusal("rootless test group mapping unavailable") from exc
 
 
 def check_project(project, config):
@@ -150,10 +249,12 @@ def check_project(project, config):
     return existing
 
 
-def test_override(project, token, command, volume_name=None):
+def test_override(project, token, command, volume_name=None, proxy_image=None):
     """Fixed test-only configuration; never accepts an arbitrary override file."""
     if not re.fullmatch(r"[0-9a-f]{32}", token) or project != "foundry-test-" + token:
         raise ValueError("invalid test project identity")
+    if not isinstance(proxy_image, str) or not re.fullmatch(r"sha256:[0-9a-f]{64}", proxy_image):
+        raise ValueError("pinned test proxy image ID required")
     label = {"org.creatidy.foundry.test-run": token}
     volume = {"labels": label}
     if volume_name:
@@ -170,8 +271,17 @@ def test_override(project, token, command, volume_name=None):
             "cpus": 1.0, "mem_limit": "512m", "memswap_limit": "512m", "pids_limit": 128,
             "restart": "no", "labels": label,
             "logging": {"driver": "json-file", "options": {"max-size": "1m", "max-file": "2"}},
+        }, "proxy": {
+            "image": proxy_image, "entrypoint": ["python", "-I", "-u", "-c", TEST_PROXY], "command": [],
+            "user": "65534:65534", "read_only": True, "cap_drop": ["ALL"],
+            "cgroup": "private",
+            "security_opt": ["no-new-privileges:true"], "restart": "no",
+            "cpus": 0.25, "mem_limit": "128m", "memswap_limit": "128m", "pids_limit": 64,
+            "labels": label, "networks": ["backend", "ingress"],
+            "ports": ["127.0.0.1:0:8787"],
+            "logging": {"driver": "json-file", "options": {"max-size": "1m", "max-file": "2"}},
         }},
-        "networks": {"backend": {"internal": True, "labels": label}},
+        "networks": {"backend": {"internal": True, "labels": label}, "ingress": {"labels": label}},
         "volumes": {"router-data": volume},
     }
 
@@ -270,19 +380,35 @@ def main():
         if token:
             if os.environ.get("FOUNDRY_TEST_AUTHORIZATION") != "disposable-linux-engine-approved":
                 raise ValueError("test startup requires explicit authorization")
+            proxy_image = os.environ.get("FOUNDRY_TEST_PROXY_IMAGE_ID", "")
+            test_proxy_image(os.environ.get("FOUNDRY_TEST_BASE_DIGEST", ""), proxy_image)
             bounded = test_override(project, token, override["services"]["router"]["command"],
-                                    os.environ.get("FOUNDRY_TEST_VOLUME"))
+                                    os.environ.get("FOUNDRY_TEST_VOLUME"), proxy_image)
             override["services"]["router"].update(bounded["services"]["router"])
+            override["services"]["proxy"] = bounded["services"]["proxy"]
+            override["services"]["router"]["group_add"] = [test_mount_group(verify_test_engine())]
             override["networks"] = bounded["networks"]
             override["volumes"] = bounded["volumes"]
         with tempfile.TemporaryDirectory(prefix="foundry-local-tls-") as tmp:
             path = os.path.join(tmp, "override.json")
             with open(path, "x", encoding="utf-8") as stream:
                 json.dump(override, stream)
+            if token:
+                reset_path = os.path.join(tmp, "reset.yaml")
+                with open(reset_path, "x", encoding="utf-8") as stream:
+                    stream.write("services:\n  router:\n    ports: !reset []\n")
             # Reject a changed directory immediately before asking Docker to mount it.
             validate(destination)
             if mi_dir:
                 validate_mi(mi_dir, mi_digest)
+            if token:
+                verify_test_engine()
+                resolved = subprocess.run(base + ["-f", path, "-f", reset_path, "config", "--format", "json"],
+                                          stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True, timeout=20)
+                resolved_config = json.loads(resolved.stdout)
+                if resolved_config["services"]["router"].get("ports"):
+                    raise ValueError("test router port reset failed")
+                config = resolved_config
             if check_project(project, config):
                 if not adoption:
                     raise ValueError("project resources already exist")
@@ -294,10 +420,12 @@ def main():
                     volumes = check_test_ownership(project, token)
                     if selected_volume and selected_volume not in volumes:
                         raise ValueError("restored volume is not owned by test project")
-            command = base + ["-f", path, "up", "-d", "--no-build", "--pull", "never"]
+            command = base + ["-f", path] + (["-f", reset_path] if token else []) + ["up", "-d", "--no-build", "--pull", "never"]
             if mi_dir or token:
                 command += ["--force-recreate", "--wait", "--wait-timeout", "60"]
-                verify_test_engine()
+                data = verify_test_engine()
+                if token and override["services"]["router"]["group_add"] != [test_mount_group(data)]:
+                    raise TestEngineRefusal("test engine group mapping changed")
                 return subprocess.run(command, timeout=90).returncode
             return subprocess.run(command).returncode
     except TestEngineRefusal:

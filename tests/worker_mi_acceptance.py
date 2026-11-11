@@ -32,6 +32,13 @@ SOURCES = ("foundry-worker-a", "foundry-worker-b")
 EFFORTS = ("low", "medium", "high", "xhigh", "max", "ultra")
 MODEL = "openai/gpt-6-sol/high~high"
 PROMPT = "Foundry synthetic acceptance request"
+DISCONNECTED_GATEWAY_ERRORS = frozenset({
+    (404, "not_found_error", "pin_target_not_found"),
+    (503, "api_error", "target_unavailable"),
+    (503, "api_error", "adapter_unavailable"),
+    # SR's documented dispatch failure is also fail-closed, without failover.
+    (502, "api_error", "backend_failure"),
+})
 EXPECTED_CUT = {"format_version": 1, "payload_schema": "mi.public-evidence-working/2",
                 "sha256": "c63233c4ad8ccd79f87ea01e18e0d79559f8802474f399442f0e8a99d67db74f"}
 FIXTURE_CUTS = frozenset({EXPECTED_CUT["sha256"],
@@ -122,7 +129,7 @@ def _tampered(payload: dict) -> list[dict]:
 
 def _assert_private(value: object, source: str) -> None:
     if source in json.dumps(value, sort_keys=True):
-        raise AssertionError("restricted response leaked excluded source identity")
+        raise AssertionError("restricted response leaked protected data")
 
 
 def _assert_retained(receipt: object, cut_lookup: Callable[[str], bytes | None],
@@ -577,12 +584,9 @@ def run_worker_acceptance(config: WorkerConfig, live_callback=None) -> dict | No
             "model": f"sr-pin:{alternate_resource}/{MODEL}",
             "messages": [{"role": "user", "content": PROMPT}],
         }, {"Authorization": f"Bearer {restricted_key}"})
-        _assert_gateway_error(unavailable_status, unavailable, {
-            (404, "not_found_error", "pin_target_not_found"),
-            (503, "api_error", "target_unavailable"),
-            (503, "api_error", "adapter_unavailable"),
-        })
-        _assert_private(unavailable, preferred)
+        _assert_gateway_error(unavailable_status, unavailable, DISCONNECTED_GATEWAY_ERRORS)
+        for protected in (preferred, PROMPT, key, restricted_key):
+            _assert_private(unavailable, protected)
         if _turns(workers) != before:
             raise AssertionError("disconnected request reached a fake backend")
         runtime = WorkerRuntime(origin=origin, store=worker["store"], local_adapters=worker["registry"],

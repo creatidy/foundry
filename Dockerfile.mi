@@ -2,8 +2,8 @@
 FROM python:3.12-slim AS build
 RUN apt-get update && apt-get install -y --no-install-recommends git ca-certificates && rm -rf /var/lib/apt/lists/*
 RUN git clone https://forgejo.creatidy.com/Creatidy/scarcity-router.git /src && \
-    git -C /src checkout --detach f96d58e6d7d0fffdbe70476850d824efa5de2fb5 && \
-    test "$(git -C /src rev-parse HEAD)" = f96d58e6d7d0fffdbe70476850d824efa5de2fb5
+    git -C /src checkout --detach 8fc4f91ff1aa4c52f4738d436fc2ac12d0b8acb1 && \
+    test "$(git -C /src rev-parse HEAD)" = 8fc4f91ff1aa4c52f4738d436fc2ac12d0b8acb1
 RUN python -m venv /opt/sr && /opt/sr/bin/pip install '/src[mi]' && \
     /opt/sr/bin/python -c "import json, importlib.metadata as m; d=json.loads(m.distribution('model-intelligence').read_text('direct_url.json')); assert d['url']=='https://forgejo.creatidy.com/Creatidy/model-intelligence.git' and d['vcs_info']['commit_id']=='d65891668b7e79f7b666c021f02a1b4bf8c4ca9c'"
 

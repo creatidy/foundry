@@ -22,10 +22,24 @@ orchestrator, model selector, facts producer or shared authority database.
 
 - Start from one smallest working composition and verify it on actual target hosts.
 - Keep one canonical Compose; do not run invented daemons for MI, Kernel or Console.
-- No Docker socket, privileged container, blanket shared workspace, plaintext
-  non-loopback listener, `verify=false`, TOFU or unverifiable private-CA bootstrap.
+- No Docker socket, privileged container, blanket shared workspace, `verify=false`,
+  TOFU or unverifiable private-CA bootstrap.
+- The default single-host Compose profile explicitly selects SR's
+  `--local-container-http` mode, binds any published service ports to host
+  loopback, and requires no certificates. This profile is the only permitted
+  case for plaintext non-loopback listeners. Authentication and authorization
+  remain required.
+  HTTP is plaintext on the Compose network: attached peers or operator-configured
+  routing may reach the listener, and host-loopback publication alone does not
+  prove isolation. Operators are responsible for changes to the supplied topology.
+  Do not require host networking, topology monitoring, an extra proxy or global
+  Docker configuration for the local profile.
+- Advanced deployments across machines, network segments or independently
+  configured distributed Docker environments require verified TLS with hostname
+  and chain validation; never silently fall back to HTTP.
 - Product capabilities are not established by YAML alone: verify authenticated
-  end-to-end execution, TLS, updates, isolation, storage and rollback.
+  end-to-end execution, the appropriate transport, updates, isolation, storage
+  and rollback.
 - Use one independently reviewed PR per consequential change after scope and actual
   source are frozen. Exact review/CI/merge authority comes from current canonical
   repository policy, not this bootstrap.

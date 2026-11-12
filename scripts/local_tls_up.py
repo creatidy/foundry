@@ -14,7 +14,7 @@ from local_tls_init import no_acl, open_parent
 from docker_socket_validation import validate_engine_socket
 
 
-def validate_mi(destination, expected):
+def validate_mi(destination, expected, *, publication="/run/foundry/mi/publication.json"):
     if not re.fullmatch(r"[0-9a-f]{64}", expected):
         raise ValueError("independent MI digest required")
     parent, name = open_parent(destination)
@@ -49,7 +49,7 @@ def validate_mi(destination, expected):
                 result[key] = value
             return result
         config = json.loads(data[0], object_pairs_hook=unique)
-        if (config["publication"] != "/run/foundry/mi/publication.json" or
+        if (config["publication"] != publication or
             config["reference"]["sha256"] != expected or
             hashlib.sha256(data[1]).hexdigest() != expected):
             raise ValueError("MI reference mismatch")

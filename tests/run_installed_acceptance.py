@@ -528,7 +528,7 @@ def run(args):
     manifest = _file_manifest()
     source = (ROOT / "Dockerfile.mi").read_bytes()
     product_revision = provenance.product_revision(source)
-    for revision in (provenance.OLD_SR, provenance.NEW_SR):
+    for revision in provenance.TEST_SR_REVISIONS:
         provenance.dockerfile(source, revision, args.base_digest)
     real_source = (args.zai_python, args.zai_output_dir, args.authorize_zai_source_reads)
     if any(real_source) and not all(real_source):

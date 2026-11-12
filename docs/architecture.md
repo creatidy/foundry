@@ -9,19 +9,22 @@ Foundry is a distribution and compatibility boundary for four independent produc
 The integration graph, once each existing producer contract is verified, is:
 
 ```text
-Kernel -> existing harness -> Scarcity Router authorized gateway -> execution source
+Kernel -> SR /v1/select recommendation -> Kernel-bound existing harness
+Optional execution client -> Scarcity Router authorized gateway -> execution source
 Model Intelligence validated publication -> Scarcity Router evidence admission
 SR / MI / Kernel owner-served facts and commands -> Console (when implemented)
 Foundry -> configure and validate installed component versions and transport
 ```
 
+CK's implemented SR allocator consumes recommendations from `/v1/select` and independently checks its runtime bindings; a recommendation is not a reservation or proof of execution. At inspected [CK revision `1bcb052`](https://forgejo.creatidy.com/Creatidy/creatidy-kernel/src/commit/1bcb052e527933b7b2f419ac76017f2d20e88a1e/README.md), its SR client accepts HTTP only for configured loopback hostnames and requires verified HTTPS otherwise. A Docker service name is not loopback to a client in another container. CK's own owner interface is a preconnected local descriptor, not an existing network server. These are current CK contracts, not a requirement to add a proxy or a claim that CK and the selected SR revision have been accepted together.
+
 ## Current evidence and deployment implications
 
 | Component | Implementation and release consideration | Initial composition decision |
 | --- | --- | --- |
-| Scarcity Router | Existing Python composed HTTP/gateway/control server, SQLite under `/data`, separate native worker, TLS required off loopback; Docker image definition exists, no verified published release. | Only currently described Compose service. Explicit TLS, image and state. |
+| Scarcity Router | Existing Python composed HTTP/gateway/control server, SQLite under `/data`, separate native worker, explicit local-container HTTP mode and verified TLS for networked use; Docker image definition exists, no verified published release. | Only currently described Compose service. Foundry's current Compose uses explicit TLS, image and state. |
 | Model Intelligence | Library and offline/public evidence producer, retained publication files; no live daemon or automatic refresh scheduler. | Integrate through existing verified SR consumer interface later, not a fake MI service. |
-| Creatidy Kernel | Local harness/workspace authority, SQLite on specifically validated native local Linux filesystem; OverlayFS and network filesystems refused. | Keep native-host execution as supported path until container filesystem, harness and credential boundaries pass acceptance. |
+| Creatidy Kernel | Local harness/workspace authority with a preconnected local descriptor interface, and SQLite on a specifically validated native local Linux filesystem; OverlayFS and network filesystems refused. | Keep native-host execution as supported path until container filesystem, harness and credential boundaries pass acceptance. Do not invent a CK network daemon. |
 | Creatidy Console | React/Vite scaffold, no implemented producer integrations or stable auth/reverse proxy contract. | No operational container until the owning project delivers and accepts integration. |
 
 ## Product requirements
@@ -32,9 +35,9 @@ Advanced or distributed deployments retain verified HTTPS/TLS, operator-managed 
 
 ## Current implementation
 
-SR supports genuine loopback HTTP without certificates (D-056 tier A), with a Host authority matching the bind; `localhost` is not interchangeable with a `127.0.0.1` bind. SR also supports verified TLS for non-loopback binds and externally managed certificate paths and verified reload. Its example Compose uses host networking for native Linux loopback, not evidence for Docker Desktop. A WSL loopback observation in [SR #224](https://forgejo.creatidy.com/Creatidy/scarcity-router/issues/224) is not complete installation or security acceptance.
+SR supports genuine loopback HTTP without certificates, with a Host authority matching the bind; `localhost` is not interchangeable with a `127.0.0.1` bind. Since [SR PR #267](https://forgejo.creatidy.com/Creatidy/scarcity-router/pulls/267), its explicit `--local-container-http` mode also supports ordinary local bridge Compose with host-loopback publication. SR retains verified TLS for advanced networked deployments and externally managed certificate paths and reload. Upstream testing is not acceptance of a Foundry installation.
 
-Foundry's current `compose.yaml` binds SR to `0.0.0.0` inside a bridge container, requires an explicitly supplied image and certificate/key, and publishes a host loopback port. Its documented public-CA path and experimental local TLS/Windows workflows are not the target simple installer or proof of authenticated end-to-end operation. Docker bridge HTTP is not currently supported: SR rejects non-loopback plaintext listeners, and bridge-published traffic reaches a non-loopback container interface. The experimental Windows certificate-import workflow in [Foundry PR #14](https://forgejo.creatidy.com/Creatidy/foundry/pulls/14) is superseded as the default UX direction, not integrated; its history and unfinished work remain intact. Operator-managed TLS remains relevant for advanced use.
+Foundry's current `compose.yaml` binds SR to `0.0.0.0` inside a bridge container, requires an explicitly supplied image and certificate/key, and publishes a host loopback port. Its documented public-CA path and experimental local TLS/Windows workflows are not the target simple installer or proof of authenticated end-to-end operation. SR's new explicit Docker HTTP mode is not yet integrated in Foundry: bridge-published traffic reaches a non-loopback container interface, and Foundry's current instructions prohibit plaintext listeners there. The experimental Windows certificate-import workflow in [Foundry PR #14](https://forgejo.creatidy.com/Creatidy/foundry/pulls/14) is superseded as the default UX direction, not integrated; its history and unfinished work remain intact. Operator-managed TLS remains relevant for advanced use.
 
 ## Target deployment topology
 
@@ -51,16 +54,16 @@ These are acceptance targets, not claims of implemented Foundry installation mod
 ## Security and open acceptance
 
 - Native and WSL paths must demonstrate local-only reachability on supported configurations, including actual Windows-to-WSL access and negative external access; forwarding and a Host rejection alone do not prove network isolation.
-- Local Docker HTTP requires a future explicit, enforceable SR whole-listener contract. Host loopback publication alone does not prevent direct container-IP routes, access by bridge peers, daemon direct routing, firewall changes or later network attachment. A dedicated or internal network and startup-only inspection do not prove continuous isolation. Demonstrate the effective host publication, container and peer reachability, daemon routing and firewall boundaries over startup, restart and topology changes, with negative LAN/WAN and unintended-peer access checks on each supported platform. Define trusted host and Docker administrator assumptions and fail closed when the boundary cannot be established or maintained.
+- SR's explicit local Docker HTTP mode publishes ports to host loopback in its supplied Compose configuration, but HTTP is plaintext on the Compose network: other connected containers can reach the listener. Host-loopback publication alone does not establish isolation from direct container-IP routes or later network changes. The local deployment assumes a trusted host and Docker administrator; operators who alter the supplied topology are responsible for the resulting exposure. Continuous topology monitoring is not part of the owner's local deployment requirement.
 - Preserve authentication, authorization, Host validation, CSRF defenses and separation of administrator, inference-client, worker and other credentials in every tier. HTTP removes transport confidentiality within the accepted local boundary; local users and privileged host/Docker administrators are not automatically isolated. Protect onboarding and persistent state as well as ordinary requests.
-- SR D-056 and D-085 and #224 currently retain a not-yet-implemented, explicitly selected whole-listener Tier B and require TLS on non-loopback binds today. The smallest upstream decision is for SR's owner to amend or formally reconcile #224 and D-085 with the desired ordinary bridge-local HTTP mode: specify the trusted boundary, continuously enforceable isolation and failure behavior, including topology changes, or explicitly decide an equivalent revised contract. A flag, label, unchecked `0.0.0.0` exception or Compose declaration is not that contract. No host-side mechanism is selected here. Until an accepted contract and implementation exist, retain TLS for bridge binds. SR #224 also records review-capacity constraints requiring a policy-consistent owner disposition before further consequential delivery.
-- Foundry's existing `AGENTS.md` prohibits plaintext non-loopback listeners. The Docker target conflicts with that instruction until a separately authorized, reviewed policy amendment and SR contract exist; this documentation does not relax it. Native Linux/WSL installer work is independently actionable and does not wait for Docker Tier B.
+- The owner revised [SR #224](https://forgejo.creatidy.com/Creatidy/scarcity-router/issues/224), superseding the former continuous topology-enforcement requirement. Its local Docker mode was merged in SR PR #267; the issue is now closed. No topology watcher, new proxy or certificate-management service is required by that local SR scope.
+- Foundry's existing `AGENTS.md` independently prohibits plaintext non-loopback listeners. The Docker HTTP target still conflicts with that instruction until a separately authorized, reviewed policy amendment; this documentation does not relax it. Native Linux/WSL installer work is independently actionable.
 - Cross-host, LAN, VPN and advanced connections require verified TLS to protect credentials and traffic and authenticate the endpoint across the host boundary. Preserve hostname and chain verification, operator-managed renewal and secure failure; no `verify=false`, TOFU or silent HTTPS-to-HTTP fallback. Worker transport has its own SR contract.
 
 - Each component owns its state and authority. Do not merge SQLite files or copy secrets across components.
 - Never mount the Docker socket, owner home, Kilo session tokens or whole source workspaces into the Router server container.
 - No blanket host networking, privileged containers, `verify=false`, TOFU, automatic external interface binding, implicit identity migration or silent model substitution.
-- A cross-container client must authenticate and, under the current SR contract, verify the correct TLS hostname and trust chain. Internal network membership alone is not an authentication or confidentiality boundary.
+- A cross-container client must authenticate. In SR's explicit local HTTP mode, traffic on the Compose network is plaintext; in advanced networked deployments the client must verify the TLS hostname and trust chain. Network membership alone is not an authentication or confidentiality boundary.
 
 ## Ownership boundaries
 

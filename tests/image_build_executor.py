@@ -420,8 +420,7 @@ class DockerExecutor:
         if self.preflight_base != self.base:
             raise ValueError("successful preflight for this base required")
         source = (ROOT / "Dockerfile.mi").read_bytes()
-        if dockerfile not in (p.dockerfile(source, p.OLD_SR, self.base),
-                              p.dockerfile(source, p.NEW_SR, self.base)):
+        if dockerfile not in tuple(p.dockerfile(source, revision, self.base) for revision in p.TEST_SR_REVISIONS):
             raise ValueError("unrecognized test image definition")
         base = json.loads(self.project._docker("image", "inspect", "python:3.12-slim@" + self.base))
         if len(base) != 1 or base[0].get("Os") != "linux" or not any(

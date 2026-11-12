@@ -29,15 +29,15 @@ class ImageProvenanceTests(unittest.TestCase):
         values.update(kwargs)
         return p.verify_build(**values)
 
-    def test_both_exact_definitions(self):
+    def test_all_reviewed_sources_derive_both_historical_definitions(self):
         actual = p.product_revision(self.source)
         sources = {revision: self.source.replace(actual.encode(), revision.encode())
-                   for revision in (p.OLD_SR, p.NEW_SR)}
+                   for revision in p.DOCKERFILE_SHA256}
         definitions = {}
         for source_revision, source in sources.items():
             self.assertEqual(p.DOCKERFILE_SHA256[source_revision], hashlib.sha256(source).hexdigest())
             self.assertEqual(source_revision, p.product_revision(source))
-            for revision in sources:
+            for revision in p.TEST_SR_REVISIONS:
                 with self.subTest(source=source_revision, target=revision):
                     definition = p.dockerfile(source, revision, self.base)
                     if revision in definitions:

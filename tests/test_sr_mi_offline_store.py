@@ -7,8 +7,11 @@ backup procedure and does not prove an image upgrade or deployment rollback.
 
 import importlib.util
 import json
+import os
 from pathlib import Path
 import shutil
+import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -61,6 +64,35 @@ class OfflineStoreTests(unittest.TestCase):
             self.assertEqual(original_reference, self.load(self.trust).activate(reopened).reference)
         finally:
             reopened.close()
+
+    def test_native_preflight_and_actual_mi_activation_use_same_fixture(self):
+        directory = self.root / "native-mi"
+        directory.mkdir(mode=0o750)
+        directory.chmod(0o750)
+        publication = directory / "publication.json"
+        publication.write_bytes(self.publication.read_bytes())
+        trust = json.loads(self.trust.read_text(encoding="utf-8"))
+        trust["publication"] = str(publication)
+        config = directory / "trust.json"
+        config.write_text(json.dumps(trust), encoding="utf-8")
+        for path in (publication, config):
+            path.chmod(0o640)
+        script = Path(__file__).resolve().parents[1] / "scripts" / "local_runtime.py"
+        environment = {"HOME": str(self.root), "PATH": os.defpath, "PYTHONNOUSERSITE": "1",
+                       "PYTHONDONTWRITEBYTECODE": "1", "FOUNDRY_MI_DIR": str(directory),
+                       "FOUNDRY_MI_SHA256": fixture.EXPECTED_SHA256}
+        for safe_path in (False, True):
+            with self.subTest(safe_path=safe_path):
+                env = {**environment, **({"PYTHONSAFEPATH": "1"} if safe_path else {})}
+                result = subprocess.run([sys.executable, "-B", str(script), "--native-mi-check"],
+                                        env=env, capture_output=True, text=True, timeout=30, check=False)
+                self.assertEqual(result.returncode, 0, result.stderr)
+        store = self.store_type.open(self.state)
+        try:
+            server = self.load(config).activate(store)
+            self.assertEqual(fixture.EXPECTED_SHA256, server.reference.sha256)
+        finally:
+            store.close()
 
     def test_closed_store_snapshot_restores_to_separate_directory(self):
         store = self.store_type.open(self.state)

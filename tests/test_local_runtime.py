@@ -21,6 +21,12 @@ runtime = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(runtime)
 
 
+class AcceptedRevisionsTests(unittest.TestCase):
+    def test_merged_local_compose_revision_is_accepted(self):
+        self.assertIn("5bd4fa4d65028b46455f63726c2dda7b8e3ca341", runtime.ACCEPTED)
+        self.assertIn("dc74c0f015551f075bc45ee15bdb0cf0705c91b5", runtime.ACCEPTED)
+
+
 class LocalRuntimeTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="foundry-discovery-")

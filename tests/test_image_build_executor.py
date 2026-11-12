@@ -380,21 +380,22 @@ class DockerExecutorTests(unittest.TestCase):
                                   build_authorization="disposable-linux-image-build-approved")
             ex.temp, ex.preflight_base = object(), base
             cls.return_value._docker.side_effect = RuntimeError("mock inspection reached")
-            for revision in (p.OLD_SR, p.NEW_SR):
-                variant = source.replace(actual.encode(), revision.encode())
-                definition = p.dockerfile(variant, revision, base)
-                with self.subTest(revision=revision), patch.object(Path, "read_bytes", return_value=variant):
-                    with self.assertRaisesRegex(RuntimeError, "mock inspection reached"):
-                        ex.build(dockerfile=definition, timeout=p.MAX_SECONDS, output_limit=p.MAX_OUTPUT)
-                    cls.return_value._docker.reset_mock()
-                    with self.assertRaises(ValueError):
-                        ex.build(dockerfile=definition + b"\nRUN malicious\n", timeout=p.MAX_SECONDS,
-                                 output_limit=p.MAX_OUTPUT)
-                    cls.return_value._docker.assert_not_called()
-                with patch.object(Path, "read_bytes", return_value=variant + b"\n"):
-                    with self.assertRaises(ValueError):
-                        ex.build(dockerfile=definition, timeout=p.MAX_SECONDS, output_limit=p.MAX_OUTPUT)
-                    cls.return_value._docker.assert_not_called()
+            for source_revision in p.DOCKERFILE_SHA256:
+                variant = source.replace(actual.encode(), source_revision.encode())
+                for revision in p.TEST_SR_REVISIONS:
+                    definition = p.dockerfile(variant, revision, base)
+                    with self.subTest(source=source_revision, target=revision), patch.object(Path, "read_bytes", return_value=variant):
+                        with self.assertRaisesRegex(RuntimeError, "mock inspection reached"):
+                            ex.build(dockerfile=definition, timeout=p.MAX_SECONDS, output_limit=p.MAX_OUTPUT)
+                        cls.return_value._docker.reset_mock()
+                        with self.assertRaises(ValueError):
+                            ex.build(dockerfile=definition + b"\nRUN malicious\n", timeout=p.MAX_SECONDS,
+                                     output_limit=p.MAX_OUTPUT)
+                        cls.return_value._docker.assert_not_called()
+                    with patch.object(Path, "read_bytes", return_value=variant + b"\n"):
+                        with self.assertRaises(ValueError):
+                            ex.build(dockerfile=definition, timeout=p.MAX_SECONDS, output_limit=p.MAX_OUTPUT)
+                        cls.return_value._docker.assert_not_called()
 
 
 if __name__ == "__main__":

@@ -1,6 +1,7 @@
 """Select an auditable existing SR environment, then exec the native launcher."""
 
 import argparse
+import importlib.util
 import hashlib
 import json
 import os
@@ -14,7 +15,9 @@ from urllib.parse import unquote, urlsplit
 ROOT = Path(__file__).resolve().parents[1]
 MINIMUM = "925ec06681c7fa085edd5015f57663e85d735768"
 ACCEPTED = {MINIMUM, "c67900723cd6ec7430a36dd0357ee17061f811b6",
-            "8fc4f91ff1aa4c52f4738d436fc2ac12d0b8acb1"}
+            "8fc4f91ff1aa4c52f4738d436fc2ac12d0b8acb1",
+            "5bd4fa4d65028b46455f63726c2dda7b8e3ca341",
+            "dc74c0f015551f075bc45ee15bdb0cf0705c91b5"}
 CANONICAL = "https://forgejo.creatidy.com/Creatidy/scarcity-router.git"
 PROBE = """
 import importlib.metadata, importlib.util, json, sys
@@ -133,8 +136,30 @@ def discover():
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--check", action="store_true", help="verify discovery without starting SR")
+    modes = parser.add_mutually_exclusive_group()
+    modes.add_argument("--check", action="store_true", help="verify discovery without starting SR")
+    modes.add_argument("--native-mi-check", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
+    if args.native_mi_check:
+        try:
+            destination = os.environ.get("FOUNDRY_MI_DIR", "")
+            expected = os.environ.get("FOUNDRY_MI_SHA256", "")
+            if not destination or not expected or os.environ.get("FOUNDRY_MI_IMAGE_ID"):
+                raise ValueError("native MI requires a directory and independent digest, not an image ID")
+            sys.path.insert(0, str(Path(__file__).resolve().parent))
+            from local_tls_up import validate_mi
+            validate_mi(destination, expected, publication=destination + "/publication.json")
+        except (ValueError, OSError, KeyError, TypeError, UnicodeError, RecursionError, OverflowError):
+            print("Foundry: native MI input validation failed", file=sys.stderr)
+            return 2
+        try:
+            available = importlib.util.find_spec("model_intelligence") is not None
+        except (ImportError, ValueError, OSError):
+            available = False
+        if not available:
+            print("Foundry: selected SR environment lacks the optional MI dependency", file=sys.stderr)
+            return 2
+        return 0
     try:
         python, checkout, revision = discover()
     except (ValueError, OSError, subprocess.SubprocessError) as exc:

@@ -615,7 +615,7 @@ class OrchestrationTests(unittest.TestCase):
         actual = provenance.product_revision(source)
         base = "sha256:" + "a" * 64
         expected = provenance.pinned_dockerfile(source, provenance.NEW_SR, base)
-        for revision in (provenance.OLD_SR, provenance.NEW_SR):
+        for revision in provenance.DOCKERFILE_SHA256:
             variant = source.replace(actual.encode(), revision.encode())
             with self.subTest(revision=revision), mock.patch.object(Path, "read_bytes", return_value=variant):
                 self.assertEqual(expected, provisioning.test_image_dockerfile(base))

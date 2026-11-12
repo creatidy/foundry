@@ -87,7 +87,7 @@ class WiringTests(unittest.TestCase):
         helper, fake = b'helper', b'fake'
         digest = lambda data: hashlib.sha256(data).hexdigest()
         args = SimpleNamespace(worker_sha256=digest(helper), fake_sha256=digest(fake))
-        for revision in (entry.provenance.OLD_SR, entry.provenance.NEW_SR):
+        for revision in entry.provenance.DOCKERFILE_SHA256:
             variant = source.replace(actual.encode(), revision.encode())
             manifest = {'tests/worker_mi_acceptance.py': digest(helper), 'Dockerfile.mi': digest(variant)}
             with self.subTest(revision=revision):

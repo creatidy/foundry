@@ -58,7 +58,8 @@ class LocalRuntimeTests(unittest.TestCase):
         return subprocess.check_output(["git", "-C", str(self.checkout), *args], text=True)
 
     def environment(self, destination, *, editable=False):
-        venv.EnvBuilder(with_pip=False).create(destination)
+        # Keep standalone interpreters beside their shared-library installation.
+        venv.EnvBuilder(with_pip=False, symlinks=True).create(destination)
         site = next((destination / "lib").glob("python*/site-packages"))
         if editable:
             (site / "fixture.pth").write_text(str(self.checkout) + "\n")

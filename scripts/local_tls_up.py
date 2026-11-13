@@ -118,6 +118,16 @@ def check_project(project, config):
     return existing
 
 
+def mount_group():
+    """Rootless Docker maps the invoking host user's primary group to zero."""
+    result = subprocess.run(["docker", "info", "--format", "{{json .SecurityOptions}}"],
+                            check=True, capture_output=True, timeout=20)
+    options = json.loads(result.stdout)
+    if not isinstance(options, list) or not all(isinstance(value, str) for value in options):
+        raise ValueError("Docker group mapping unavailable")
+    return "0" if "name=rootless" in options else str(os.getegid())
+
+
 def tls_override(destination, hostname, *, leaf=False):
     if (not os.path.isabs(destination) or not os.path.isdir(destination) or
             not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9.-]*", hostname)):
@@ -194,7 +204,7 @@ def local_http_main():
         override = {"image": image}
         if mi_dir:
             command = command + ["--mi-config=/run/foundry/mi/trust.json"]
-            override.update(command=command, restart="no", group_add=[str(os.getegid())], volumes=[
+            override.update(command=command, restart="no", group_add=[mount_group()], volumes=[
                 {"type": "bind", "source": os.path.join(mi_dir, name).replace("$", "$$"),
                  "target": "/run/foundry/mi/" + name, "read_only": True,
                  "bind": {"create_host_path": False}} for name in ("trust.json", "publication.json")])
@@ -260,6 +270,7 @@ def main(argv=()):
         if not args.tls and (hostname != "127.0.0.1" or os.environ.get("FOUNDRY_TLS_DIR") != destination):
             raise ValueError("local leaf directory or hostname mismatch")
         override = {"services": {"router": tls_override(destination, hostname, leaf=not args.tls)}}
+        override["services"]["router"]["group_add"] = [mount_group()]
         if mi_dir:
             override["services"]["router"]["command"].append("--mi-config=/run/foundry/mi/trust.json")
             override["services"]["router"]["image"] = image_id

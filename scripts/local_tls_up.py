@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
-"""Explicit loopback-only leaf trust override for the canonical Compose file."""
+"""Local HTTP and explicit verified-TLS startup using one canonical Compose."""
 
+import argparse
 import json
 import hashlib
 import os
@@ -105,67 +106,6 @@ class TestEngineRefusal(Exception):
     pass
 
 
-TEST_PROXY = '''import asyncio
-
-active = set()
-
-async def relay(reader, writer):
-    while data := await reader.read(65536):
-        writer.write(data)
-        await writer.drain()
-    if writer.can_write_eof():
-        writer.write_eof()
-
-async def handle(reader, writer):
-    task = asyncio.current_task()
-    if len(active) >= 64:
-        writer.close()
-        await writer.wait_closed()
-        return
-    active.add(task)
-    upstream = None
-    pumps = []
-    try:
-        async with asyncio.timeout(120):
-            remote, upstream = await asyncio.open_connection('router', 8787)
-            pumps = [asyncio.create_task(relay(reader, upstream)),
-                     asyncio.create_task(relay(remote, writer))]
-            await asyncio.gather(*pumps)
-    except (OSError, TimeoutError):
-        pass
-    finally:
-        for pump in pumps:
-            pump.cancel()
-        await asyncio.gather(*pumps, return_exceptions=True)
-        if upstream is not None:
-            upstream.close()
-        writer.close()
-        active.remove(task)
-
-async def main():
-    server = await asyncio.start_server(handle, '0.0.0.0', 8787, backlog=64)
-    async with server:
-        await server.serve_forever()
-
-asyncio.run(main())
-'''
-
-
-def test_proxy_image(digest, image_id):
-    """Recheck the independently authenticated base reference on this engine."""
-    if not re.fullmatch(r"sha256:[0-9a-f]{64}", digest) or not re.fullmatch(r"sha256:[0-9a-f]{64}", image_id):
-        raise ValueError("pinned test proxy base digest and image ID required")
-    verify_test_engine()
-    result = subprocess.run(["docker", "image", "inspect", "python:3.12-slim@" + digest],
-                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True, timeout=30)
-    images = json.loads(result.stdout)
-    if (not isinstance(images, list) or len(images) != 1 or images[0].get("Id") != image_id or
-            images[0].get("Os") != "linux" or not isinstance(images[0].get("RepoDigests"), list) or
-            not any(value in {"python@" + digest, "docker.io/library/python@" + digest}
-                    for value in images[0]["RepoDigests"])):
-        raise ValueError("test proxy base image identity mismatch")
-
-
 def verify_test_engine():
     """Recheck the selected test daemon immediately before each Docker call."""
     if not os.environ.get("FOUNDRY_TEST_RUN_ID"):
@@ -249,12 +189,10 @@ def check_project(project, config):
     return existing
 
 
-def test_override(project, token, command, volume_name=None, proxy_image=None):
+def test_override(project, token, command, volume_name=None):
     """Fixed test-only configuration; never accepts an arbitrary override file."""
     if not re.fullmatch(r"[0-9a-f]{32}", token) or project != "foundry-test-" + token:
         raise ValueError("invalid test project identity")
-    if not isinstance(proxy_image, str) or not re.fullmatch(r"sha256:[0-9a-f]{64}", proxy_image):
-        raise ValueError("pinned test proxy image ID required")
     label = {"org.creatidy.foundry.test-run": token}
     volume = {"labels": label}
     if volume_name:
@@ -263,25 +201,13 @@ def test_override(project, token, command, volume_name=None, proxy_image=None):
         volume["name"] = volume_name
     return {
         "services": {"router": {
-            "command": command + ["--worker-listen-host=127.0.0.1", "--worker-listen-port=8788",
-                                  "--worker-tls-certfile=/run/foundry/tls/server.crt",
-                                  "--worker-tls-keyfile=/run/foundry/tls/server.key",
-                                  "--worker-tls-reload-hostname=127.0.0.1",
-                                  "--worker-tls-reload-ca-cert=/run/foundry/tls/server.crt"],
+            "command": command,
             "cpus": 1.0, "mem_limit": "512m", "memswap_limit": "512m", "pids_limit": 128,
+            "cgroup": "private",
             "restart": "no", "labels": label,
             "logging": {"driver": "json-file", "options": {"max-size": "1m", "max-file": "2"}},
-        }, "proxy": {
-            "image": proxy_image, "entrypoint": ["python", "-I", "-u", "-c", TEST_PROXY], "command": [],
-            "user": "65534:65534", "read_only": True, "cap_drop": ["ALL"],
-            "cgroup": "private",
-            "security_opt": ["no-new-privileges:true"], "restart": "no",
-            "cpus": 0.25, "mem_limit": "128m", "memswap_limit": "128m", "pids_limit": 64,
-            "labels": label, "networks": ["backend", "ingress"],
-            "ports": ["127.0.0.1:0:8787"],
-            "logging": {"driver": "json-file", "options": {"max-size": "1m", "max-file": "2"}},
         }},
-        "networks": {"backend": {"internal": True, "labels": label}, "ingress": {"labels": label}},
+        "networks": {"backend": {"internal": False, "labels": label}},
         "volumes": {"router-data": volume},
     }
 
@@ -316,7 +242,198 @@ def check_test_ownership(project, token):
     return volumes
 
 
-def main():
+def mount_group():
+    """Rootless Docker maps the invoking host user's primary group to zero."""
+    verify_test_engine()
+    result = subprocess.run(["docker", "info", "--format", "{{json .SecurityOptions}}"],
+                            check=True, capture_output=True, timeout=20)
+    options = json.loads(result.stdout)
+    if not isinstance(options, list) or not all(isinstance(value, str) for value in options):
+        raise ValueError("Docker group mapping unavailable")
+    return "0" if "name=rootless" in options else str(os.getegid())
+
+
+def tls_settings(base):
+    """Use Compose's dotenv precedence rather than a second dotenv parser."""
+    result = subprocess.run(base + ["config", "--environment"], check=True,
+                            capture_output=True, timeout=30)
+    values = {}
+    for line in result.stdout.decode("utf-8").splitlines():
+        key, separator, value = line.partition("=")
+        if not separator or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key) or key in values:
+            raise ValueError("ambiguous Compose environment")
+        values[key] = value
+    return {key: values.get(key, "") for key in
+            ("TLS_DEST", "FOUNDRY_TLS_DIR", "FOUNDRY_ROUTER_HOST")}
+
+
+def apply_test_override(project, override, command):
+    """Bound the canonical service without replacing its topology or transport."""
+    token = os.environ["FOUNDRY_TEST_RUN_ID"]
+    router = override["services"]["router"]
+    group = router.get("group_add") or [mount_group()]
+    if group != [test_mount_group(verify_test_engine())]:
+        raise TestEngineRefusal("product and test engine group mapping disagree")
+    bounded = test_override(project, token, command, os.environ.get("FOUNDRY_TEST_VOLUME"))
+    router.update(bounded["services"]["router"])
+    router["group_add"] = group
+    override.update(networks=bounded["networks"], volumes=bounded["volumes"])
+
+
+def check_test_adoption(project, adoption):
+    token = os.environ["FOUNDRY_TEST_RUN_ID"]
+    selected = os.environ.get("FOUNDRY_TEST_VOLUME")
+    if selected and not adoption:
+        raise ValueError("restored volume requires test project adoption")
+    volumes = check_test_ownership(project, token)
+    if selected and selected not in volumes:
+        raise ValueError("restored volume is not owned by test project")
+    if not adoption and volumes:
+        raise ValueError("test resources already exist")
+
+
+def tls_override(destination, hostname, *, leaf=False):
+    if (not os.path.isabs(destination) or not os.path.isdir(destination) or
+            not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9.-]*", hostname)):
+        raise ValueError("absolute TLS directory and certificate hostname required")
+    for name in ("server.crt", "server.key"):
+        with open(os.path.join(destination, name), "rb"):
+            pass
+    command = ["--host=0.0.0.0", "--port=8787", "--data-dir=/data",
+               "--tls-certfile=/run/foundry/tls/server.crt",
+               "--tls-keyfile=/run/foundry/tls/server.key",
+               "--tls-reload-hostname=" + hostname,
+               "--worker-listen-host=0.0.0.0", "--worker-listen-port=8790",
+               "--worker-tls-certfile=/run/foundry/tls/server.crt",
+               "--worker-tls-keyfile=/run/foundry/tls/server.key",
+               "--worker-tls-reload-hostname=" + hostname]
+    environment = {"SR_HEALTHCHECK_URL": "https://" + hostname + ":8787/healthz"}
+    if leaf:
+        command += ["--tls-reload-ca-cert=/run/foundry/tls/server.crt",
+                    "--worker-tls-reload-ca-cert=/run/foundry/tls/server.crt"]
+        environment["SR_HEALTHCHECK_CA"] = "/run/foundry/tls/server.crt"
+    return {"command": command, "environment": environment,
+            "extra_hosts": [hostname + ":127.0.0.1"],
+            "group_add": [str(os.getegid())],
+            "volumes": [{"type": "bind", "source": destination.replace("$", "$$"),
+                         "target": "/run/foundry/tls", "read_only": True,
+                         "bind": {"create_host_path": False}}]}
+
+
+def tls_config():
+    """Render the explicit advanced TLS model without starting any service."""
+    base = ["docker", "compose"] + (["--env-file", ".env"] if os.path.isfile(".env") else [])
+    settings = tls_settings(base + ["-f", "compose.yaml"])
+    override = tls_override(settings["FOUNDRY_TLS_DIR"], settings["FOUNDRY_ROUTER_HOST"])
+    with tempfile.TemporaryDirectory(prefix="foundry-tls-config-") as tmp:
+        path = os.path.join(tmp, "override.json")
+        with open(path, "x", encoding="utf-8") as stream:
+            json.dump({"services": {"router": override}}, stream)
+        result = subprocess.run(base + ["-f", "compose.yaml", "-f", path, "config", "--format", "json",
+                                        "--no-path-resolution"], check=True, capture_output=True, timeout=30)
+        return json.loads(result.stdout)
+
+
+def local_http_main():
+    """Build the default source once, then start its resolved local image ID."""
+    try:
+        token = os.environ.get("FOUNDRY_TEST_RUN_ID", "")
+        project = os.environ.get("LOCAL_TLS_PROJECT", "")
+        adoption = os.environ.get("LOCAL_TLS_ADOPT_PROJECT", "")
+        if token:
+            test_override(project, token, [])
+            if (os.environ.get("FOUNDRY_TEST_AUTHORIZATION") != "disposable-linux-engine-approved" or
+                    (adoption and adoption != project)):
+                raise ValueError("test startup requires explicit project authorization")
+        if any(os.environ.get(key) for key in ("TLS_DEST", "FOUNDRY_TLS_DIR", "FOUNDRY_ROUTER_HOST")):
+            raise ValueError("TLS settings require explicit tls-up, not local HTTP")
+        base = ["docker", "compose"] + (["-p", project] if token else []) + (["--env-file", ".env"] if os.path.isfile(".env") else []) + ["-f", "compose.yaml"]
+        verify_test_engine()
+        if any(tls_settings(base).values()):
+            raise ValueError("effective Compose TLS settings require explicit tls-up")
+        verify_test_engine()
+        result = subprocess.run(base + ["config", "--format", "json"], check=True,
+                                capture_output=True, timeout=30)
+        config = json.loads(result.stdout)
+        if token and (config["name"] != project or set(config["services"]) != {"router"}):
+            raise ValueError("unexpected test Compose project or services")
+        router = config["services"]["router"]
+        if token and not re.fullmatch(r"sha256:[0-9a-f]{64}", router["image"]):
+            raise ValueError("test startup requires an already verified immutable image")
+        command = router["command"]
+        if "--local-container-http" not in command or any(arg.startswith("--tls-") for arg in command):
+            raise ValueError("not the canonical local HTTP command")
+        mi_dir, digest = os.environ.get("FOUNDRY_MI_DIR", ""), os.environ.get("FOUNDRY_MI_SHA256", "")
+        expected = os.environ.get("FOUNDRY_MI_IMAGE_ID", "")
+        if mi_dir or digest or expected:
+            validate_mi(mi_dir, digest)
+        if router["image"] == "foundry-sr-mi:5bd4fa4-local":
+            verify_test_engine()
+            subprocess.run(base + ["build", "router"], check=True, timeout=900)
+        verify_test_engine()
+        result = subprocess.run(["docker", "image", "inspect", router["image"]], check=True,
+                                capture_output=True, timeout=30)
+        images = json.loads(result.stdout)
+        if len(images) != 1 or not re.fullmatch(r"sha256:[0-9a-f]{64}", images[0]["Id"]):
+            raise ValueError("image identity unavailable")
+        health = images[0].get("Config", {}).get("Healthcheck", {}).get("Test", [])
+        if (not isinstance(health, list) or len(health) < 2 or health[0] not in ("CMD", "CMD-SHELL") or
+                router.get("entrypoint") is not None or "healthcheck" in router):
+            raise ValueError("image liveness contract unavailable")
+        image = images[0]["Id"]
+        if token and image != router["image"]:
+            raise ValueError("test image identity changed")
+        if expected and expected != image:
+            raise ValueError("MI image identity mismatch")
+        override = {"image": image}
+        if mi_dir:
+            command = command + ["--mi-config=/run/foundry/mi/trust.json"]
+            override.update(command=command, restart="no", group_add=[mount_group()], volumes=[
+                {"type": "bind", "source": os.path.join(mi_dir, name).replace("$", "$$"),
+                 "target": "/run/foundry/mi/" + name, "read_only": True,
+                 "bind": {"create_host_path": False}} for name in ("trust.json", "publication.json")])
+        override = {"services": {"router": override}}
+        if token:
+            apply_test_override(project, override, command)
+        with tempfile.TemporaryDirectory(prefix="foundry-local-http-") as tmp:
+            path = os.path.join(tmp, "override.json")
+            with open(path, "x", encoding="utf-8") as stream:
+                json.dump(override, stream)
+            if mi_dir:
+                validate_mi(mi_dir, digest)
+            if token:
+                if check_project(project, config) and not adoption:
+                    raise ValueError("project resources already exist")
+                check_test_adoption(project, adoption)
+            command = base + ["-f", path, "up", "-d", "--no-build", "--pull", "never",
+                              "--wait", "--wait-timeout", "60"]
+            if mi_dir or token:
+                command.append("--force-recreate")
+            verify_test_engine()
+            if token:
+                group = override["services"]["router"]["group_add"]
+                if group != [mount_group()] or group != [test_mount_group(verify_test_engine())]:
+                    raise TestEngineRefusal("test engine group mapping changed")
+            return subprocess.run(command, timeout=90).returncode
+    except TestEngineRefusal:
+        print("Test engine identity verification failed.", file=sys.stderr)
+        return 70
+    except subprocess.TimeoutExpired:
+        print("Local HTTP startup timed out.", file=sys.stderr)
+        return 124 if os.environ.get("FOUNDRY_TEST_RUN_ID") else 1
+    except (OSError, ValueError, KeyError, TypeError, AttributeError, IndexError, subprocess.SubprocessError):
+        print("Local HTTP startup not confirmed: check Docker, image and protected MI inputs; inspect resources before retrying.", file=sys.stderr)
+        return 1
+
+
+def main(argv=()):
+    parser = argparse.ArgumentParser(description=__doc__)
+    modes = parser.add_mutually_exclusive_group()
+    modes.add_argument("--local-http", action="store_true")
+    modes.add_argument("--tls", action="store_true")
+    args = parser.parse_args(argv)
+    if args.local_http:
+        return local_http_main()
     try:
         project = os.environ.get("LOCAL_TLS_PROJECT", "")
         if not re.fullmatch(r"[a-z0-9][a-z0-9_-]*", project):
@@ -324,16 +441,24 @@ def main():
         adoption = os.environ.get("LOCAL_TLS_ADOPT_PROJECT", "")
         if adoption and adoption != project:
             raise ValueError("adoption acknowledgement does not match project")
-        destination = os.environ.get("TLS_DEST", "")
-        validate(destination)
+        token = os.environ.get("FOUNDRY_TEST_RUN_ID", "")
+        if token:
+            test_override(project, token, [])
+            if os.environ.get("FOUNDRY_TEST_AUTHORIZATION") != "disposable-linux-engine-approved":
+                raise ValueError("test startup requires explicit authorization")
+        base = ["docker", "compose", "-p", project] + (["--env-file", ".env"] if os.path.isfile(".env") else []) + ["-f", "compose.yaml"]
+        verify_test_engine()
+        settings = tls_settings(base)
+        destination = settings["FOUNDRY_TLS_DIR" if args.tls else "TLS_DEST"]
+        if not args.tls:
+            validate(destination)
         mi_dir = os.environ.get("FOUNDRY_MI_DIR", "")
         mi_digest = os.environ.get("FOUNDRY_MI_SHA256", "")
         image_id = os.environ.get("FOUNDRY_MI_IMAGE_ID", "")
         if mi_dir or mi_digest or image_id:
             validate_mi(mi_dir, mi_digest)
-            if not re.fullmatch(r"sha256:[0-9a-f]{64}", image_id):
+            if image_id and not re.fullmatch(r"sha256:[0-9a-f]{64}", image_id):
                 raise ValueError("independent MI image ID required")
-        base = ["docker", "compose", "-p", project, "--env-file", ".env", "-f", "compose.yaml"]
         verify_test_engine()
         result = subprocess.run(base + ["config", "--format", "json", "--no-path-resolution"],
                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True,
@@ -342,91 +467,61 @@ def main():
         if config["name"] != project:
             raise ValueError("unexpected Compose project")
         router = config["services"]["router"]
-        if mi_dir:
+        if token and (set(config["services"]) != {"router"} or
+                      not re.fullmatch(r"sha256:[0-9a-f]{64}", router["image"])):
+            raise ValueError("test startup requires one router with an immutable image")
+        if mi_dir or token:
             verify_test_engine()
             result = subprocess.run(["docker", "image", "inspect", router["image"]],
                                     stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True, timeout=30)
             images = json.loads(result.stdout)
             health = images[0]["Config"].get("Healthcheck", {}).get("Test") if len(images) == 1 else None
-            if (len(images) != 1 or images[0]["Id"] != image_id or
+            if (len(images) != 1 or (image_id and images[0]["Id"] != image_id) or
+                (token and images[0]["Id"] != router["image"]) or
                 not isinstance(health, list) or len(health) < 2 or health[0] not in ("CMD", "CMD-SHELL") or
                 "healthcheck" in router or router.get("entrypoint") is not None):
                 raise ValueError("MI image or healthcheck not accepted")
-        mounts = [m for m in router["volumes"] if m.get("target") == "/run/foundry/tls"]
-        if (len(mounts) != 1 or mounts[0].get("type") != "bind" or
-            mounts[0].get("source") != destination or not mounts[0].get("read_only") or
-            router["environment"].get("SR_HEALTHCHECK_URL") != "https://127.0.0.1:8787/healthz"):
-            raise ValueError("Compose TLS directory or loopback hostname mismatch")
-        command = router["command"]
-        if ("--tls-reload-hostname=127.0.0.1" not in command or
-            any(arg.startswith("--tls-reload-ca-cert") for arg in command)):
-            raise ValueError("unexpected SR TLS command")
-        override = {"services": {"router": {
-            "command": command + ["--tls-reload-ca-cert=/run/foundry/tls/server.crt"],
-            "group_add": [str(os.getegid())],
-            "environment": {"SR_HEALTHCHECK_CA": "/run/foundry/tls/server.crt"},
-        }}}
+            image_id = images[0]["Id"]
+        hostname = settings["FOUNDRY_ROUTER_HOST"]
+        if not args.tls and (hostname != "127.0.0.1" or settings["FOUNDRY_TLS_DIR"] != destination):
+            raise ValueError("local leaf directory or hostname mismatch")
+        override = {"services": {"router": tls_override(destination, hostname, leaf=not args.tls)}}
+        override["services"]["router"]["group_add"] = [mount_group()]
         if mi_dir:
             override["services"]["router"]["command"].append("--mi-config=/run/foundry/mi/trust.json")
             override["services"]["router"]["image"] = image_id
             override["services"]["router"]["restart"] = "no"
-            override["services"]["router"]["volumes"] = [
+            override["services"]["router"]["volumes"] += [
                 {"type": "bind", "source": os.path.join(mi_dir, name).replace("$", "$$"),
                  "target": "/run/foundry/mi/" + name, "read_only": True,
                  "bind": {"create_host_path": False}}
                 for name in ("trust.json", "publication.json")
             ]
-        token = os.environ.get("FOUNDRY_TEST_RUN_ID", "")
         if token:
-            if os.environ.get("FOUNDRY_TEST_AUTHORIZATION") != "disposable-linux-engine-approved":
-                raise ValueError("test startup requires explicit authorization")
-            proxy_image = os.environ.get("FOUNDRY_TEST_PROXY_IMAGE_ID", "")
-            test_proxy_image(os.environ.get("FOUNDRY_TEST_BASE_DIGEST", ""), proxy_image)
-            bounded = test_override(project, token, override["services"]["router"]["command"],
-                                    os.environ.get("FOUNDRY_TEST_VOLUME"), proxy_image)
-            override["services"]["router"].update(bounded["services"]["router"])
-            override["services"]["proxy"] = bounded["services"]["proxy"]
-            override["services"]["router"]["group_add"] = [test_mount_group(verify_test_engine())]
-            override["networks"] = bounded["networks"]
-            override["volumes"] = bounded["volumes"]
+            apply_test_override(project, override, override["services"]["router"]["command"])
         with tempfile.TemporaryDirectory(prefix="foundry-local-tls-") as tmp:
             path = os.path.join(tmp, "override.json")
             with open(path, "x", encoding="utf-8") as stream:
                 json.dump(override, stream)
-            if token:
-                reset_path = os.path.join(tmp, "reset.yaml")
-                with open(reset_path, "x", encoding="utf-8") as stream:
-                    stream.write("services:\n  router:\n    ports: !reset []\n")
             # Reject a changed directory immediately before asking Docker to mount it.
-            validate(destination)
+            if not args.tls:
+                validate(destination)
             if mi_dir:
                 validate_mi(mi_dir, mi_digest)
-            if token:
-                verify_test_engine()
-                resolved = subprocess.run(base + ["-f", path, "-f", reset_path, "config", "--format", "json"],
-                                          stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True, timeout=20)
-                resolved_config = json.loads(resolved.stdout)
-                if resolved_config["services"]["router"].get("ports"):
-                    raise ValueError("test router port reset failed")
-                config = resolved_config
             if check_project(project, config):
                 if not adoption:
                     raise ValueError("project resources already exist")
             if token:
-                selected_volume = os.environ.get("FOUNDRY_TEST_VOLUME")
-                if selected_volume and not adoption:
-                    raise ValueError("restored volume requires test project adoption")
-                if adoption:
-                    volumes = check_test_ownership(project, token)
-                    if selected_volume and selected_volume not in volumes:
-                        raise ValueError("restored volume is not owned by test project")
-            command = base + ["-f", path] + (["-f", reset_path] if token else []) + ["up", "-d", "--no-build", "--pull", "never"]
+                check_test_adoption(project, adoption)
+            command = base + ["-f", path, "up", "-d", "--no-build", "--pull", "never"]
             if mi_dir or token:
                 command += ["--force-recreate", "--wait", "--wait-timeout", "60"]
                 data = verify_test_engine()
-                if token and override["services"]["router"]["group_add"] != [test_mount_group(data)]:
+                if token and (override["services"]["router"]["group_add"] != [test_mount_group(data)] or
+                              override["services"]["router"]["group_add"] != [mount_group()]):
                     raise TestEngineRefusal("test engine group mapping changed")
                 return subprocess.run(command, timeout=90).returncode
+            verify_test_engine()
             return subprocess.run(command).returncode
     except TestEngineRefusal:
         print("Test engine identity verification failed.", file=sys.stderr)
@@ -440,4 +535,4 @@ def main():
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(main(sys.argv[1:]))

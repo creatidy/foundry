@@ -1,33 +1,28 @@
-# Foundry M0: one existing SR service only. NOT a complete integrated system.
-# M0 supports a previously provisioned certificate verifiable by platform roots.
-# ACME/private-CA bootstrap is NOT delivered; no plaintext bridge exception.
-# Zero-touch TLS and the Windows/WSL localhost experience are not yet delivered.
+# Single-host local HTTP. Compose peers and configured routes are inside the
+# plaintext trust boundary; loopback publication alone does not prove isolation.
+# Advanced TLS uses the explicit startup override, never automatic fallback.
 name: foundry
 
 services:
   router:
-    image: ${FOUNDRY_ROUTER_IMAGE:?Pin an inspected Scarcity Router image}
+    image: ${FOUNDRY_ROUTER_IMAGE:-foundry-sr-mi:5bd4fa4-local}
+    build:
+      context: .
+      dockerfile: Dockerfile.mi
     command:
       - --host=0.0.0.0
       - --port=8787
       - --data-dir=/data
-      - --tls-certfile=/run/foundry/tls/server.crt
-      - --tls-keyfile=/run/foundry/tls/server.key
-      - --tls-reload-hostname=${FOUNDRY_ROUTER_HOST:?Set the certificate DNS hostname}
+      - --local-container-http
+      - --worker-listen-host=0.0.0.0
+      - --worker-listen-port=8790
     environment:
-      # Existing SR image healthcheck uses the normal verified TLS trust store.
-      # The hostname is mapped to loopback INSIDE this container only.
-      SR_HEALTHCHECK_URL: https://${FOUNDRY_ROUTER_HOST:?Set the certificate DNS hostname}:8787/healthz
-    extra_hosts:
-      - ${FOUNDRY_ROUTER_HOST:?Set the certificate DNS hostname}:127.0.0.1
+      SR_HEALTHCHECK_URL: http://127.0.0.1:8787/healthz
     ports:
       - "127.0.0.1:${FOUNDRY_ROUTER_PORT:-8787}:8787"
+      - "127.0.0.1:${FOUNDRY_WORKER_PORT:-8790}:8790"
     volumes:
       - router-data:/data
-      - type: bind
-        source: ${FOUNDRY_TLS_DIR:?Set the absolute directory with server.crt and server.key}
-        target: /run/foundry/tls
-        read_only: true
     networks:
       - backend
     restart: unless-stopped

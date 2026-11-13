@@ -8,6 +8,8 @@ import ssl
 import subprocess
 import sys
 
+from local_tls_up import tls_config
+
 
 def router_identity(config):
     router = config["services"]["router"]
@@ -25,6 +27,10 @@ def router_identity(config):
     # otherwise an alias or a consumed value can change SR's effective args.
     allowed = {"--host", "--port", "--data-dir", "--tls-reload-hostname",
                "--tls-certfile", "--tls-keyfile"}
+    worker = {"--worker-listen-host", "--worker-listen-port", "--worker-tls-certfile",
+              "--worker-tls-keyfile", "--worker-tls-reload-hostname"}
+    if any(arg.startswith("--worker-") for arg in command):
+        allowed |= worker
     values = {}
     for arg in command:
         name, separator, value = arg.partition("=")
@@ -35,6 +41,12 @@ def router_identity(config):
             values["--tls-certfile"] != "/run/foundry/tls/server.crt" or
             values["--tls-keyfile"] != "/run/foundry/tls/server.key"):
         raise ValueError("invalid TLS identity")
+    if worker <= values.keys() and (
+            values["--worker-listen-host"] != "0.0.0.0" or values["--worker-listen-port"] != "8790" or
+            values["--worker-tls-certfile"] != values["--tls-certfile"] or
+            values["--worker-tls-keyfile"] != values["--tls-keyfile"] or
+            values["--worker-tls-reload-hostname"] != values["--tls-reload-hostname"]):
+        raise ValueError("invalid worker TLS identity")
     return Path(source), values["--tls-reload-hostname"]
 
 
@@ -73,12 +85,7 @@ def verify(directory, hostname, client_context):
 
 def main():
     try:
-        result = subprocess.run(
-            ["docker", "compose", "--env-file", ".env", "-f", "compose.yaml",
-             "config", "--format", "json", "--no-path-resolution"],
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True, timeout=30,
-        )
-        directory, hostname = router_identity(json.loads(result.stdout))
+        directory, hostname = router_identity(tls_config())
         # OpenSSL otherwise accepts these environment variables as trust overrides.
         os.environ.pop("SSL_CERT_FILE", None)
         os.environ.pop("SSL_CERT_DIR", None)

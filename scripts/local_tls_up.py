@@ -129,17 +129,20 @@ def mount_group():
 
 
 def tls_settings(base):
-    """Use Compose's dotenv precedence rather than a second dotenv parser."""
-    result = subprocess.run(base + ["config", "--environment"], check=True,
-                            capture_output=True, timeout=30)
-    values = {}
-    for line in result.stdout.decode("utf-8").splitlines():
-        key, separator, value = line.partition("=")
-        if not separator or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key) or key in values:
-            raise ValueError("ambiguous Compose environment")
-        values[key] = value
-    return {key: values.get(key, "") for key in
-            ("TLS_DEST", "FOUNDRY_TLS_DIR", "FOUNDRY_ROUTER_HOST")}
+    """Resolve only TLS keys as structured data through Compose's own dotenv."""
+    keys = ("TLS_DEST", "FOUNDRY_TLS_DIR", "FOUNDRY_ROUTER_HOST")
+    labels = {"org.creatidy.foundry." + key.lower(): "${" + key + "-}" for key in keys}
+    with tempfile.TemporaryDirectory(prefix="foundry-tls-settings-") as tmp:
+        path = os.path.join(tmp, "settings.json")
+        with open(path, "x", encoding="utf-8") as stream:
+            json.dump({"services": {"router": {"labels": labels}}}, stream)
+        result = subprocess.run(base + ["-f", path, "config", "--format", "json", "--no-path-resolution"],
+                                check=True, capture_output=True, timeout=30)
+    rendered = json.loads(result.stdout)["services"]["router"]["labels"]
+    if not isinstance(rendered, dict) or any(not isinstance(rendered.get(name), str) for name in labels):
+        raise ValueError("invalid Compose TLS projection")
+    # Compose config escapes dollars for reuse as Compose input, including JSON.
+    return {key: rendered["org.creatidy.foundry." + key.lower()].replace("$$", "$") for key in keys}
 
 
 def tls_override(destination, hostname, *, leaf=False):

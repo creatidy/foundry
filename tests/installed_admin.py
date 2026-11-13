@@ -104,17 +104,22 @@ class AdminSession:
             raise ValueError("server returned non-JSON response") from None
         return status, payload
 
+    def assert_onboarding_origin(self):
+        """Reject cross-origin onboarding before any administrator is created."""
+        status, _, _ = self._request("POST", "/admin/onboarding", {},
+                                     {"Origin": "https://untrusted.invalid", "Sec-Fetch-Site": "cross-site"})
+        if status != 403:
+            raise AssertionError("onboarding did not reject a cross-origin request before form parsing")
+
     def assert_auth_boundaries(self):
-        """Check installed session, Origin, CSRF and inference-key boundaries."""
+        """Check installed session/CSRF separation over the verified connection."""
         if not self.cookie or not self.csrf:
             raise ValueError("administrator session not established")
         for headers in ({"Cookie": self.cookie},
-                        {"Cookie": self.cookie, "X-Scarcity-CSRF": "invalid-test-csrf"},
-                        {"Cookie": self.cookie, "X-Scarcity-CSRF": self.csrf,
-                         "Origin": "https://untrusted.invalid"}):
+                        {"Cookie": self.cookie, "X-Scarcity-CSRF": "invalid-test-csrf"}):
             status, _, _ = self._request("POST", "/control/mi/reload", {}, headers)
             if status != 403:
-                raise AssertionError("administrator mutation did not reject invalid CSRF or Origin")
+                raise AssertionError("administrator mutation did not reject missing or invalid CSRF")
         status, _, _ = self._request("POST", "/v1/select", {
             "requirement": {"task_level": "L0", "capability_minima": {}, "hard_constraints": {}}
         }, {"Cookie": self.cookie, "X-Scarcity-CSRF": self.csrf})

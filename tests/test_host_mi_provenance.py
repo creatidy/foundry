@@ -2,11 +2,13 @@
 
 import os
 import hashlib
+import io
 import json
 from pathlib import Path
 import sys
 import tempfile
 import shutil
+import subprocess
 import types
 import unittest
 from unittest import mock
@@ -23,15 +25,146 @@ REPO = os.environ.get("FOUNDRY_TEST_MI_REPO")
 FAKE = os.environ.get("FOUNDRY_TEST_FAKE_APPSERVER")
 
 
+class SourceCaptureTests(unittest.TestCase):
+    def _verify(self, stdout_size, stderr_size, *, error=None, code=0, ticks=None, wait_timeout=False, cleanup_timeout=False):
+        content = b"pinned fixture"
+        wheel = io.BytesIO()
+        with zipfile.ZipFile(wheel, "w") as archive:
+            archive.writestr("model_intelligence/fixture.py", content)
+        stdout, stderr = mock.Mock(), mock.Mock()
+        stdout.fileno.return_value, stderr.fileno.return_value = 101, 102
+        process = mock.Mock(stdout=stdout, stderr=stderr, returncode=None)
+        process.poll.side_effect = lambda: process.returncode
+        process.kill.side_effect = lambda: setattr(process, "returncode", -9)
+        waits = []
+        def wait(timeout=None):
+            waits.append(timeout)
+            if cleanup_timeout and timeout == 5:
+                raise subprocess.TimeoutExpired("private command", timeout)
+            if wait_timeout and len(waits) == 1:
+                raise subprocess.TimeoutExpired("private command", timeout, output=b"private", stderr=b"private")
+            if process.returncode is None:
+                process.returncode = code
+            return process.returncode
+        process.wait.side_effect = wait
+        registered = {}
+        selector = mock.MagicMock()
+        selector.__enter__.return_value = selector
+        def register(stream, events):
+            self.assertEqual(provenance.selectors.EVENT_READ, events)
+            registered[stream.fileno()] = types.SimpleNamespace(fd=stream.fileno(), fileobj=stream)
+        selector.register.side_effect = register
+        selector.unregister.side_effect = lambda stream: registered.pop(stream.fileno())
+        selector.get_map.return_value = registered
+        selector.select.side_effect = lambda timeout: [(key, provenance.selectors.EVENT_READ) for key in registered.values()]
+        remaining = {101: stdout_size, 102: stderr_size}
+        produced = 0
+        def read(fd, size):
+            nonlocal produced
+            self.assertLessEqual(size, 65536)
+            count = min(size, remaining[fd])
+            remaining[fd] -= count
+            produced += count
+            return (b"x" if fd == 101 else b"s") * count
+        command = ["git", "--no-replace-objects", "private-repository"]
+        def manifest(run, repo, revision, component):
+            self.assertEqual(("/unused", fixture.MI_REVISION, "mi"), (repo, revision, component))
+            self.assertEqual(b"x" * stdout_size, run(command))
+            return {"model_intelligence/fixture.py": hashlib.sha256(content).hexdigest()}
+        with mock.patch.object(provenance.subprocess, "Popen", return_value=process) as popen, \
+             mock.patch.object(provenance.selectors, "DefaultSelector", return_value=selector), \
+             mock.patch.object(provenance.os, "read", side_effect=read), \
+             mock.patch.object(provenance.time, "monotonic", side_effect=ticks, return_value=0), \
+             mock.patch.object(provenance.image_build_executor, "git_manifest", side_effect=manifest), \
+             mock.patch.object(provenance.subprocess, "run", side_effect=AssertionError("unbounded capture")):
+            if error:
+                with self.assertRaises(error) as raised:
+                    provenance.verify_source_wheel("/unused", wheel.getvalue())
+                self.assertNotIn("private", str(raised.exception))
+            else:
+                provenance.verify_source_wheel("/unused", wheel.getvalue())
+        popen.assert_called_once_with(command, env={
+            "PATH": os.defpath, "HOME": "/tmp/kilo", "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_NO_LAZY_FETCH": "1", "GIT_ALLOW_PROTOCOL": "",
+            "GIT_OPTIONAL_LOCKS": "0"}, stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0)
+        stdout.close.assert_called_once_with()
+        stderr.close.assert_called_once_with()
+        selector.__exit__.assert_called_once()
+        self.assertIsNotNone(process.returncode)
+        self.assertTrue(all(timeout is not None and timeout > 0 for timeout in waits))
+        self.assertLessEqual(produced, provenance.MAX_SOURCE_OUTPUT + 1)
+        return process, selector, waits, produced
+
+    def test_streaming_capture_accepts_aggregate_boundary(self):
+        limit = provenance.MAX_SOURCE_OUTPUT
+        self.assertEqual(16 * 1024 * 1024, limit)
+        for sizes in ((limit, 0), (0, limit), (limit // 2, limit // 2)):
+            with self.subTest(sizes=sizes):
+                process, _, _, produced = self._verify(*sizes)
+                process.kill.assert_not_called()
+                self.assertEqual(limit, produced)
+
+    def test_either_stream_or_combined_overflow_kills_and_reaps(self):
+        limit = provenance.MAX_SOURCE_OUTPUT
+        for sizes in ((limit + 1, 0), (0, limit + 1), (limit // 2 + 1, limit // 2)):
+            with self.subTest(sizes=sizes):
+                process, _, waits, produced = self._verify(*sizes, error=ValueError)
+                process.kill.assert_called_once_with()
+                self.assertEqual([5], waits)
+                self.assertEqual(limit + 1, produced)
+
+    def test_nonzero_exit_is_generic_and_already_reaped(self):
+        process, _, waits, _ = self._verify(32, 64, code=7, error=ValueError)
+        process.kill.assert_not_called()
+        self.assertEqual([30], waits)
+
+    def test_command_and_global_timeouts_kill_and_reap(self):
+        for ticks in ([0, 0, 31], [0, 119, 121]):
+            with self.subTest(ticks=ticks):
+                process, selector, waits, produced = self._verify(64, 64, ticks=ticks, error=TimeoutError)
+                process.kill.assert_called_once_with()
+                selector.select.assert_not_called()
+                self.assertEqual([5], waits)
+                self.assertEqual(0, produced)
+
+    def test_wait_timeout_kills_reaps_and_closes_both_streams(self):
+        process, _, waits, _ = self._verify(0, 0, wait_timeout=True, error=TimeoutError)
+        process.kill.assert_called_once_with()
+        self.assertEqual([30, 5], waits)
+
+    def test_cleanup_timeout_is_bounded_and_closes_both_streams(self):
+        process, _, waits, _ = self._verify(provenance.MAX_SOURCE_OUTPUT + 1, 0,
+                                           error=TimeoutError, cleanup_timeout=True)
+        process.kill.assert_called_once_with()
+        self.assertEqual([5], waits)
+
+    def test_global_deadline_bounds_select_and_wait(self):
+        process, selector, waits, _ = self._verify(0, 0, ticks=[0, 115, 116, 117])
+        process.kill.assert_not_called()
+        selector.select.assert_called_once_with(4)
+        self.assertEqual([3], waits)
+
+    def test_expired_global_deadline_refuses_before_child(self):
+        with mock.patch.object(provenance.time, "monotonic", side_effect=[0, 121]), \
+             mock.patch.object(provenance.image_build_executor, "git_manifest", side_effect=lambda run, *args: run(["git"])), \
+             mock.patch.object(provenance.subprocess, "Popen") as popen:
+            with self.assertRaisesRegex(TimeoutError, "MI source verification timed out"):
+                provenance.verify_source_wheel("/unused", b"")
+            popen.assert_not_called()
+
+
 class HostMIProvenanceTests(unittest.TestCase):
     def test_rejects_changed_artifact_before_starting_child(self):
         with tempfile.TemporaryDirectory() as tmp:
             wheel = Path(tmp) / "mi.whl"
             wheel.write_bytes(b"not the approved wheel")
-            with mock.patch.object(provenance.subprocess, "run") as run:
+            with mock.patch.object(provenance.subprocess, "run") as run, \
+                    mock.patch.object(provenance.subprocess, "Popen") as popen:
                 with self.assertRaisesRegex(ValueError, "digest mismatch"):
                     provenance.generate_cuts(sys.executable, wheel, tmp)
                 run.assert_not_called()
+                popen.assert_not_called()
             link = Path(tmp) / "link.whl"
             link.symlink_to(wheel)
             with self.assertRaises(OSError):

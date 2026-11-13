@@ -6,6 +6,7 @@ import io
 import json
 import os
 from pathlib import Path
+import selectors
 import shutil
 import stat
 import subprocess
@@ -21,6 +22,8 @@ import mi_publication_fixture as fixture
 # documented backend and SOURCE_DATE_EPOCH, independently of this invocation.
 WHEEL_SHA256 = "1ca0b6a0d0e99a5df4a75c66b625f9433553afda09f6b5928be574369a29d019"
 MAX_WHEEL_BYTES = 4 * 1024 * 1024
+# Aggregate stdout and stderr cap, matching git_manifest's object-size limit.
+MAX_SOURCE_OUTPUT = 16 * 1024 * 1024
 DIST_INFO = "model_intelligence-0.1.0.dist-info"
 TRUST_SHA256 = fixture.TRUST_SHA256
 
@@ -98,15 +101,59 @@ def verify_source_wheel(repo, wheel_data):
                    "GIT_OPTIONAL_LOCKS": "0"}
 
     def run(command):
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
+        now = time.monotonic()
+        if now >= deadline:
             raise TimeoutError("MI source verification timed out")
-        result = subprocess.run(command, env=environment, stdin=subprocess.DEVNULL,
-                                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                timeout=min(30, remaining), check=False)
-        if result.returncode:
-            raise ValueError("pinned MI source object unavailable")
-        return result.stdout
+        command_deadline = min(deadline, now + 30)
+        process = None
+        try:
+            process = subprocess.Popen(command, env=environment, stdin=subprocess.DEVNULL,
+                                       stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0)
+            output, total = bytearray(), 0
+            with selectors.DefaultSelector() as selector:
+                for stream in (process.stdout, process.stderr):
+                    selector.register(stream, selectors.EVENT_READ)
+                while selector.get_map():
+                    remaining = command_deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise TimeoutError("MI source verification timed out")
+                    for key, _ in selector.select(remaining):
+                        chunk = os.read(key.fd, min(65536, MAX_SOURCE_OUTPUT - total + 1))
+                        if not chunk:
+                            selector.unregister(key.fileobj)
+                            continue
+                        total += len(chunk)
+                        if total > MAX_SOURCE_OUTPUT:
+                            raise ValueError("MI source output exceeds limit")
+                        if key.fileobj is process.stdout:
+                            output.extend(chunk)
+                remaining = command_deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError("MI source verification timed out")
+                if process.wait(timeout=remaining):
+                    raise ValueError("pinned MI source object unavailable")
+            return bytes(output)
+        except (subprocess.TimeoutExpired, TimeoutError):
+            raise TimeoutError("MI source verification timed out") from None
+        except OSError:
+            raise ValueError("pinned MI source object unavailable") from None
+        finally:
+            if process is not None:
+                try:
+                    if process.poll() is None:
+                        try:
+                            process.kill()
+                        except ProcessLookupError:
+                            pass
+                        try:
+                            process.wait(timeout=5)
+                        except subprocess.TimeoutExpired:
+                            raise TimeoutError("MI source process cleanup not confirmed") from None
+                finally:
+                    try:
+                        process.stdout.close()
+                    finally:
+                        process.stderr.close()
 
     source = image_build_executor.git_manifest(run, repo, fixture.MI_REVISION, "mi")
     with zipfile.ZipFile(io.BytesIO(wheel_data)) as archive:

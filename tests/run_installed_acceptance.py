@@ -66,7 +66,8 @@ except Exception as exc:
 '''
 
 PHASE_CHECKS = {
-    'baseline': ['local_http_missing_and_invalid_credentials_rejected', 'admin_csrf_origin_and_inference_separation',
+    'baseline': ['local_http_missing_and_invalid_credentials_rejected', 'onboarding_cross_origin_rejected',
+                 'admin_csrf_and_inference_separation',
                  'advanced_tls_untrusted_and_wrong_hostname_rejected', 'mi_disabled_4097_admitted'],
     'execution': ['worker_execution_scenario_completed'],
     'variant_reload': ['mi_enabled_4097_blocked', 'stale_reload_rejected', 'incompatible_reload_rejected', 'withdrawal_reload_blocks', 'retained_projection_verified'],
@@ -555,7 +556,7 @@ def run(args):
         fresh_publication, fresh_trust = cuts["fresh"]
 
         with _project(args, baseline=True, phase='baseline', evidence=evidence, cuts=cuts) as adapter:
-            adapter.start_old()  # Baseline uses the new test image without MI.
+            adapter.start_old(check_onboarding_origin=True)  # New image, no administrator or MI yet.
             _security_negatives(adapter)
             key = _client(adapter, "MI-disabled baseline")
             control = _control(adapter, helper, fake, args)

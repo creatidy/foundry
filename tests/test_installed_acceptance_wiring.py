@@ -267,8 +267,10 @@ class WiringTests(unittest.TestCase):
                 self.project, self.old_image_id, self.new_image_id = project, old, new
                 self.admin = mock.Mock()
 
-            def start_old(self):
+            def start_old(self, *, check_onboarding_origin=False):
                 events.append((self.project.number, "start_old"))
+                if check_onboarding_origin:
+                    events.append((self.project.number, "onboarding_origin"))
 
             def start_new_with_cut(self, publication, trust, digest):
                 self.assert_fresh = (publication, trust, digest)
@@ -350,6 +352,8 @@ class WiringTests(unittest.TestCase):
         self.assertTrue(all(project.image_id == "old" for project in projects[1:]))
         self.assertEqual([0, 1, 2, 3, 4, 5], [number for number, event in events if event == "cleanup"])
         self.assertEqual([None] * 5 + ['tls'], default_transports)
+        self.assertEqual([0], [number for number, event in events if event == "onboarding_origin"])
+        self.assertLess(events.index((0, "onboarding_origin")), events.index((0, "security")))
         self.assertTrue(all(control.closed for control in controls))
         self.assertLess(events.index((2, "variant")), events.index((2, "close")))
         for number, operation in enumerate(("unbound", "execution", "variant", "stale", "preactivation", "migration")):

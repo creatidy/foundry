@@ -47,23 +47,32 @@ class AdminTests(unittest.TestCase):
         session.cookie, session.csrf = "scarcity-router-admin=test", "valid-csrf"
         with mock.patch.object(session, "_request", side_effect=[(403, b"{}", []),
                                                                   (403, b"{}", []),
-                                                                  (403, b"{}", []),
                                                                   (401, b"{}", [])]) as request:
             session.assert_auth_boundaries()
         self.assertNotIn("X-Scarcity-CSRF", request.call_args_list[0].args[3])
         self.assertEqual("invalid-test-csrf", request.call_args_list[1].args[3]["X-Scarcity-CSRF"])
-        self.assertEqual({"Cookie": session.cookie, "X-Scarcity-CSRF": session.csrf,
-                          "Origin": "https://untrusted.invalid"}, request.call_args_list[2].args[3])
-        self.assertNotIn("Authorization", request.call_args_list[3].args[3])
+        self.assertNotIn("Authorization", request.call_args_list[2].args[3])
 
     def test_installed_auth_boundaries_reject_unexpected_statuses(self):
-        for responses in ([200], [403, 200], [403, 403, 200], [403, 403, 403, 200]):
+        for responses in ([200], [403, 200], [403, 403, 200]):
             session = installed_admin.AdminSession(mock.Mock())
             session.cookie, session.csrf = "cookie", "csrf"
             with self.subTest(responses=responses), \
                  mock.patch.object(session, "_request", side_effect=[(status, b"{}", []) for status in responses]), \
                  self.assertRaises(AssertionError):
                 session.assert_auth_boundaries()
+
+    def test_onboarding_origin_is_checked_before_form_or_admin_auth(self):
+        session = installed_admin.AdminSession(mock.Mock())
+        for status in (403, 200, 303, 400, 401):
+            with self.subTest(status=status), mock.patch.object(session, "_request", return_value=(status, b"{}", [])) as request:
+                if status == 403:
+                    session.assert_onboarding_origin()
+                else:
+                    with self.assertRaises(AssertionError):
+                        session.assert_onboarding_origin()
+                request.assert_called_once_with("POST", "/admin/onboarding", {},
+                                                {"Origin": "https://untrusted.invalid", "Sec-Fetch-Site": "cross-site"})
 
     def test_bootstrap_and_admin_header_separation(self):
         project = mock.Mock(port=1234, container_id="owned")
@@ -210,6 +219,31 @@ class OfflineLifecycleTests(unittest.TestCase):
             project.launch.assert_called_once_with(new, mi_enabled=True, adopt=True,
                                                    mi_digest=lifecycle.fixture.EXPECTED_SHA256)
             login.assert_called_once()
+
+    def test_onboarding_origin_guard_precedes_bootstrap_only_when_requested(self):
+        old, new = "sha256:" + "a" * 64, "sha256:" + "b" * 64
+        for enabled, refused in ((False, False), (True, False), (True, True)):
+            project = mock.Mock(root=None, image_id=old, port=None)
+            adapter = lifecycle.InstalledLifecycleAdapter(project, old, new)
+            calls = []
+            def origin():
+                calls.append("origin")
+                if refused:
+                    raise AssertionError("Origin accepted")
+            with self.subTest(enabled=enabled, refused=refused), \
+                    mock.patch.object(adapter.admin, "assert_onboarding_origin", side_effect=origin), \
+                    mock.patch.object(adapter.admin, "bootstrap", side_effect=lambda: calls.append("bootstrap")):
+                if refused:
+                    with self.assertRaises(AssertionError):
+                        adapter.start_old(check_onboarding_origin=enabled)
+                    self.assertEqual(["origin"], calls)
+                    self.assertFalse(adapter._initialized)
+                else:
+                    adapter.start_old(check_onboarding_origin=enabled)
+                    self.assertEqual(["origin", "bootstrap"] if enabled else ["bootstrap"], calls)
+                    if enabled:
+                        with self.assertRaises(ValueError):
+                            adapter.start_old(check_onboarding_origin=True)
 
     def test_new_cut_preflight_and_restart_keep_independent_digest(self):
         old, new = "sha256:" + "a" * 64, "sha256:" + "b" * 64

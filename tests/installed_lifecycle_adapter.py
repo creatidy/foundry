@@ -118,11 +118,15 @@ class InstalledLifecycleAdapter:
         self._snapshots = {}
         self._mi_digest = fixture.EXPECTED_SHA256
 
-    def _start(self, image, mi_enabled):
+    def _start(self, image, mi_enabled, *, check_onboarding_origin=False):
+        if check_onboarding_origin and self._initialized:
+            raise ValueError("onboarding Origin check requires a fresh administrator store")
         if not self._initialized:
             if image != self.old_image_id:
                 raise ValueError("old image must start first")
             self.project.start(mi_enabled=False)
+            if check_onboarding_origin:
+                self.admin.assert_onboarding_origin()
             self.admin.bootstrap()
             self._initialized = True
         else:
@@ -134,8 +138,8 @@ class InstalledLifecycleAdapter:
                 self.project.launch(image, mi_enabled=False, adopt=True)
             self.admin.login()
 
-    def start_old(self):
-        self._start(self.old_image_id, False)
+    def start_old(self, *, check_onboarding_origin=False):
+        self._start(self.old_image_id, False, check_onboarding_origin=check_onboarding_origin)
 
     def start_new(self):
         self._start(self.new_image_id, True)

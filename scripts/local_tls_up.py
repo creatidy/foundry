@@ -128,6 +128,20 @@ def mount_group():
     return "0" if "name=rootless" in options else str(os.getegid())
 
 
+def tls_settings(base):
+    """Use Compose's dotenv precedence rather than a second dotenv parser."""
+    result = subprocess.run(base + ["config", "--environment"], check=True,
+                            capture_output=True, timeout=30)
+    values = {}
+    for line in result.stdout.decode("utf-8").splitlines():
+        key, separator, value = line.partition("=")
+        if not separator or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key) or key in values:
+            raise ValueError("ambiguous Compose environment")
+        values[key] = value
+    return {key: values.get(key, "") for key in
+            ("TLS_DEST", "FOUNDRY_TLS_DIR", "FOUNDRY_ROUTER_HOST")}
+
+
 def tls_override(destination, hostname, *, leaf=False):
     if (not os.path.isabs(destination) or not os.path.isdir(destination) or
             not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9.-]*", hostname)):
@@ -158,13 +172,13 @@ def tls_override(destination, hostname, *, leaf=False):
 
 def tls_config():
     """Render the explicit advanced TLS model without starting any service."""
-    override = tls_override(os.environ.get("FOUNDRY_TLS_DIR", ""),
-                            os.environ.get("FOUNDRY_ROUTER_HOST", ""))
+    base = ["docker", "compose"] + (["--env-file", ".env"] if os.path.isfile(".env") else [])
+    settings = tls_settings(base + ["-f", "compose.yaml"])
+    override = tls_override(settings["FOUNDRY_TLS_DIR"], settings["FOUNDRY_ROUTER_HOST"])
     with tempfile.TemporaryDirectory(prefix="foundry-tls-config-") as tmp:
         path = os.path.join(tmp, "override.json")
         with open(path, "x", encoding="utf-8") as stream:
             json.dump({"services": {"router": override}}, stream)
-        base = ["docker", "compose"] + (["--env-file", ".env"] if os.path.isfile(".env") else [])
         result = subprocess.run(base + ["-f", "compose.yaml", "-f", path, "config", "--format", "json",
                                         "--no-path-resolution"], check=True, capture_output=True, timeout=30)
         return json.loads(result.stdout)
@@ -176,6 +190,8 @@ def local_http_main():
         if any(os.environ.get(key) for key in ("TLS_DEST", "FOUNDRY_TLS_DIR", "FOUNDRY_ROUTER_HOST")):
             raise ValueError("TLS settings require explicit tls-up, not local HTTP")
         base = ["docker", "compose"] + (["--env-file", ".env"] if os.path.isfile(".env") else []) + ["-f", "compose.yaml"]
+        if any(tls_settings(base).values()):
+            raise ValueError("effective Compose TLS settings require explicit tls-up")
         result = subprocess.run(base + ["config", "--format", "json"], check=True,
                                 capture_output=True, timeout=30)
         config = json.loads(result.stdout)
@@ -239,7 +255,9 @@ def main(argv=()):
         adoption = os.environ.get("LOCAL_TLS_ADOPT_PROJECT", "")
         if adoption and adoption != project:
             raise ValueError("adoption acknowledgement does not match project")
-        destination = os.environ.get("FOUNDRY_TLS_DIR" if args.tls else "TLS_DEST", "")
+        base = ["docker", "compose", "-p", project] + (["--env-file", ".env"] if os.path.isfile(".env") else []) + ["-f", "compose.yaml"]
+        settings = tls_settings(base)
+        destination = settings["FOUNDRY_TLS_DIR" if args.tls else "TLS_DEST"]
         if not args.tls:
             validate(destination)
         mi_dir = os.environ.get("FOUNDRY_MI_DIR", "")
@@ -249,7 +267,6 @@ def main(argv=()):
             validate_mi(mi_dir, mi_digest)
             if image_id and not re.fullmatch(r"sha256:[0-9a-f]{64}", image_id):
                 raise ValueError("independent MI image ID required")
-        base = ["docker", "compose", "-p", project] + (["--env-file", ".env"] if os.path.isfile(".env") else []) + ["-f", "compose.yaml"]
         result = subprocess.run(base + ["config", "--format", "json", "--no-path-resolution"],
                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
         config = json.loads(result.stdout)
@@ -266,8 +283,8 @@ def main(argv=()):
                 "healthcheck" in router or router.get("entrypoint") is not None):
                 raise ValueError("MI image or healthcheck not accepted")
             image_id = images[0]["Id"]
-        hostname = os.environ.get("FOUNDRY_ROUTER_HOST", "")
-        if not args.tls and (hostname != "127.0.0.1" or os.environ.get("FOUNDRY_TLS_DIR") != destination):
+        hostname = settings["FOUNDRY_ROUTER_HOST"]
+        if not args.tls and (hostname != "127.0.0.1" or settings["FOUNDRY_TLS_DIR"] != destination):
             raise ValueError("local leaf directory or hostname mismatch")
         override = {"services": {"router": tls_override(destination, hostname, leaf=not args.tls)}}
         override["services"]["router"]["group_add"] = [mount_group()]

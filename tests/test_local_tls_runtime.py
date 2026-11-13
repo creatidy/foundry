@@ -45,7 +45,7 @@ class LocalTLSRuntimeTests(unittest.TestCase):
         self.dest = self.project / "tls"
         self.env = {k: v for k, v in os.environ.items() if not k.startswith(("FOUNDRY_", "COMPOSE_"))}
         self.env.update(FOUNDRY_ROUTER_IMAGE=os.environ["FOUNDRY_TEST_SR_IMAGE"],
-                        FOUNDRY_ROUTER_HOST="127.0.0.1", FOUNDRY_ROUTER_PORT="0",
+                        FOUNDRY_ROUTER_HOST="127.0.0.1", FOUNDRY_ROUTER_PORT="0", FOUNDRY_WORKER_PORT="0",
                         FOUNDRY_TLS_DIR=str(self.dest), TLS_DEST=str(self.dest),
                         COMPOSE_PROJECT_NAME="foundry-runtime-" + uuid.uuid4().hex[:12])
         self.env["LOCAL_TLS_PROJECT"] = self.env["COMPOSE_PROJECT_NAME"]

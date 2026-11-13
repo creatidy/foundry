@@ -105,14 +105,16 @@ class AdminSession:
         return status, payload
 
     def assert_auth_boundaries(self):
-        """Check installed session/CSRF separation over the verified connection."""
+        """Check installed session, Origin, CSRF and inference-key boundaries."""
         if not self.cookie or not self.csrf:
             raise ValueError("administrator session not established")
         for headers in ({"Cookie": self.cookie},
-                        {"Cookie": self.cookie, "X-Scarcity-CSRF": "invalid-test-csrf"}):
+                        {"Cookie": self.cookie, "X-Scarcity-CSRF": "invalid-test-csrf"},
+                        {"Cookie": self.cookie, "X-Scarcity-CSRF": self.csrf,
+                         "Origin": "https://untrusted.invalid"}):
             status, _, _ = self._request("POST", "/control/mi/reload", {}, headers)
             if status != 403:
-                raise AssertionError("administrator mutation did not reject missing or invalid CSRF")
+                raise AssertionError("administrator mutation did not reject invalid CSRF or Origin")
         status, _, _ = self._request("POST", "/v1/select", {
             "requirement": {"task_level": "L0", "capability_minima": {}, "hard_constraints": {}}
         }, {"Cookie": self.cookie, "X-Scarcity-CSRF": self.csrf})

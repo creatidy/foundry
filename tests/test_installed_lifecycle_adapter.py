@@ -47,14 +47,17 @@ class AdminTests(unittest.TestCase):
         session.cookie, session.csrf = "scarcity-router-admin=test", "valid-csrf"
         with mock.patch.object(session, "_request", side_effect=[(403, b"{}", []),
                                                                   (403, b"{}", []),
+                                                                  (403, b"{}", []),
                                                                   (401, b"{}", [])]) as request:
             session.assert_auth_boundaries()
         self.assertNotIn("X-Scarcity-CSRF", request.call_args_list[0].args[3])
         self.assertEqual("invalid-test-csrf", request.call_args_list[1].args[3]["X-Scarcity-CSRF"])
-        self.assertNotIn("Authorization", request.call_args_list[2].args[3])
+        self.assertEqual({"Cookie": session.cookie, "X-Scarcity-CSRF": session.csrf,
+                          "Origin": "https://untrusted.invalid"}, request.call_args_list[2].args[3])
+        self.assertNotIn("Authorization", request.call_args_list[3].args[3])
 
     def test_installed_auth_boundaries_reject_unexpected_statuses(self):
-        for responses in ([200], [403, 200], [403, 403, 200]):
+        for responses in ([200], [403, 200], [403, 403, 200], [403, 403, 403, 200]):
             session = installed_admin.AdminSession(mock.Mock())
             session.cookie, session.csrf = "cookie", "csrf"
             with self.subTest(responses=responses), \

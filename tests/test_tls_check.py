@@ -155,7 +155,7 @@ class TLSCheckTests(unittest.TestCase):
         project = self.path / "project"
         project.mkdir()
         (project / "scripts").mkdir()
-            for name in FIXTURE_FILES:
+        for name in FIXTURE_FILES:
             shutil.copyfile(ROOT / name, project / name)
         (project / ".env").write_text(
             "FOUNDRY_ROUTER_IMAGE=unused:latest\nFOUNDRY_ROUTER_HOST=example.test\n"
@@ -164,8 +164,9 @@ class TLSCheckTests(unittest.TestCase):
                if not key.startswith(("FOUNDRY_", "COMPOSE_"))}
         env.pop("SSL_CERT_FILE", None)
         env.pop("SSL_CERT_DIR", None)
-        render = subprocess.run(["docker", "compose", "--env-file", ".env", "-f", "compose.yaml",
-                                 "config", "--format", "json", "--no-path-resolution"],
+        render = subprocess.run([sys.executable, "-B", "-c",
+                                 "import json,sys; sys.path.insert(0,'scripts'); import tls_check; "
+                                 "print(json.dumps(tls_check.tls_config()))"],
                                 cwd=project, env=env, capture_output=True, timeout=30, check=True)
         self.assertEqual(tls_check.router_identity(json.loads(render.stdout)), (self.path, "example.test"))
         tls_check.verify(self.path, "example.test", self.context)

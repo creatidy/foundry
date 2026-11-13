@@ -107,7 +107,7 @@ class AdminSession:
     def assert_onboarding_origin(self):
         """Reject cross-origin onboarding before any administrator is created."""
         status, _, _ = self._request("POST", "/admin/onboarding", {},
-                                     {"Origin": "https://untrusted.invalid", "Sec-Fetch-Site": "cross-site"})
+                                     {"Origin": "https://untrusted.invalid"})
         if status != 403:
             raise AssertionError("onboarding did not reject a cross-origin request before form parsing")
 

@@ -72,7 +72,7 @@ class AdminTests(unittest.TestCase):
                     with self.assertRaises(AssertionError):
                         session.assert_onboarding_origin()
                 request.assert_called_once_with("POST", "/admin/onboarding", {},
-                                                {"Origin": "https://untrusted.invalid", "Sec-Fetch-Site": "cross-site"})
+                                                {"Origin": "https://untrusted.invalid"})
 
     def test_bootstrap_and_admin_header_separation(self):
         project = mock.Mock(port=1234, container_id="owned")

@@ -7,15 +7,12 @@ from pathlib import Path
 import subprocess
 import sys
 
+from local_tls_up import tls_config
+
 
 def main():
     try:
-        result = subprocess.run(
-            ["docker", "compose", "--env-file", ".env", "-f", "compose.yaml",
-             "config", "--format", "json", "--no-path-resolution"],
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True,
-        )
-        config = json.loads(result.stdout)
+        config = tls_config()
         mounts = [mount for mount in config["services"]["router"]["volumes"]
                   if mount.get("target") == "/run/foundry/tls"]
         if len(mounts) != 1 or mounts[0].get("type") != "bind":

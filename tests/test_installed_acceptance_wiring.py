@@ -243,7 +243,7 @@ class WiringTests(unittest.TestCase):
             shutil.rmtree(directory)
 
     def test_phases_use_distinct_projects_and_live_controls(self):
-        events, projects, controls = [], [], []
+        events, projects, controls, default_transports = [], [], [], []
         cuts = {name: (name.encode(), (name + "-trust").encode()) for name in
                 ("fresh", "stale", "withdrawn", "incompatible")}
 
@@ -251,8 +251,13 @@ class WiringTests(unittest.TestCase):
             def __init__(self, **kwargs):
                 self.number = len(projects)
                 self.image_id = kwargs["image_id"]
+                default_transports.append(kwargs['transport'])
                 projects.append(self)
                 events.append((self.number, "create"))
+
+            def launch(self, image, **kwargs):
+                self.transport = kwargs['transport']
+                events.append((self.number, 'advanced_tls'))
 
             def cleanup(self):
                 events.append((self.number, "cleanup"))
@@ -260,7 +265,7 @@ class WiringTests(unittest.TestCase):
         class Adapter:
             def __init__(self, project, old, new):
                 self.project, self.old_image_id, self.new_image_id = project, old, new
-                self.admin = object()
+                self.admin = mock.Mock()
 
             def start_old(self):
                 events.append((self.project.number, "start_old"))
@@ -324,7 +329,8 @@ class WiringTests(unittest.TestCase):
              mock.patch.object(entry.host_mi_provenance, "generate_cuts", return_value=cuts), \
              mock.patch.object(entry, "_validate_cuts"), \
              mock.patch.object(entry, "InstalledProject", Project), mock.patch.object(entry, "InstalledLifecycleAdapter", Adapter), \
-             mock.patch.object(entry, "_security_negatives", side_effect=lambda a: events.append((a.project.number, "security"))), \
+              mock.patch.object(entry, "_security_negatives", side_effect=lambda a: events.append((a.project.number, "security"))), \
+              mock.patch.object(entry, "_tls_negatives"), \
              mock.patch.object(entry, "_client", return_value="key"), \
              mock.patch.object(entry, "_control", side_effect=lambda a, h, f, x, verify_only=False: Control(a, verify_only)), \
              mock.patch.object(entry, "assert_input_boundary", side_effect=lambda a, k, c, mi_enabled: (events.append((a.project.number, "bound" if mi_enabled else "unbound")) or {'route': {'target': {'resource': {'resource_id': 'foundry-worker-a:gpt-6-sol:high'}}}})), \
@@ -343,6 +349,7 @@ class WiringTests(unittest.TestCase):
         self.assertEqual("new", projects[0].image_id)
         self.assertTrue(all(project.image_id == "old" for project in projects[1:]))
         self.assertEqual([0, 1, 2, 3, 4, 5], [number for number, event in events if event == "cleanup"])
+        self.assertEqual([None] * 5 + ['tls'], default_transports)
         self.assertTrue(all(control.closed for control in controls))
         self.assertLess(events.index((2, "variant")), events.index((2, "close")))
         for number, operation in enumerate(("unbound", "execution", "variant", "stale", "preactivation", "migration")):
@@ -467,7 +474,7 @@ class WiringTests(unittest.TestCase):
              mock.patch.object(entry, '_validate_cuts'), \
              mock.patch.object(entry, '_project') as project:
             project.return_value.__enter__.return_value = mock.Mock()
-            with mock.patch.object(entry, '_security_negatives'), mock.patch.object(entry, '_client'), \
+            with mock.patch.object(entry, '_security_negatives'), mock.patch.object(entry, '_tls_negatives'), mock.patch.object(entry, '_client'), \
                  mock.patch.object(entry, '_control'), mock.patch.object(entry, 'assert_input_boundary', return_value={'route': {'target': {'resource': {'resource_id': 'foundry-worker-a:gpt-6-sol:high'}}}}), \
                  mock.patch.object(entry, '_execution'), mock.patch.object(entry, 'run_variant_reload_acceptance', return_value=({'route': {'target': {'resource': {'resource_id': 'foundry-worker-a:gpt-6-sol:high'}}}}, None)), \
                  mock.patch.object(entry, 'run_stale_installed'), mock.patch.object(entry, '_bound_selection'), \
@@ -576,10 +583,13 @@ class WiringTests(unittest.TestCase):
                   'checks': dict.fromkeys(checks, True)}
         adapter = mock.Mock()
         adapter.project.token = 'a' * 32
+        adapter.project.transport = 'local-http'
         adapter.admin.cookie, adapter.admin.csrf = 'private-cookie', 'private-csrf'
         adapter.project.run_worker_bundle.return_value = json.dumps(result)
         args = SimpleNamespace(worker_sha256='a' * 64, fake_sha256='b' * 64)
         self.assertEqual(result, entry._execution(adapter, b'helper', b'fake', args))
+        settings = json.loads(adapter.project.run_worker_bundle.call_args.kwargs['stdin'])
+        self.assertEqual(('local-http', 8790, None), (settings['transport'], settings['worker_port'], settings['ca_file']))
         result['cases'][0]['secret'] = 'must-not-be-written'
         adapter.project.run_worker_bundle.return_value = json.dumps(result)
         with self.assertRaisesRegex(ValueError, 'worker evidence case'):
@@ -604,6 +614,25 @@ class WiringTests(unittest.TestCase):
         adapter.exchange.return_value = (200, {})
         with self.assertRaisesRegex(AssertionError, "credentials"):
             entry._security_negatives(adapter)
+
+    def test_tls_negatives_are_explicit_and_never_fall_back(self):
+        adapter = mock.Mock()
+        adapter.project.transport = 'local-http'
+        with mock.patch.object(entry.http.client, 'HTTPSConnection') as https:
+            with self.assertRaisesRegex(ValueError, 'explicitly selected TLS'):
+                entry._tls_negatives(adapter)
+            https.assert_not_called()
+        adapter.project.transport = 'tls'
+        adapter.project.port = 12345
+        adapter.project.tls_context.return_value.wrap_socket.side_effect = ssl.SSLCertVerificationError('hostname')
+        connection = mock.Mock()
+        connection.request.side_effect = ssl.SSLCertVerificationError('untrusted')
+        with mock.patch.object(entry.ssl, 'create_default_context'), \
+             mock.patch.object(entry.http.client, 'HTTPSConnection', return_value=connection), \
+             mock.patch.object(entry.socket, 'create_connection'), \
+             mock.patch.object(entry.http.client, 'HTTPConnection') as http:
+            entry._tls_negatives(adapter)
+            http.assert_not_called()
 
 
 if __name__ == "__main__":

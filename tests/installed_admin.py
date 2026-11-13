@@ -33,10 +33,17 @@ class AdminSession:
         if wire is not None and len(wire) > 1024 * 1024:
             raise ValueError("request too large")
         request_headers = dict(headers or {})
+        # Ephemeral host publication preserves the SR listener's internal authority.
+        request_headers.setdefault("Host", "127.0.0.1:8787")
         if wire is not None:
             request_headers["Content-Type"] = "application/json"
-        connection = http.client.HTTPSConnection("127.0.0.1", self.project.port,
-                                                context=self.project.tls_context(), timeout=10)
+        if self.project.transport == "tls":
+            connection = http.client.HTTPSConnection("127.0.0.1", self.project.port,
+                                                    context=self.project.tls_context(), timeout=10)
+        elif self.project.transport == "local-http":
+            connection = http.client.HTTPConnection("127.0.0.1", self.project.port, timeout=10)
+        else:
+            raise ValueError("explicit supported transport required")
         try:
             connection.request(method, path, body=wire, headers=request_headers)
             response = connection.getresponse()
@@ -67,7 +74,7 @@ class AdminSession:
     def bootstrap(self):
         project = self.project
         if project.port is None:
-            raise ValueError("expected running owned router and proxy required")
+            raise ValueError("expected running owned router required")
         project.require_roles()
         try:
             claim = project._docker("exec", project.container_id, "python", "-m",

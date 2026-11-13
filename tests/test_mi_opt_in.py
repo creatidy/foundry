@@ -29,6 +29,15 @@ class MIOptInTests(unittest.TestCase):
                                           "reference": {"sha256": self.digest}}))
         self.publication.chmod(0o640)
         self.trust.chmod(0o640)
+        self.tls = Path(self.temp.name) / "tls"
+        self.tls.mkdir()
+        for name in ("server.crt", "server.key"):
+            (self.tls / name).write_bytes(b"offline readable fixture; validation is mocked")
+        self.env = {"LOCAL_TLS_PROJECT": "test", "TLS_DEST": str(self.tls),
+                    "FOUNDRY_TLS_DIR": str(self.tls), "FOUNDRY_ROUTER_HOST": "127.0.0.1"}
+        self.enterContext(mock.patch.object(local_tls_up, "mount_group", return_value=str(os.getegid())))
+        self.enterContext(mock.patch.object(local_tls_up, "tls_settings", side_effect=lambda base: {
+            key: os.environ.get(key, "") for key in ("TLS_DEST", "FOUNDRY_TLS_DIR", "FOUNDRY_ROUTER_HOST")}))
 
     def check(self, digest=None):
         local_tls_up.validate_mi(str(self.directory), self.digest if digest is None else digest)
@@ -78,7 +87,7 @@ class MIOptInTests(unittest.TestCase):
             "environment": {"SR_HEALTHCHECK_URL": "https://127.0.0.1:8787/healthz"},
             "image": "test-image", "command": ["--tls-reload-hostname=127.0.0.1"]}}}
         for enabled in (False, True):
-            env = {"LOCAL_TLS_PROJECT": "test", "TLS_DEST": "/tls"}
+            env = self.env.copy()
             if enabled:
                 env.update(FOUNDRY_MI_DIR=str(self.directory), FOUNDRY_MI_SHA256=self.digest,
                            FOUNDRY_MI_IMAGE_ID=self.image_id)
@@ -97,11 +106,12 @@ class MIOptInTests(unittest.TestCase):
                 self.assertEqual(0, local_tls_up.main())
             router = captured[0]["services"]["router"]
             self.assertEqual(enabled, "--mi-config=/run/foundry/mi/trust.json" in router["command"])
-            self.assertEqual(enabled, "volumes" in router)
+            self.assertEqual({"/run/foundry/tls"} | ({"/run/foundry/mi/trust.json", "/run/foundry/mi/publication.json"} if enabled else set()),
+                             {mount["target"] for mount in router["volumes"]})
             if enabled:
                 self.assertEqual(self.image_id, router["image"])
                 self.assertEqual("no", router["restart"])
-                self.assertEqual({"/run/foundry/mi/trust.json", "/run/foundry/mi/publication.json"},
+                self.assertEqual({"/run/foundry/tls", "/run/foundry/mi/trust.json", "/run/foundry/mi/publication.json"},
                                  {mount["target"] for mount in router["volumes"]})
                 for mount in router["volumes"]:
                     self.assertTrue(mount["read_only"])
@@ -112,7 +122,7 @@ class MIOptInTests(unittest.TestCase):
             "volumes": [{"type": "bind", "source": "/tls", "target": "/run/foundry/tls", "read_only": True}],
             "environment": {"SR_HEALTHCHECK_URL": "https://127.0.0.1:8787/healthz"},
             "image": "test-image", "command": ["--tls-reload-hostname=127.0.0.1"]}}}
-        env = {"LOCAL_TLS_PROJECT": "test", "TLS_DEST": "/tls",
+        env = {**self.env,
                "FOUNDRY_MI_DIR": str(self.directory), "FOUNDRY_MI_SHA256": self.digest,
                "FOUNDRY_MI_IMAGE_ID": self.image_id}
         for timeout in (False, True):
@@ -135,7 +145,7 @@ class MIOptInTests(unittest.TestCase):
 
     def test_rejects_wrong_image_or_missing_healthcheck(self):
         config = {"name": "test", "services": {"router": {"image": "candidate"}}}
-        env = {"LOCAL_TLS_PROJECT": "test", "TLS_DEST": "/tls", "FOUNDRY_MI_DIR": str(self.directory),
+        env = {**self.env, "FOUNDRY_MI_DIR": str(self.directory),
                "FOUNDRY_MI_SHA256": self.digest, "FOUNDRY_MI_IMAGE_ID": self.image_id}
         for image in ({"Id": "sha256:" + "b" * 64, "Config": {"Healthcheck": {"Test": ["CMD", "probe"]}}},
                       {"Id": self.image_id, "Config": {}},
@@ -151,7 +161,7 @@ class MIOptInTests(unittest.TestCase):
     def test_rendered_compose_null_entrypoint_and_override_rejection(self):
         root = Path(__file__).resolve().parents[1]
         env = {**os.environ, "FOUNDRY_ROUTER_IMAGE": "test-image", "FOUNDRY_ROUTER_HOST": "127.0.0.1",
-               "FOUNDRY_TLS_DIR": "/tls", "LOCAL_TLS_PROJECT": "test", "TLS_DEST": "/tls",
+               "FOUNDRY_TLS_DIR": str(self.tls), "LOCAL_TLS_PROJECT": "test", "TLS_DEST": str(self.tls),
                "FOUNDRY_MI_DIR": str(self.directory), "FOUNDRY_MI_SHA256": self.digest,
                "FOUNDRY_MI_IMAGE_ID": self.image_id}
         rendered = subprocess.run(["docker", "compose", "-p", "test", "--env-file", "/dev/null",
@@ -180,7 +190,7 @@ class MIOptInTests(unittest.TestCase):
             mi_dir = str(self.directory / suffix)
             env = {key: value for key, value in os.environ.items() if not key.startswith("COMPOSE_")}
             env.update(FOUNDRY_ROUTER_IMAGE="test-image", FOUNDRY_ROUTER_HOST="127.0.0.1",
-                       FOUNDRY_TLS_DIR="/tls", LOCAL_TLS_PROJECT="test", TLS_DEST="/tls",
+                        FOUNDRY_TLS_DIR=str(self.tls), LOCAL_TLS_PROJECT="test", TLS_DEST=str(self.tls),
                        FOUNDRY_MI_DIR=mi_dir, FOUNDRY_MI_SHA256=self.digest,
                        FOUNDRY_MI_IMAGE_ID=self.image_id, NAME="interpolated")
             rendered = subprocess.run(["docker", "compose", "-p", "test", "--env-file", "/dev/null",

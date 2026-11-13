@@ -29,7 +29,9 @@ class ImageProvenanceTests(unittest.TestCase):
         values.update(kwargs)
         return p.verify_build(**values)
 
-    def test_all_reviewed_sources_derive_both_historical_definitions(self):
+    def test_all_reviewed_sources_derive_old_and_local_http_definitions(self):
+        self.assertEqual("5bd4fa4d65028b46455f63726c2dda7b8e3ca341", p.NEW_SR)
+        self.assertEqual((p.OLD_SR, p.NEW_SR), p.TEST_SR_REVISIONS)
         actual = p.product_revision(self.source)
         sources = {revision: self.source.replace(actual.encode(), revision.encode())
                    for revision in p.DOCKERFILE_SHA256}

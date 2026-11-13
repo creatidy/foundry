@@ -61,7 +61,7 @@ def start_live_worker(project, admin, helper, fake, *, helper_sha256, fake_sha25
             raise ValueError("worker archive identity or digest mismatch")
         expected_manifest = _worker_manifest(worker_archive.data)
     if project.port is None:
-        raise ValueError("running owned router and proxy are required")
+        raise ValueError("running owned router is required")
     project.require_roles()
     if not admin.cookie or not admin.csrf:
         raise ValueError("authenticated admin session required")
@@ -72,7 +72,8 @@ def start_live_worker(project, admin, helper, fake, *, helper_sha256, fake_sha25
             raise ValueError("invalid pinned worker fixture")
     target = "/tmp/foundry-worker-" + project.token + "-" + uuid.uuid4().hex
     settings = {"isolated": True, "admin_cookie": admin.cookie, "admin_csrf": admin.csrf,
-                "http_port": 8787, "worker_port": 8788, "ca_file": "/run/foundry/tls/server.crt",
+                "http_port": 8787, "worker_port": 8790, "transport": project.transport,
+                "ca_file": "/run/foundry/tls/server.crt" if project.transport == "tls" else None,
                 "store_file": "/data/server-state.sqlite3", "scratch": target + "/scratch",
                  "backend_file": target + "/codex_fake_appserver.py", "verify_only": verify_only}
     if migration is not None:

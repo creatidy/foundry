@@ -9,11 +9,39 @@ import shutil
 import ssl
 import subprocess
 import sys
+import sys
 import tempfile
 import unittest
 from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
+FIXTURE_FILES = ("Makefile", "compose.yaml", "scripts/tls_check.py",
+                 "scripts/local_tls_up.py", "scripts/local_tls_init.py",
+                 "scripts/docker_socket_validation.py")
+
+
+class TLSFixtureImports(unittest.TestCase):
+    def test_isolated_helper_dependency_closure(self):
+        import test_tls_preflight
+
+        for module, files in (("tls_check", FIXTURE_FILES),
+                              ("tls_preflight", test_tls_preflight.FIXTURE_FILES)):
+            with self.subTest(module=module), tempfile.TemporaryDirectory() as tmp:
+                project = Path(tmp)
+                for name in files:
+                    destination = project / name
+                    destination.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(ROOT / name, destination)
+                result = subprocess.run(
+                    [sys.executable, "-I", "-B", "-c",
+                     "import importlib,sys; sys.path.insert(0,sys.argv[1]); "
+                     "print(importlib.import_module(sys.argv[2]).__file__)",
+                     str(project / "scripts"), module],
+                    env={"PATH": os.defpath}, capture_output=True, text=True,
+                    check=False, timeout=10,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout.strip(), str(project / "scripts" / (module + ".py")))
 sys.path.insert(0, str(ROOT / "scripts"))
 import tls_check
 
@@ -127,7 +155,7 @@ class TLSCheckTests(unittest.TestCase):
         project = self.path / "project"
         project.mkdir()
         (project / "scripts").mkdir()
-        for name in ("Makefile", "compose.yaml", "scripts/tls_check.py"):
+            for name in FIXTURE_FILES:
             shutil.copyfile(ROOT / name, project / name)
         (project / ".env").write_text(
             "FOUNDRY_ROUTER_IMAGE=unused:latest\nFOUNDRY_ROUTER_HOST=example.test\n"

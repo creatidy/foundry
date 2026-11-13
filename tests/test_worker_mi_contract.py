@@ -33,6 +33,11 @@ class WorkerConfigTests(unittest.TestCase):
             callbacks = {"audit_records": lambda: [], "mi_receipt": lambda *_: None,
                          "mi_receipt_by_id": lambda *_: None, "mi_cut": lambda *_: None}
             WorkerConfig("127.0.0.1", 1234, ca, root, exchange, True, **callbacks).validate()
+            WorkerConfig("127.0.0.1", 8790, None, root, exchange, True, transport="local-http", **callbacks).validate()
+            for transport, certificate in (("local-http", ca), ("tls", None), ("unknown", None)):
+                with self.subTest(transport=transport, certificate=certificate), self.assertRaises(ValueError):
+                    WorkerConfig("127.0.0.1", 8790, certificate, root, exchange, True,
+                                 transport=transport, **callbacks).validate()
             for missing in callbacks:
                 with self.subTest(missing=missing):
                     incomplete = {**callbacks, missing: None}

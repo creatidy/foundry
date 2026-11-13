@@ -206,8 +206,6 @@ class InstalledLifecycleAdapter:
             raise AssertionError("activation failure did not create a new owned container")
         identifier = roles["router"]
         info = json.loads(project._docker("container", "inspect", identifier))[0]
-        proxy = json.loads(project._docker("container", "inspect", roles["proxy"]))[0]
-        project._validate_proxy_inspect(proxy)
         state = info.get("State", {})
         try:
             started = datetime.fromisoformat(state["StartedAt"].replace("Z", "+00:00"))
@@ -221,7 +219,6 @@ class InstalledLifecycleAdapter:
         host = info.get("HostConfig", {})
         bindings = host.get("PortBindings") or {}
         data_mount = [item for item in mounts if item.get("Destination") == "/data"]
-        tls_mount = [item for item in mounts if item.get("Destination") == "/run/foundry/tls"]
         mi_mounts = [item for item in mounts if item.get("Destination") in
                      ("/run/foundry/mi/trust.json", "/run/foundry/mi/publication.json")]
         if (info.get("Image") != self.new_image_id or state.get("Status") != "exited" or
@@ -230,10 +227,7 @@ class InstalledLifecycleAdapter:
                 host.get("RestartPolicy", {}).get("Name") != "no" or
                 host.get("NanoCpus") != 1_000_000_000 or host.get("Memory") != 512 * 1024 * 1024 or
                 host.get("MemorySwap") != 512 * 1024 * 1024 or host.get("PidsLimit") != 128 or
-                host.get("Privileged") is not False or len(mounts) != 4 or
-                bindings or
-                len(tls_mount) != 1 or tls_mount[0].get("Type") != "bind" or
-                tls_mount[0].get("RW") is not False or tls_mount[0].get("Source") != str(project.root / "tls") or
+                host.get("Privileged") is not False or len(mounts) != 3 or
                 not timely_exit or state["StartedAt"].startswith("0001-") or
                 "--mi-config=/run/foundry/mi/trust.json" not in args or
                 len(data_mount) != 1 or data_mount[0].get("Type") != "volume" or
@@ -244,29 +238,26 @@ class InstalledLifecycleAdapter:
                                            item.get("Source") != str(project.root / "mi" / item["Destination"].rsplit("/", 1)[1])
                                            for item in mi_mounts)):
             raise AssertionError("activation failure container identity or state mismatch")
+        project._validate_publications(info, running=False)
+        project._validate_transport(info)
         networks = project._owned("network")
-        if len(networks) != 2:
+        if len(networks) != 1:
             raise AssertionError("activation failure network ownership mismatch")
         inspected = [json.loads(project._docker("network", "inspect", item)) for item in networks]
         if any(len(item) != 1 for item in inspected):
             raise AssertionError("activation failure network inspection mismatch")
         network = {item[0].get("Name"): item[0] for item in inspected}
         backend = network.get(project.project + "_backend", {})
-        ingress = network.get(project.project + "_ingress", {})
-        attached = proxy.get("NetworkSettings", {}).get("Networks", {})
-        if (set(network) != {project.project + "_backend", project.project + "_ingress"} or
-                backend.get("Internal") is not True or ingress.get("Internal") is not False or
-                host.get("NetworkMode") != backend.get("Name") or len(attached) != 2 or
-                {value.get("NetworkID") for value in attached.values()} != {backend.get("Id"), ingress.get("Id")} or
-                set(ingress.get("Containers", {})) != {proxy.get("Id")} or
-                set(backend.get("Containers", {})) not in ({proxy.get("Id")}, {proxy.get("Id"), info.get("Id")})):
-            raise AssertionError("activation failure network is not internal")
+        if (set(network) != {project.project + "_backend"} or
+                backend.get("Internal") is not False or backend.get("Driver") != "bridge" or
+                host.get("NetworkMode") != backend.get("Name") or
+                set(backend.get("Containers", {})) not in (set(), {info.get("Id")})):
+            raise AssertionError("activation failure canonical bridge topology mismatch")
         logs = project._docker("logs", identifier, timeout=20, merge_output=True)
         if ("server: mi_publication_activation_failed" not in logs.splitlines() or
                 any("server component listening on " in line for line in logs.splitlines())):
             raise AssertionError("expected MI activation failure was not established")
         project.container_id = identifier
-        project.proxy_id = roles["proxy"]
         project.port = None
 
     def stop(self):
@@ -333,13 +324,12 @@ class InstalledLifecycleAdapter:
 
     def _validate_stopped(self):
         project = self.project
-        if project.port is not None or project._roles() != {"router": project.container_id, "proxy": project.proxy_id}:
-            raise ValueError("stopped owned router and proxy required")
+        if project.port is not None or project._roles() != {"router": project.container_id}:
+            raise ValueError("stopped owned router required")
         import json
         info = json.loads(project._docker("container", "inspect", project.container_id))[0]
-        proxy = json.loads(project._docker("container", "inspect", project.proxy_id))[0]
-        if info["State"].get("Running") or proxy["State"].get("Running"):
-            raise ValueError("router and proxy must be stopped")
+        if info["State"].get("Running"):
+            raise ValueError("router must be stopped")
         expected = project.env.get("FOUNDRY_TEST_VOLUME", project.project + "_router-data")
         mounts = [item for item in info.get("Mounts", []) if item.get("Destination") == "/data"]
         if (len(mounts) != 1 or mounts[0].get("Type") != "volume" or

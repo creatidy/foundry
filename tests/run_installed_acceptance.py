@@ -66,7 +66,8 @@ except Exception as exc:
 '''
 
 PHASE_CHECKS = {
-    'baseline': ['missing_and_invalid_credentials_rejected', 'admin_csrf_and_inference_separation', 'untrusted_and_wrong_hostname_tls_rejected', 'mi_disabled_4097_admitted'],
+    'baseline': ['local_http_missing_and_invalid_credentials_rejected', 'admin_csrf_and_inference_separation',
+                 'advanced_tls_untrusted_and_wrong_hostname_rejected', 'mi_disabled_4097_admitted'],
     'execution': ['worker_execution_scenario_completed'],
     'variant_reload': ['mi_enabled_4097_blocked', 'stale_reload_rejected', 'incompatible_reload_rejected', 'withdrawal_reload_blocks', 'retained_projection_verified'],
     'stale_startup': ['stale_cut_4096_no_solution', 'stale_projection_survives_restart',
@@ -171,7 +172,11 @@ class Evidence:
             self.data['new_test_image_sr_revision'] = provenance.NEW_SR
             self.data['foundry_image_upgrade_compatibility'] = 'not_established'
             self.data['worker_backend_scope'] = 'synthetic; native worker sandbox not verified'
-            self.data['host_https_path'] = 'test TCP proxy with end-to-end router TLS; direct Docker publication not verified'
+            self.data['host_transport'] = 'direct canonical router loopback publications; local HTTP candidate, verified TLS historical image'
+            self.data['advanced_tls_checks'] = 'baseline explicit TLS restart; no HTTP fallback'
+            self.data['migration_transport'] = 'advanced TLS for both images; retained srws://127.0.0.1:8790 worker identities, not cross-transport migration'
+            self.data['ordinary_browser_access'] = 'not_established; ephemeral host ports use explicit internal Host authority'
+            self.data['host_published_worker_client'] = 'not_established; synthetic worker runs inside router namespace'
         self.save()
 
     def save(self):
@@ -208,7 +213,8 @@ def _project(args, *, baseline=False, phase=None, evidence=None, cuts=None):
     old, new = (args.new_image_id, args.old_image_id) if baseline else (args.old_image_id, args.new_image_id)
     project = InstalledProject(socket_path=args.socket, engine_id=args.engine_id, image_id=old,
                                authorization="disposable-linux-engine-approved", mi_cuts=cuts,
-                               base_digest=args.base_digest)
+                                base_digest=args.base_digest, tls_image_id=args.old_image_id,
+                                transport='tls' if phase == 'migration_backup_restore' else None)
     record = None
     if evidence is not None:
         record = evidence.data['phases'][phase] = {'status': 'running', 'cleanup': 'pending'}
@@ -258,6 +264,11 @@ def _security_negatives(adapter):
         if status != 401:
             raise AssertionError("missing or invalid credentials were accepted")
     adapter.admin.assert_auth_boundaries()
+
+
+def _tls_negatives(adapter):
+    if adapter.project.transport != 'tls':
+        raise ValueError('TLS negatives require explicitly selected TLS')
     conn = http.client.HTTPSConnection("127.0.0.1", adapter.project.port, timeout=10,
                                        context=ssl.create_default_context())
     try:
@@ -288,7 +299,8 @@ def _execution(adapter, helper, fake, args):
     project = adapter.project
     target = "/tmp/foundry-worker-" + project.token
     settings = {"isolated": True, "admin_cookie": adapter.admin.cookie, "admin_csrf": adapter.admin.csrf,
-                "http_port": 8787, "worker_port": 8788, "ca_file": "/run/foundry/tls/server.crt",
+                "http_port": 8787, "worker_port": 8790, "transport": project.transport,
+                "ca_file": "/run/foundry/tls/server.crt" if project.transport == 'tls' else None,
                 "store_file": "/data/server-state.sqlite3", "scratch": target + "/scratch",
                 "backend_file": target + "/codex_fake_appserver.py"}
     files = {"runner.py": RUNNER, "worker_mi_acceptance.py": helper, "codex_fake_appserver.py": fake}
@@ -557,6 +569,10 @@ def run(args):
                     evidence.save()
             finally:
                 control.close()
+            adapter.stop()
+            adapter.project.launch(args.new_image_id, mi_enabled=False, adopt=True, transport='tls')
+            adapter.admin.login()
+            _tls_negatives(adapter)
 
         with _project(args, phase='execution', evidence=evidence, cuts=cuts) as adapter:
             adapter.start_new_with_cut(fresh_publication, fresh_trust, fixture.EXPECTED_SHA256)

@@ -52,7 +52,7 @@ Exchange = Callable[[str, str, object | None, dict[str, str]], tuple[int, object
 class WorkerConfig:
     worker_host: str
     worker_port: int
-    ca_file: Path
+    ca_file: Path | None
     scratch: Path
     exchange: Exchange
     isolated: bool
@@ -62,6 +62,7 @@ class WorkerConfig:
     mi_receipt_by_id: Callable[[str], object] | None = None
     mi_cut: Callable[[str], bytes | None] | None = None
     migration: str | None = None
+    transport: str = "tls"
 
     def validate(self) -> None:
         try:
@@ -78,8 +79,10 @@ class WorkerConfig:
                                                                  self.mi_receipt_by_id, self.mi_cut)
         if not all(callable(callback) for callback in callbacks):
             raise ValueError("audit and retained MI evidence callbacks are required")
-        if not self.ca_file.is_file() or not self.scratch.is_dir():
-            raise ValueError("existing CA file and isolated scratch directory required")
+        if (self.transport not in ("tls", "local-http") or
+                (self.transport == "tls" and (self.ca_file is None or not self.ca_file.is_file())) or
+                (self.transport == "local-http" and self.ca_file is not None) or not self.scratch.is_dir()):
+            raise ValueError("explicit transport, matching CA and isolated scratch directory required")
 
 
 def _ok(result: tuple[int, object]) -> dict:
@@ -328,8 +331,11 @@ def run_worker_acceptance(config: WorkerConfig, live_callback=None) -> dict | No
             raise ValueError("migration source configuration changed")
     workers = {}
     try:
-        connect_verified = ca_connect_factory(str(config.ca_file))
-        origin = WorkerOrigin.parse(f"srws://{config.worker_host}:{config.worker_port}")
+        from scarcity_router.worker_client import default_connect_factory
+        connect_verified = ca_connect_factory(str(config.ca_file)) if config.transport == "tls" else default_connect_factory
+        scheme = "srws" if config.transport == "tls" else "srw"
+        origin_url = f"{scheme}://{config.worker_host}:{config.worker_port}"
+        origin = WorkerOrigin.parse(origin_url)
 
         for source_id in SOURCES:
             directory = config.scratch / source_id
@@ -361,7 +367,8 @@ def run_worker_acceptance(config: WorkerConfig, live_callback=None) -> dict | No
             if config.migration == "resume":
                 identity = store.load_identity()
                 source = next(item for item in sources if item["source_id"] == source_id)
-                if identity is None or source.get("worker_id") != identity.worker_id:
+                if (identity is None or identity.server_origin != origin_url or
+                        source.get("worker_id") != identity.worker_id):
                     raise ValueError("preserved worker identity does not match the restored source")
             else:
                 code = admin("POST", "/control/workers/pairing-codes", {"label": source_id})["pairing_code"]
@@ -654,9 +661,12 @@ def run_in_container(settings: dict, live_callback=None) -> dict | None:
         raise ValueError("admin session and CSRF required")
     port = settings["http_port"]
     if type(port) is not int or not 1 <= port <= 65535:
-        raise ValueError("invalid loopback HTTPS port")
-    ca = Path(settings["ca_file"])
-    context = ssl.create_default_context(cafile=str(ca))
+        raise ValueError("invalid loopback HTTP port")
+    transport = settings["transport"]
+    if transport not in ("tls", "local-http") or (transport == "local-http" and settings["ca_file"] is not None):
+        raise ValueError("explicit transport and matching CA required")
+    ca = Path(settings["ca_file"]) if transport == "tls" else None
+    context = ssl.create_default_context(cafile=str(ca)) if transport == "tls" else None
 
     def exchange(method, path, body, headers):
         if not path.startswith(("/control/", "/v1/")) or "\r" in path or "\n" in path:
@@ -667,7 +677,8 @@ def run_in_container(settings: dict, live_callback=None) -> dict | None:
         data = json.dumps(body).encode() if body is not None else None
         if data is not None:
             merged["Content-Type"] = "application/json"
-        connection = http.client.HTTPSConnection("127.0.0.1", port, context=context, timeout=30)
+        connection = (http.client.HTTPSConnection("127.0.0.1", port, context=context, timeout=30)
+                      if transport == "tls" else http.client.HTTPConnection("127.0.0.1", port, timeout=30))
         try:
             connection.request(method, path, body=data, headers=merged)
             result = connection.getresponse()
@@ -763,7 +774,7 @@ def run_in_container(settings: dict, live_callback=None) -> dict | None:
         return run_worker_acceptance(WorkerConfig(
             "127.0.0.1", settings["worker_port"], ca, scratch, exchange, True,
             audit_records=audit, backend_file=Path(settings["backend_file"]), mi_receipt=receipt,
-            mi_receipt_by_id=receipt_by_id, mi_cut=retained_cut, migration=migration,
+            mi_receipt_by_id=receipt_by_id, mi_cut=retained_cut, migration=migration, transport=transport,
         ), live_callback=(lambda ready, execute: live_callback(ready, verify_cut, execute)) if live_callback is not None else None)
     finally:
         retained_store.close()

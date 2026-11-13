@@ -26,12 +26,11 @@ import image_provenance as provenance
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 from local_tls_init import no_acl, open_parent
-from local_tls_up import TEST_PROXY
 from docker_socket_validation import validate_engine_socket
 
 ROOT = Path(__file__).resolve().parents[1]
 LABEL = "org.creatidy.foundry.test-run"
-SR_TEST_REVISION = "8fc4f91ff1aa4c52f4738d436fc2ac12d0b8acb1"
+SR_TEST_REVISION = provenance.NEW_SR
 SR_OLD_REVISION = "f96d58e6d7d0fffdbe70476850d824efa5de2fb5"
 _ENGINE_VERIFICATION_FAILED = False
 _EXPECTED_INSPECTION = None
@@ -110,7 +109,8 @@ class InstalledProject:
     storage quotas. Docker metadata alone cannot prove these properties.
     """
 
-    def __init__(self, *, socket_path, engine_id, image_id, authorization, mi_cuts=None, base_digest=None):
+    def __init__(self, *, socket_path, engine_id, image_id, authorization, mi_cuts=None, base_digest=None,
+                 tls_image_id=None, transport=None):
         if authorization != "disposable-linux-engine-approved":
             raise ValueError("explicit disposable engine authorization required")
         if not re.fullmatch(r"sha256:[0-9a-f]{64}", image_id):
@@ -127,15 +127,21 @@ class InstalledProject:
         self.engine_id = engine_id
         self.image_id = image_id
         if base_digest is not None and (not isinstance(base_digest, str) or not re.fullmatch(r"sha256:[0-9a-f]{64}", base_digest)):
-            raise ValueError("pinned test proxy base digest required")
+            raise ValueError("pinned test base digest required")
         self.base_digest = base_digest
-        self.proxy_image_id = None
+        if tls_image_id is not None and not re.fullmatch(r"sha256:[0-9a-f]{64}", tls_image_id):
+            raise ValueError("pinned historical TLS image ID required")
+        self.tls_image_id = tls_image_id
+        if transport not in (None, "tls", "local-http"):
+            raise ValueError("explicit supported default transport required")
+        self.default_transport = transport
+        self.transport = transport or ("tls" if image_id == tls_image_id else "local-http")
         self.token = uuid.uuid4().hex
         self.project = "foundry-test-" + self.token
         self.root = None
         self.container_id = None
-        self.proxy_id = None
         self.port = None
+        self.worker_port = None
         self.env = None
         self._engine_blocked = False
         self._inspection_only = False
@@ -266,8 +272,6 @@ class InstalledProject:
             raise ValueError("project has already been started")
         if not isinstance(self.mi_cuts, dict) or "fresh" not in self.mi_cuts:
             raise ValueError("verified synthetic MI cuts required")
-        if self.base_digest is None:
-            raise ValueError("independently authenticated proxy base digest required")
         self.root = Path(tempfile.mkdtemp(prefix="foundry-accept-"))
         os.chmod(self.root, 0o700)
         for name in ("compose.yaml", "scripts/local_tls_up.py", "scripts/local_tls_init.py",
@@ -279,7 +283,7 @@ class InstalledProject:
         self.env = {"PATH": os.defpath, "HOME": str(self.root), "DOCKER_HOST": "unix://" + str(self.socket_path),
                     "DOCKER_CONFIG": str(self.root / "docker-config"),
                     "FOUNDRY_ROUTER_IMAGE": self.image_id, "FOUNDRY_MI_IMAGE_ID": self.image_id,
-                    "FOUNDRY_ROUTER_HOST": "127.0.0.1", "FOUNDRY_ROUTER_PORT": "0",
+                    "FOUNDRY_ROUTER_HOST": "127.0.0.1", "FOUNDRY_ROUTER_PORT": "0", "FOUNDRY_WORKER_PORT": "0",
                     "FOUNDRY_TLS_DIR": str(self.root / "tls"), "TLS_DEST": str(self.root / "tls"),
                     "FOUNDRY_MI_DIR": str(self.root / "mi"), "FOUNDRY_MI_SHA256": fixture.EXPECTED_SHA256,
                     "LOCAL_TLS_PROJECT": self.project, "FOUNDRY_TEST_RUN_ID": self.token,
@@ -287,23 +291,13 @@ class InstalledProject:
                     "FOUNDRY_TEST_ENGINE_ID": self.engine_id,
                     "FOUNDRY_TEST_DOCKER_HOST": "unix://" + str(self.socket_path)}
         self._verify_engine()
-        base = json.loads(self._docker("image", "inspect", "python:3.12-slim@" + self.base_digest))
-        if (not isinstance(base, list) or len(base) != 1 or base[0].get("Os") != "linux" or
-                not isinstance(base[0].get("Id"), str) or not re.fullmatch(r"sha256:[0-9a-f]{64}", base[0]["Id"]) or
-                not isinstance(base[0].get("RepoDigests"), list) or
-                not any(value in {"python@" + self.base_digest, "docker.io/library/python@" + self.base_digest}
-                        for value in base[0]["RepoDigests"])):
-            raise ValueError("test proxy base image identity mismatch")
-        self.proxy_image_id = base[0]["Id"]
-        self.env.update(FOUNDRY_TEST_BASE_DIGEST=self.base_digest, FOUNDRY_TEST_PROXY_IMAGE_ID=self.proxy_image_id)
-        self._run([sys.executable, "scripts/local_tls_init.py"], timeout=30)
         prepare_mi(self.root / "mi", self.mi_cuts["fresh"])
         if configure_mi is not None:
             configure_mi(self.root / "mi")
         return self.launch(self.image_id, mi_enabled=mi_enabled, adopt=False, mi_digest=mi_digest)
 
     def launch(self, image_id, *, mi_enabled, adopt, mi_digest=fixture.EXPECTED_SHA256,
-               expect_mi_failure=False):
+               expect_mi_failure=False, transport=None):
         if self.root is None or not re.fullmatch(r"sha256:[0-9a-f]{64}", image_id):
             raise ValueError("initialized project and pinned image required")
         if type(expect_mi_failure) is not bool or (expect_mi_failure and
@@ -311,6 +305,10 @@ class InstalledProject:
             raise ValueError("expected MI failure requires a stopped adopted project")
         if mi_enabled and mi_digest not in {fixture.EXPECTED_SHA256, *fixture.VARIANT_SHA256.values()}:
             raise ValueError("independently pinned MI fixture digest required")
+        selected = transport or self.default_transport or ("tls" if image_id == self.tls_image_id else "local-http")
+        if selected not in ("tls", "local-http") or (image_id == self.tls_image_id and selected != "tls"):
+            raise ValueError("explicit supported transport required; historical image requires TLS")
+        self.transport = selected
         image = json.loads(self._docker("image", "inspect", image_id))
         if len(image) != 1 or image[0].get("Id") != image_id or image[0].get("Os") != "linux":
             raise ValueError("pinned Linux image not present")
@@ -331,6 +329,14 @@ class InstalledProject:
             self.env.pop("LOCAL_TLS_ADOPT_PROJECT", None)
         self.image_id = image_id
         self.env["FOUNDRY_ROUTER_IMAGE"] = image_id
+        if selected == "tls":
+            self.env.update(TLS_DEST=str(self.root / "tls"), FOUNDRY_TLS_DIR=str(self.root / "tls"),
+                            FOUNDRY_ROUTER_HOST="127.0.0.1")
+        else:
+            for name in ("TLS_DEST", "FOUNDRY_TLS_DIR", "FOUNDRY_ROUTER_HOST"):
+                self.env.pop(name, None)
+        if selected == "tls" and not (self.root / "tls").exists():
+            self._run([sys.executable, "scripts/local_tls_init.py"], timeout=30)
         if mi_enabled:
             self.env.update(FOUNDRY_MI_IMAGE_ID=image_id, FOUNDRY_MI_DIR=str(self.root / "mi"),
                             FOUNDRY_MI_SHA256=mi_digest)
@@ -340,7 +346,9 @@ class InstalledProject:
         global _ENGINE_VERIFICATION_FAILED, _EXPECTED_INSPECTION
         self._verify_engine()
         try:
-            self._run([sys.executable, "scripts/local_tls_up.py"], timeout=180)
+            # Call the production recipe directly so make cannot mask exit 70/124.
+            self._run([sys.executable, "scripts/local_tls_up.py"] + (["--local-http"] if selected == "local-http" else []),
+                      timeout=180)
         except CommandFailure as exc:
             # A failed Compose invocation may have created or changed resources.
             # Its exit code alone cannot establish a safe cleanup boundary.
@@ -367,7 +375,7 @@ class InstalledProject:
 
     def _validate_started(self, mi_enabled):
         roles = self._roles()
-        self.container_id, self.proxy_id = roles["router"], roles["proxy"]
+        self.container_id = roles["router"]
         data = json.loads(self._docker("container", "inspect", self.container_id))[0]
         host = data["HostConfig"]
         if (data["Image"] != self.image_id or host.get("NanoCpus") != 1_000_000_000 or
@@ -388,7 +396,7 @@ class InstalledProject:
                 after[0].get("Image") != self.image_id or after[0].get("State", {}).get("Running") is not True or
                 after[0]["State"].get("StartedAt") != started):
             raise ValueError("workload restarted during cgroup check")
-        expected_binds = {"/run/foundry/tls": str(self.root / "tls")}
+        expected_binds = {"/run/foundry/tls": str(self.root / "tls")} if self.transport == "tls" else {}
         if mi_enabled:
             expected_binds.update({"/run/foundry/mi/" + name: str(self.root / "mi" / name)
                                    for name in ("trust.json", "publication.json")})
@@ -405,81 +413,74 @@ class InstalledProject:
             raise ValueError("container data volume is not the owned selected volume")
         networks = self._owned("network")
         attached = data["NetworkSettings"].get("Networks", {})
-        if len(networks) != 2 or len(attached) != 1:
-            raise ValueError("container must use exactly one owned internal network")
+        if len(networks) != 1 or len(attached) != 1:
+            raise ValueError("container must use exactly one owned bridge network")
         network_id = next(iter(attached.values())).get("NetworkID", "")
         inspected = [json.loads(self._docker("network", "inspect", identifier)) for identifier in networks]
         if any(len(items) != 1 for items in inspected):
             raise ValueError("container network isolation is unverified")
         net = {item[0].get("Id"): item[0] for item in inspected}
-        if (len(net) != 2 or network_id not in net or net[network_id].get("Internal") is not True or
+        if (len(net) != 1 or network_id not in net or net[network_id].get("Internal") is not False or
+                net[network_id].get("Driver") != "bridge" or
                 net[network_id].get("Name") != self.project + "_backend" or
                 any(not any(full.startswith(short) for short in networks) for full in net)):
-            raise ValueError("container network isolation is unverified")
-        ports = data["NetworkSettings"]["Ports"]
-        if any(ports.values()) or host.get("PortBindings"):
-            raise ValueError("router must not publish any ports")
-        proxy = json.loads(self._docker("container", "inspect", self.proxy_id))[0]
-        port = self._validate_proxy_inspect(proxy)
-        proxy_started = proxy.get("State", {}).get("StartedAt")
-        effective = self._docker("exec", self.proxy_id, "/bin/cat", *_CGROUP_FILES, timeout=20)
-        after_proxy = json.loads(self._docker("container", "inspect", self.proxy_id))
-        if (effective.splitlines() != ["0::/", "0::/", "134217728", "0", "64", "25000 100000"] or
-                not isinstance(proxy_started, str) or not proxy_started or len(after_proxy) != 1 or
-                after_proxy[0].get("Image") != self.proxy_image_id or
-                after_proxy[0].get("State", {}).get("Running") is not True or
-                after_proxy[0]["State"].get("StartedAt") != proxy_started or self._roles() != roles):
-            raise ValueError("effective proxy cgroup or process identity unverified")
-        proxy_networks = proxy.get("NetworkSettings", {}).get("Networks", {})
-        if ({value.get("NetworkID") for value in proxy_networks.values()} != set(net) or
-                len(proxy_networks) != 2 or
-                next(item for key, item in net.items() if key != network_id).get("Name") != self.project + "_ingress" or
-                next(item for key, item in net.items() if key != network_id).get("Internal") is not False):
-            raise ValueError("proxy network topology mismatch")
-        router_full, proxy_full = data.get("Id"), proxy.get("Id")
-        if (not router_full or not proxy_full or
-                set(net[network_id].get("Containers", {})) != {router_full, proxy_full} or
-                set(next(item for key, item in net.items() if key != network_id).get("Containers", {})) != {proxy_full}):
+            raise ValueError("canonical bridge topology is unverified")
+        if not data.get("Id") or set(net[network_id].get("Containers", {})) != {data["Id"]}:
             raise ValueError("unexpected network peers")
-        self.port = port
+        self.port, self.worker_port = self._validate_publications(data)
+        self._validate_transport(data)
+        if (host.get("CgroupnsMode") != "private" or host.get("RestartPolicy", {}).get("Name") != "no" or
+                "no-new-privileges:true" not in (host.get("SecurityOpt") or []) or
+                host.get("CapAdd") or host.get("Devices")):
+            raise ValueError("router security settings mismatch")
         return self
 
-    def _validate_proxy_inspect(self, proxy):
-        """Validate a running proxy's inspect data without Docker calls or exec.
-
-        Callers separately verify role ownership, network peers and effective
-        cgroups. This can be used during the read-only failure window.
-        """
-        ph = proxy.get("HostConfig", {})
-        config = proxy.get("Config", {})
-        if (proxy.get("Image") != self.proxy_image_id or not proxy.get("State", {}).get("Running") or
-                ph.get("NanoCpus") != 250_000_000 or ph.get("Memory") != 128 * 1024 * 1024 or
-                ph.get("MemorySwap") != 128 * 1024 * 1024 or ph.get("PidsLimit") != 64 or
-                ph.get("Privileged") is not False or ph.get("ReadonlyRootfs") is not True or
-                ph.get("CgroupnsMode") != "private" or
-                ph.get("CapDrop") != ["ALL"] or ph.get("CapAdd") not in (None, []) or
-                "no-new-privileges:true" not in (ph.get("SecurityOpt") or []) or
-                ph.get("RestartPolicy", {}).get("Name") != "no" or
-                config.get("User") != "65534:65534" or
-                config.get("Entrypoint") != ["python", "-I", "-u", "-c", TEST_PROXY] or
-                config.get("Cmd") not in (None, []) or proxy.get("Mounts") or
-                ph.get("Binds") or ph.get("Devices") or ph.get("NetworkMode") in ("host", "none")):
-            raise ValueError("proxy security settings or image mismatch")
-        ports = proxy["NetworkSettings"]["Ports"]
-        bindings = ports.get("8787/tcp") or []
-        if (len(bindings) != 1 or bindings[0].get("HostIp") != "127.0.0.1" or
-                any(value for key, value in ports.items() if key != "8787/tcp")):
+    def _validate_publications(self, data, *, running=True):
+        configured = data.get("HostConfig", {}).get("PortBindings") or {}
+        ports = data.get("NetworkSettings", {}).get("Ports") or {}
+        expected = ("8787/tcp", "8790/tcp")
+        if set(configured) != set(expected) or any(value for key, value in ports.items() if key not in expected):
             raise ValueError("unexpected listener publication")
-        port = bindings[0].get("HostPort", "")
-        if not isinstance(port, str) or not re.fullmatch(r"[0-9]{1,5}", port) or not 1 <= int(port) <= 65535:
-            raise ValueError("invalid Docker allocated host port")
-        configured = ph.get("PortBindings") or {}
-        configured_bindings = configured.get("8787/tcp") or []
-        if (set(configured) != {"8787/tcp"} or len(configured_bindings) != 1 or
-                configured_bindings[0].get("HostIp") != "127.0.0.1" or
-                configured_bindings[0].get("HostPort") not in ("", "0", port)):
-            raise ValueError("proxy configured publication mismatch")
-        return int(port)
+        result = []
+        for name in expected:
+            bindings = configured[name]
+            if len(bindings) != 1 or bindings[0].get("HostIp") != "127.0.0.1":
+                raise ValueError("configured publication must allocate a loopback port")
+            if running:
+                allocated = ports.get(name) or []
+                if len(allocated) != 1 or allocated[0].get("HostIp") != "127.0.0.1":
+                    raise ValueError("unexpected listener publication")
+                value = allocated[0].get("HostPort", "")
+                if not isinstance(value, str) or not re.fullmatch(r"[0-9]{1,5}", value) or not 1 <= int(value) <= 65535:
+                    raise ValueError("invalid Docker allocated host port")
+                if bindings[0].get("HostPort") not in ("", "0", value):
+                    raise ValueError("configured and allocated publication mismatch")
+                result.append(int(value))
+            elif bindings[0].get("HostPort") not in ("", "0"):
+                raise ValueError("stopped activation must use ephemeral publication")
+        return tuple(result)
+
+    def _validate_transport(self, data):
+        command = data.get("Config", {}).get("Cmd") or []
+        required = ["--host=0.0.0.0", "--port=8787", "--data-dir=/data",
+                    "--worker-listen-host=0.0.0.0", "--worker-listen-port=8790"]
+        if self.transport == "local-http":
+            required.append("--local-container-http")
+            if any(arg.startswith(("--tls-", "--worker-tls-")) for arg in command):
+                raise ValueError("local HTTP cannot contain TLS options")
+        elif self.transport == "tls":
+            required += ["--tls-certfile=/run/foundry/tls/server.crt", "--tls-keyfile=/run/foundry/tls/server.key",
+                         "--tls-reload-hostname=127.0.0.1", "--tls-reload-ca-cert=/run/foundry/tls/server.crt",
+                         "--worker-tls-certfile=/run/foundry/tls/server.crt", "--worker-tls-keyfile=/run/foundry/tls/server.key",
+                         "--worker-tls-reload-hostname=127.0.0.1", "--worker-tls-reload-ca-cert=/run/foundry/tls/server.crt"]
+            if "--local-container-http" in command:
+                raise ValueError("TLS cannot enable local HTTP")
+        else:
+            raise ValueError("unsupported transport")
+        if (any(command.count(arg) != 1 for arg in required) or
+                any(arg not in required + ["--mi-config=/run/foundry/mi/trust.json"] for arg in command) or
+                command.count("--mi-config=/run/foundry/mi/trust.json") > 1):
+            raise ValueError("listener transport command mismatch")
 
     def finish_expected_inspection(self, *, verified):
         """End the single read-only classification window, fencing any failure."""
@@ -513,12 +514,12 @@ class InstalledProject:
     def origin(self):
         if self.port is None:
             raise ValueError("project is not ready")
-        return "https://127.0.0.1:" + str(self.port)
+        return ("https" if self.transport == "tls" else "http") + "://127.0.0.1:" + str(self.port)
 
     @property
     def ca_file(self):
-        if self.port is None:
-            raise ValueError("project is not ready")
+        if self.port is None or self.transport != "tls":
+            raise ValueError("TLS project is not ready")
         return self.root / "tls" / "server.crt"
 
     def tls_context(self):
@@ -532,14 +533,15 @@ class InstalledProject:
             raise
 
     def _stop_owned(self):
-        if self._roles() != {"router": self.container_id, "proxy": self.proxy_id}:
+        if self._roles() != {"router": self.container_id}:
             raise ValueError("expected owned containers are not present")
-        for identifier in (self.proxy_id, self.container_id):
+        for identifier in (self.container_id,):
             self._docker("container", "stop", "--time", "5", identifier, timeout=20)
             info = json.loads(self._docker("container", "inspect", identifier))[0]
             if info["State"].get("Running"):
                 raise RuntimeError("container did not stop")
         self.port = None
+        self.worker_port = None
 
     def run_worker_bundle(self, files, expected_sha256, *, stdin):
         """Run an independently pinned, small test bundle inside the router.
@@ -593,7 +595,7 @@ class InstalledProject:
             raise
 
     def _roles(self):
-        """Resolve exactly the two labelled Compose roles, rejecting all others."""
+        """Resolve exactly the labelled canonical router, rejecting all others."""
         try:
             roles = {}
             for identifier in self._owned("container"):
@@ -605,10 +607,10 @@ class InstalledProject:
                         not isinstance(info[0].get("Id"), str) or not info[0]["Id"].startswith(identifier)):
                     raise ValueError("container role ownership changed")
                 role = labels.get("com.docker.compose.service")
-                if role not in ("router", "proxy") or role in roles:
+                if role != "router" or role in roles:
                     raise ValueError("unexpected or duplicate container role")
                 roles[role] = identifier
-            if set(roles) != {"router", "proxy"}:
+            if set(roles) != {"router"}:
                 raise ValueError("missing test container role")
             return roles
         except BaseException:
@@ -617,10 +619,9 @@ class InstalledProject:
 
     def require_roles(self):
         roles = self._roles()
-        if (not self.container_id or not self.proxy_id or
-                roles != {"router": self.container_id, "proxy": self.proxy_id}):
+        if not self.container_id or roles != {"router": self.container_id}:
             self.block_engine()
-            raise ValueError("owned router or proxy identity changed")
+            raise ValueError("owned router identity changed")
         return roles
 
     def _owned_verified(self, kind):

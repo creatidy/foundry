@@ -3,9 +3,8 @@ COMPOSE := docker compose $(if $(wildcard .env),--env-file .env) -f compose.yaml
 
 .PHONY: start runtime-check config preflight tls-check build up tls-up down ps logs local-tls-init local-tls-up
 
-export TLS_DEST LOCAL_TLS_PROJECT LOCAL_TLS_ADOPT_PROJECT FOUNDRY_MI_DIR FOUNDRY_MI_SHA256 FOUNDRY_MI_IMAGE_ID
+export LOCAL_TLS_PROJECT LOCAL_TLS_ADOPT_PROJECT FOUNDRY_MI_DIR FOUNDRY_MI_SHA256 FOUNDRY_MI_IMAGE_ID
 export FOUNDRY_SR_CHECKOUT
-export FOUNDRY_ROUTER_HOST FOUNDRY_TLS_DIR
 
 start:
 	@python3 scripts/local_runtime.py

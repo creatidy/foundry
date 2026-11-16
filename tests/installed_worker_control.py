@@ -78,7 +78,10 @@ def start_live_worker(project, admin, helper, fake, *, helper_sha256, fake_sha25
                  "backend_file": target + "/codex_fake_appserver.py", "verify_only": verify_only}
     if migration is not None:
         settings["migration"] = migration
+    from installed_provisioning import check_work_root
+    check_work_root()
     with tempfile.TemporaryDirectory(prefix="worker-live-", dir=project.root) as tmp:
+        check_work_root()
         directory = Path(tmp)
         for name, content in (("runner.py", _RUNNER), ("worker_mi_acceptance.py", helper),
                               ("codex_fake_appserver.py", fake)):
@@ -98,6 +101,7 @@ def start_live_worker(project, admin, helper, fake, *, helper_sha256, fake_sha25
             raise ValueError("restored worker archive mismatch")
     project.require_roles()
     project._verify_engine()
+    check_work_root()
     process = subprocess.Popen(["docker", "exec", "-i", "-e", "PYTHONPATH=" + target, project.container_id,
                                 "timeout", "--signal=TERM", "--kill-after=5s", "600s",
                                 "python", target + "/runner.py"], cwd=project.root, env=project.env,

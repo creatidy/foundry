@@ -20,18 +20,20 @@ import run_installed_acceptance as entry
 def mocked_full_run(args):
     args.authorize_disposable_linux_engine = args.authorize_image_build = True
     args.confirm_external_boundaries = True
-    args.preflight_evidence = '/tmp/kilo/probe/acceptance.json'
     args.base_digest = 'sha256:' + 'a' * 64
     args.sr_repo = '/sr'
     args.mi_repo = '/mi'
     args.zai_python = args.zai_output_dir = None
     args.authorize_zai_source_reads = False
-    args.evidence_dir = '/tmp/kilo/result'
     evidence = mock.Mock(data={'image_cleanup': {}, 'images': {}, 'preflight': {},
                                'phases': {name: {} for name in entry.PHASE_CHECKS}})
     executor = mock.MagicMock(probe_uncertain=False, cleanup_failed=False)
     executor.__enter__.return_value = executor
     with ExitStack() as stack:
+        root = stack.enter_context(tempfile.TemporaryDirectory())
+        args.work_root = root
+        args.preflight_evidence = root + '/probe/acceptance.json'
+        args.evidence_dir = root + '/result'
         for obj, name, kwargs in (
             (entry.Path, 'is_dir', {'return_value': True}),
             (entry.provenance, 'dockerfile', {}),
@@ -47,6 +49,184 @@ def mocked_full_run(args):
 
 
 class WiringTests(unittest.TestCase):
+    def setUp(self):
+        self.work_root = self.enterContext(tempfile.TemporaryDirectory())
+        self.enterContext(mock.patch.object(entry, 'DEFAULT_WORK_ROOT', self.work_root))
+
+    def test_legacy_default_accepts_0755_but_rejects_acl(self):
+        with tempfile.TemporaryDirectory() as root:
+            os.chmod(root, 0o755)
+            with mock.patch.object(entry, 'DEFAULT_WORK_ROOT', root):
+                fd = entry._open_work_root(root)
+                os.close(fd)
+                with mock.patch.object(entry, 'no_acl', side_effect=ValueError('ACL')):
+                    with self.assertRaisesRegex(ValueError, 'ACL'):
+                        entry._open_work_root(root)
+            with self.assertRaises(ValueError):
+                entry._open_work_root(root)
+
+    def test_work_root_mount_change_is_detected(self):
+        with tempfile.TemporaryDirectory() as root, entry._work_root_context(root):
+            real_identity = entry._root_identity
+            calls = []
+            def changed(fd):
+                dev, ino, mount = real_identity(fd)
+                calls.append(fd)
+                return dev, ino, mount + (len(calls) == 2)
+            with mock.patch.object(entry, '_root_identity', side_effect=changed):
+                with self.assertRaisesRegex(ValueError, 'identity changed'):
+                    entry.provisioning.check_work_root()
+
+    def test_real_source_is_refused_before_any_acceptance_operation(self):
+        with tempfile.TemporaryDirectory() as root, \
+             mock.patch.object(entry, '_discover_engine') as discover, \
+             mock.patch.object(entry, 'Evidence') as evidence:
+            args = SimpleNamespace(work_root=root, zai_python='/python', zai_output_dir='/outside',
+                                   authorize_zai_source_reads=True)
+            with self.assertRaisesRegex(ValueError, 'not supported with bounded work root'):
+                entry.run(args)
+            discover.assert_not_called()
+            evidence.assert_not_called()
+
+    def test_legacy_real_source_is_validated_and_reported_offline(self):
+        blockers = {name: 0 for name in ('scope_channel', 'subject_channel', 'subject_configuration',
+                                         'reasoning_effort', 'configuration_mismatch', 'unknown_freshness')}
+        summary = {'source_revision': entry.zai.MI_REVISION, 'router_applicability': 'not-established',
+                   'router_binding': None, 'integrity_not_authenticity': True,
+                   'retrieved_sources': len(entry.zai.EXPECTED_SOURCES), 'cut_sha256': 'a' * 64,
+                   'model_claims': 1, 'blockers': blockers}
+        for valid in (True, False):
+            args = SimpleNamespace(socket='/sock', engine_id='engine', worker_sha256='a' * 64,
+                                   fake_appserver='/fake', fake_sha256='b' * 64,
+                                   mi_python='/python', mi_wheel='/wheel')
+            payload = dict(summary)
+            if not valid:
+                payload['cut_sha256'] = 'invalid'
+            result = SimpleNamespace(returncode=0, stderr=b'', stdout=json.dumps(payload).encode())
+            root_context = entry._work_root_context
+            with self.subTest(valid=valid), mocked_full_run(args) as evidence, \
+                 mock.patch.object(entry, '_work_root_context', side_effect=lambda _: root_context(self.work_root)), \
+                 mock.patch.object(entry.Path, 'is_file', return_value=True), \
+                 mock.patch.object(entry.zai, 'check_directory') as check_directory, \
+                 mock.patch.object(entry, '_prepare', return_value=(b'helper', b'fake', {})), \
+                 mock.patch.object(entry.subprocess, 'run', return_value=result) as source, \
+                 mock.patch.object(entry, '_executor', side_effect=RuntimeError('stop before build')) as executor:
+                args.work_root = '/tmp/kilo'
+                args.zai_python, args.zai_output_dir, args.authorize_zai_source_reads = '/python', '/zai-output', True
+                expected = RuntimeError if valid else ValueError
+                with self.assertRaisesRegex(expected, 'stop before build' if valid else 'invalid real-source'):
+                    entry.run(args)
+                check_directory.assert_called_once_with('/zai-output')
+                source.assert_called_once_with(
+                    ['/python', '-I', str(entry.ROOT / 'tests' / 'zai_real_source_check.py'),
+                     '--output-dir', '/zai-output', '--authorization', entry.zai.AUTHORIZATION],
+                    env={'PATH': os.defpath, 'HOME': '/zai-output', 'LANG': 'C.UTF-8'},
+                    stdin=entry.subprocess.DEVNULL, stdout=entry.subprocess.PIPE, stderr=entry.subprocess.PIPE,
+                    timeout=entry.zai.PROCESS_TIMEOUT + 15, check=False)
+                if valid:
+                    self.assertEqual('a' * 64, evidence.data['real_source']['cut_sha256'])
+                    self.assertEqual('not_tested', evidence.data['real_source']['installed_image_compatibility'])
+                    executor.assert_called_once()
+                else:
+                    self.assertNotIn('real_source', evidence.data)
+                    executor.assert_not_called()
+
+    def test_direct_run_scopes_and_restores_work_root(self):
+        with tempfile.TemporaryDirectory() as root:
+            old_tempdir, old_tmpdir = tempfile.tempdir, os.environ.get('TMPDIR')
+            def inspect(args):
+                self.assertEqual(root, tempfile.gettempdir())
+                self.assertEqual(root, os.environ['TMPDIR'])
+                entry.provisioning.check_work_root()
+                raise RuntimeError('stop')
+            with mock.patch.object(entry, '_run', side_effect=inspect):
+                with self.assertRaisesRegex(RuntimeError, 'stop'):
+                    entry.run(SimpleNamespace(work_root=root))
+            self.assertEqual(old_tempdir, tempfile.tempdir)
+            self.assertEqual(old_tmpdir, os.environ.get('TMPDIR'))
+            self.assertIsNone(entry.provisioning._WORK_ROOT_GUARD)
+
+    def test_replaced_root_blocks_evidence_allocators_and_subprocess(self):
+        with tempfile.TemporaryDirectory() as parent:
+            root = Path(parent) / 'store'
+            root.mkdir(mode=0o700)
+            wheel = Path(parent) / 'fixture.whl'
+            wheel.write_bytes(b'fixture')
+            with entry._work_root_context(str(root)):
+                root.rename(Path(parent) / 'original')
+                root.mkdir(mode=0o700)
+                with self.assertRaisesRegex(ValueError, 'identity changed'):
+                    entry.Evidence(str(root / 'evidence'), work_root=str(root))
+                with mock.patch.object(entry.tempfile, 'TemporaryDirectory') as allocate:
+                    with self.assertRaisesRegex(ValueError, 'identity changed'):
+                        entry._discover_engine(SimpleNamespace(socket='/unused', engine_id=None))
+                    allocate.assert_not_called()
+                with mock.patch.object(entry.host_mi_provenance, 'WHEEL_SHA256', hashlib.sha256(b'fixture').hexdigest()), \
+                     mock.patch.object(entry.host_mi_provenance.tempfile, 'TemporaryDirectory') as allocate:
+                    with self.assertRaisesRegex(ValueError, 'identity changed'):
+                        entry.host_mi_provenance.generate_cuts('/usr/bin/python3', wheel, parent, str(root))
+                    allocate.assert_not_called()
+                project = entry.InstalledProject(socket_path='/private/docker.sock', engine_id='engine-id-123',
+                                                 image_id='sha256:' + '0' * 64,
+                                                 authorization='disposable-linux-engine-approved',
+                                                 mi_cuts={'fresh': (b'', b'')})
+                with mock.patch.object(entry.provisioning.tempfile, 'mkdtemp') as allocate, \
+                     mock.patch.object(entry.provisioning.subprocess, 'Popen') as popen:
+                    with self.assertRaisesRegex(ValueError, 'identity changed'):
+                        project.start()
+                    with self.assertRaisesRegex(ValueError, 'identity changed'):
+                        project._run(['docker', 'info'])
+                    allocate.assert_not_called()
+                    popen.assert_not_called()
+                executor = entry.build.DockerExecutor(socket_path='/private/docker.sock', engine_id='engine-id-123',
+                    authorization='disposable-linux-engine-approved',
+                    build_authorization='disposable-linux-image-build-approved')
+                with mock.patch.object(entry.build.tempfile, 'TemporaryDirectory') as allocate:
+                    with self.assertRaisesRegex(ValueError, 'identity changed'):
+                        executor.__enter__()
+                    allocate.assert_not_called()
+                self.assertFalse((root / 'evidence').exists())
+
+    def test_work_root_rejects_traversal_symlinks_modes_and_wrong_owner(self):
+        with tempfile.TemporaryDirectory() as root:
+            parent = Path(root)
+            private = parent / 'private'
+            private.mkdir(mode=0o700)
+            link = parent / 'link'
+            link.symlink_to(private, target_is_directory=True)
+            for value in (str(parent / 'private' / '..' / 'private'), str(link), 'relative'):
+                with self.subTest(value=value), self.assertRaises((ValueError, OSError)):
+                    entry._open_work_root(value)
+            private.chmod(0o755)
+            with self.assertRaises(ValueError):
+                entry._open_work_root(str(private))
+            private.chmod(0o700)
+            real_fstat = os.fstat
+            def wrong_owner(fd):
+                result = real_fstat(fd)
+                if result.st_ino == private.stat().st_ino and result.st_dev == private.stat().st_dev:
+                    values = list(result)
+                    values[4] = os.geteuid() + 1
+                    return os.stat_result(values)
+                return result
+            with mock.patch.object(entry.os, 'fstat', side_effect=wrong_owner):
+                with self.assertRaises(ValueError):
+                    entry._open_work_root(str(private))
+
+    def test_evidence_default_and_explicit_root_reject_escapes(self):
+        with tempfile.TemporaryDirectory() as root:
+            with mock.patch.object(entry, '_open_work_root', wraps=lambda path: os.open(root, os.O_RDONLY | os.O_DIRECTORY)) as opened:
+                report = entry.Evidence('/tmp/kilo/default')
+                report.close()
+                opened.assert_called_once_with('/tmp/kilo')
+            with self.assertRaises(ValueError):
+                entry.Evidence(root + '/other/../escape', work_root=root)
+            with self.assertRaises(ValueError):
+                entry._read_preflight(root + '/other/../default/acceptance.json', '/sock', 'base', root)
+            with tempfile.TemporaryDirectory() as other:
+                with self.assertRaises(ValueError):
+                    entry._read_preflight(root + '/default/acceptance.json', '/sock', 'base', other)
+
     def test_manifest_is_fixed_content_only_and_detects_changes_in_archive(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -152,7 +332,13 @@ class WiringTests(unittest.TestCase):
              mock.patch.object(entry.host_mi_provenance, 'generate_cuts', side_effect=ValueError('bad wheel')) as cuts:
             with self.assertRaisesRegex(ValueError, 'bad wheel'):
                 entry._prepare(args)
-        cuts.assert_called_once_with('/python', '/wheel', '/mi')
+        cuts.assert_called_once_with('/python', '/wheel', '/mi', self.work_root)
+        args.work_root = '/private/store'
+        with mock.patch.object(entry, '_checked_file', return_value=b'fixture'), \
+             mock.patch.object(entry.host_mi_provenance, 'generate_cuts', side_effect=ValueError('bad wheel')) as cuts:
+            with self.assertRaisesRegex(ValueError, 'bad wheel'):
+                entry._prepare(args)
+        cuts.assert_called_once_with('/python', '/wheel', '/mi', '/private/store')
 
     def test_project_preserves_original_error_when_cleanup_is_blocked(self):
         args = SimpleNamespace(new_image_id='new', old_image_id='old', socket='/run/docker.sock', engine_id='engine',
@@ -206,8 +392,15 @@ class WiringTests(unittest.TestCase):
         argv = ['runner', '--socket', '/run/docker.sock', '--base-digest', 'sha256:' + 'a' * 64,
                 '--sr-repo', '/sr', '--mi-repo', '/mi', '--worker-sha256', 'a' * 64,
                 '--fake-appserver', '/fake', '--fake-sha256', 'b' * 64,
-                '--evidence-dir', '/tmp/kilo/example']
-        with mock.patch.object(entry.sys, 'argv', argv), mock.patch.object(entry, 'run', side_effect=RuntimeError('failed')):
+                '--evidence-dir', self.work_root + '/example']
+        def run(args):
+            self.assertEqual(root, args.work_root)
+            self.assertEqual(root, tempfile.gettempdir())
+            self.assertEqual(root, os.environ['TMPDIR'])
+            raise RuntimeError('failed')
+        root = self.work_root
+        with mock.patch.object(entry.sys, 'argv', argv + ['--work-root', root]), mock.patch.object(entry, '_run', side_effect=run):
+            old_tempdir, old_tmpdir = tempfile.tempdir, os.environ.get('TMPDIR')
             with mock.patch.object(entry.signal, 'signal', side_effect=['previous-alarm', 'previous-term', None, None]) as handlers:
                 with mock.patch.object(entry.signal, 'alarm') as alarm:
                     with self.assertRaisesRegex(RuntimeError, 'failed'):
@@ -215,12 +408,15 @@ class WiringTests(unittest.TestCase):
         self.assertEqual([mock.call(5400), mock.call(0)], alarm.call_args_list)
         self.assertEqual(mock.call(entry.signal.SIGALRM, 'previous-alarm'), handlers.call_args_list[2])
         self.assertEqual(mock.call(entry.signal.SIGTERM, 'previous-term'), handlers.call_args_list[3])
+        self.assertEqual(old_tempdir, tempfile.tempdir)
+        self.assertEqual(old_tmpdir, os.environ.get('TMPDIR'))
 
     def test_evidence_is_private_exclusive_and_tracks_pending_phases(self):
-        directory = tempfile.mkdtemp(prefix='foundry-report-test-', dir='/tmp/kilo')
+        root = tempfile.mkdtemp(prefix='foundry-report-root-')
+        directory = tempfile.mkdtemp(prefix='foundry-report-test-', dir=root)
         os.rmdir(directory)
         try:
-            report = entry.Evidence(directory)
+            report = entry.Evidence(directory, work_root=root)
             report.close()
             self.assertEqual(0o700, stat.S_IMODE(os.stat(directory).st_mode))
             path = Path(directory) / 'acceptance.json'
@@ -236,11 +432,11 @@ class WiringTests(unittest.TestCase):
             self.assertIn('sandbox not verified', document['worker_backend_scope'])
             self.assertTrue(all(item['status'] == 'pending' for item in document['phases'].values()))
             with self.assertRaises(FileExistsError):
-                entry.Evidence(directory)
+                entry.Evidence(directory, work_root=root)
             with self.assertRaises(ValueError):
-                entry.Evidence(directory + '/nested')
+                entry.Evidence(directory + '/nested', work_root=root)
         finally:
-            shutil.rmtree(directory)
+            shutil.rmtree(root)
 
     def test_phases_use_distinct_projects_and_live_controls(self):
         events, projects, controls, default_transports = [], [], [], []
@@ -390,8 +586,8 @@ class WiringTests(unittest.TestCase):
                                base_digest="sha256:" + "a" * 64, socket="/private/sock", engine_id="engine",
                                zai_python=None, zai_output_dir=None, authorize_zai_source_reads=False,
                                worker_sha256='a' * 64, fake_appserver='/fake', fake_sha256='b' * 64, mi_python='/python', mi_wheel='/wheel',
-                               preflight_evidence='/tmp/kilo/preflight/acceptance.json',
-                               evidence_dir="/tmp/kilo/test-report")
+                               preflight_evidence=self.work_root + '/preflight/acceptance.json',
+                               evidence_dir=self.work_root + '/test-report')
         events = []
         evidence = mock.Mock(data={'image_cleanup': {}, 'images': {}, 'preflight': {}})
 
@@ -454,11 +650,11 @@ class WiringTests(unittest.TestCase):
                                base_digest="sha256:" + "a" * 64, zai_python="/venv/bin/python",
                                zai_output_dir=None, authorize_zai_source_reads=False,
                                worker_sha256='a' * 64, fake_appserver='/fake', fake_sha256='b' * 64, mi_python='/python', mi_wheel='/wheel',
-                               preflight_evidence='/tmp/kilo/preflight/acceptance.json', socket='/private/sock', engine_id=None)
+                               preflight_evidence=self.work_root + '/preflight/acceptance.json', socket='/private/sock', engine_id=None)
         with mock.patch.object(entry.Path, "is_dir", return_value=True), \
              mock.patch.object(entry, "_read_preflight", return_value="engine"), \
              mock.patch.object(entry.provenance, "dockerfile"), \
-             mock.patch.object(entry.subprocess, "run") as subprocess_run, \
+             mock.patch('subprocess.run') as subprocess_run, \
              mock.patch.object(entry.build, "DockerExecutor") as executor:
             with self.assertRaisesRegex(ValueError, "separate authorization"):
                 entry.run(args)
@@ -469,13 +665,14 @@ class WiringTests(unittest.TestCase):
         args = SimpleNamespace(authorize_disposable_linux_engine=True, authorize_image_build=True,
                                confirm_external_boundaries=True, sr_repo='/sr', mi_repo='/mi',
                                base_digest='sha256:' + 'a' * 64, socket='/sock', engine_id=None,
-                               preflight_evidence='/tmp/kilo/probe/acceptance.json',
+                               preflight_evidence=self.work_root + '/probe/acceptance.json',
                                worker_sha256='a' * 64, fake_appserver='/fake', fake_sha256='b' * 64, mi_python='/python', mi_wheel='/wheel',
                                zai_python=None, zai_output_dir=None, authorize_zai_source_reads=False,
-                               evidence_dir='/tmp/kilo/full')
+                               evidence_dir=self.work_root + '/full')
         with mocked_full_run(args) as evidence, \
              mock.patch.object(entry, '_prepare', return_value=(b'helper', b'fake', {'fresh': (b'cut', b'trust')})), \
              mock.patch.object(entry, '_validate_cuts'), \
+             mock.patch.object(entry.subprocess, 'run') as source, \
              mock.patch.object(entry, '_project') as project:
             project.return_value.__enter__.return_value = mock.Mock()
             with mock.patch.object(entry, '_security_negatives'), mock.patch.object(entry, '_tls_negatives'), mock.patch.object(entry, '_client'), \
@@ -484,6 +681,7 @@ class WiringTests(unittest.TestCase):
                  mock.patch.object(entry, 'run_stale_installed'), mock.patch.object(entry, '_bound_selection'), \
                  mock.patch.object(entry, 'run_preactivation_failure'), mock.patch.object(entry, 'run_lifecycle_acceptance'):
                 entry.run(args)
+        source.assert_not_called()
         self.assertEqual('synthetic_acceptance_passed', evidence.data['status'])
         source = (entry.ROOT / 'Dockerfile.mi').read_bytes()
         self.assertEqual(entry.provenance.product_revision(source), evidence.data['product_dockerfile_sr_revision'])
@@ -491,7 +689,7 @@ class WiringTests(unittest.TestCase):
     def test_preflight_only_reports_probe_without_build_or_acceptance(self):
         args = SimpleNamespace(preflight_only=True, authorize_engine_preflight=True,
                                base_digest='sha256:' + 'a' * 64, socket='/run/docker.sock', engine_id=None,
-                               evidence_dir='/tmp/kilo/probe', zai_python=None, zai_output_dir=None,
+                               evidence_dir=self.work_root + '/probe', zai_python=None, zai_output_dir=None,
                                authorize_zai_source_reads=False)
         evidence = mock.Mock(data={'preflight': {}})
         executor = mock.MagicMock()
@@ -504,9 +702,9 @@ class WiringTests(unittest.TestCase):
              mock.patch.object(entry.build, 'DockerExecutor', return_value=executor), \
              mock.patch.object(entry.build, 'build_verified') as build, \
              mock.patch.object(entry, '_prepare') as prepare, \
-             mock.patch.object(entry.subprocess, 'run') as source:
+             mock.patch('subprocess.run') as source:
             entry.run(args)
-        evidence_factory.assert_called_once_with(args.evidence_dir, preflight_only=True)
+        evidence_factory.assert_called_once_with(args.evidence_dir, preflight_only=True, work_root=self.work_root)
         executor.preflight.assert_called_once_with(base_digest=args.base_digest)
         self.assertEqual('verified-engine-id', args.engine_id)
         self.assertEqual('preflight_passed', evidence.data['status'])
@@ -526,7 +724,7 @@ class WiringTests(unittest.TestCase):
     def test_preflight_failure_is_not_reported_as_cleanup_success(self):
         args = SimpleNamespace(preflight_only=True, authorize_engine_preflight=True,
                                base_digest='sha256:' + 'a' * 64, socket='/run/docker.sock', engine_id=None,
-                               evidence_dir='/tmp/kilo/probe', zai_python=None, zai_output_dir=None,
+                               evidence_dir=self.work_root + '/probe', zai_python=None, zai_output_dir=None,
                                authorize_zai_source_reads=False)
         evidence = mock.Mock(data={'preflight': {}})
         executor = mock.MagicMock()
@@ -542,11 +740,12 @@ class WiringTests(unittest.TestCase):
         evidence.close.assert_called_once()
 
     def test_reviewed_preflight_is_bound_to_socket_base_and_engine(self):
-        directory = tempfile.mkdtemp(prefix='foundry-preflight-test-', dir='/tmp/kilo')
+        root = tempfile.mkdtemp(prefix='foundry-preflight-root-')
+        directory = tempfile.mkdtemp(prefix='foundry-preflight-test-', dir=root)
         os.rmdir(directory)
         base = 'sha256:' + 'a' * 64
         try:
-            evidence = entry.Evidence(directory, preflight_only=True)
+            evidence = entry.Evidence(directory, preflight_only=True, work_root=root)
             evidence.data.update(status='preflight_passed', socket='/run/docker.sock', base_digest=base,
                                  engine_id='verified-engine-id')
             evidence.data['preflight']['probe'] = {'status': 'passed', 'cleanup': 'passed'}
@@ -557,16 +756,16 @@ class WiringTests(unittest.TestCase):
             self.assertFalse(document['synthetic_evidence'])
             self.assertEqual('not_established', document['daemon_host_isolation'])
             self.assertEqual('not_established', document['builder_storage_quota'])
-            self.assertEqual('verified-engine-id', entry._read_preflight(path, '/run/docker.sock', base))
+            self.assertEqual('verified-engine-id', entry._read_preflight(path, '/run/docker.sock', base, root))
             with self.assertRaisesRegex(ValueError, 'does not match'):
-                entry._read_preflight(path, '/different.sock', base)
+                entry._read_preflight(path, '/different.sock', base, root)
             with self.assertRaisesRegex(ValueError, 'does not match'):
-                entry._read_preflight(path, '/run/docker.sock', 'sha256:' + 'b' * 64)
+                entry._read_preflight(path, '/run/docker.sock', 'sha256:' + 'b' * 64, root)
             os.chmod(path, 0o644)
             with self.assertRaisesRegex(ValueError, 'unprotected'):
-                entry._read_preflight(path, '/run/docker.sock', base)
+                entry._read_preflight(path, '/run/docker.sock', base, root)
         finally:
-            shutil.rmtree(directory)
+            shutil.rmtree(root)
 
     def test_worker_evidence_is_strictly_allowlisted(self):
         checks = ('both_sources_routable both_own_projections_valid cross_client_projection_rejected '

@@ -2,6 +2,7 @@
 
 import json
 import subprocess
+import tempfile
 from types import SimpleNamespace
 import unittest
 from unittest import mock
@@ -129,9 +130,11 @@ class DiagnosticTests(unittest.TestCase):
             self.assertNotIn("secret-token", str(caught.exception))
 
     def test_preflight_report_retains_safe_failure(self):
+        root = self.enterContext(tempfile.TemporaryDirectory())
         args = SimpleNamespace(preflight_only=True, authorize_engine_preflight=True, base_digest=diagnostic.DIGEST,
                                socket=diagnostic.SOCKET, engine_id=diagnostic.ENGINE, zai_python=None,
-                               zai_output_dir=None, authorize_zai_source_reads=False, evidence_dir="/tmp/kilo/mock")
+                               zai_output_dir=None, authorize_zai_source_reads=False,
+                               work_root=root, evidence_dir=root + "/mock")
         evidence = mock.Mock(data={"preflight": {}})
         executor = mock.MagicMock()
         executor.__enter__.return_value = executor

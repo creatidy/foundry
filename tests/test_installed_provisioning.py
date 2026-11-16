@@ -805,6 +805,8 @@ class OrchestrationTests(unittest.TestCase):
             self.assertEqual("http://127.0.0.1:32123", project.origin)
             self.assertEqual(32124, project.worker_port)
             self.assertEqual("0", project.env["FOUNDRY_ROUTER_PORT"])
+            self.assertEqual(tmp, project.env['TMPDIR'])
+            self.assertEqual(tmp, project.env['HOME'])
             self.assertNotIn("LOCAL_TLS_ADOPT_PROJECT", project.env)
             adverse = [
                 (inspect[0]["HostConfig"], "Memory", 0),

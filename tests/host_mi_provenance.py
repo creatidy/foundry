@@ -16,6 +16,7 @@ import zipfile
 
 import image_build_executor
 import mi_publication_fixture as fixture
+from installed_provisioning import check_work_root
 
 
 # MI INSTALLED_ACCEPTANCE.md: wheel built from the SR MI pin, with the
@@ -93,10 +94,11 @@ def verify_installation(venv, wheel):
     return site
 
 
-def verify_source_wheel(repo, wheel_data):
+def verify_source_wheel(repo, wheel_data, work_dir=None):
     """Compare every MI package file to the exact pinned Git commit objects."""
     deadline = time.monotonic() + 120
-    environment = {"PATH": os.defpath, "HOME": "/tmp/kilo", "GIT_CONFIG_NOSYSTEM": "1",
+    work_dir = os.fspath(work_dir) if work_dir is not None else tempfile.gettempdir()
+    environment = {"PATH": os.defpath, "HOME": work_dir, "TMPDIR": work_dir, "GIT_CONFIG_NOSYSTEM": "1",
                    "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_NO_LAZY_FETCH": "1", "GIT_ALLOW_PROTOCOL": "",
                    "GIT_OPTIONAL_LOCKS": "0"}
 
@@ -107,6 +109,7 @@ def verify_source_wheel(repo, wheel_data):
         command_deadline = min(deadline, now + 30)
         process = None
         try:
+            check_work_root()
             process = subprocess.Popen(command, env=environment, stdin=subprocess.DEVNULL,
                                        stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0)
             output, total = bytearray(), 0
@@ -164,7 +167,7 @@ def verify_source_wheel(repo, wheel_data):
         raise ValueError("MI wheel package differs from pinned source tree")
 
 
-def generate_cuts(python, wheel, mi_repo):
+def generate_cuts(python, wheel, mi_repo, work_root="/tmp/kilo"):
     """Return {kind: (publication bytes, trust JSON bytes)} from the pinned wheel.
 
     Trust the interpreter, standard library, uv, this harness and private temp
@@ -185,8 +188,11 @@ def generate_cuts(python, wheel, mi_repo):
         os.close(fd)
     if len(data) > MAX_WHEEL_BYTES or hashlib.sha256(data).hexdigest() != WHEEL_SHA256:
         raise ValueError("MI wheel digest mismatch")
-    verify_source_wheel(mi_repo, data)
-    with tempfile.TemporaryDirectory(prefix="foundry-verified-mi-", dir="/tmp/kilo") as tmp:
+    check_work_root()
+    with tempfile.TemporaryDirectory(prefix="foundry-verified-mi-", dir=work_root) as tmp:
+        check_work_root()
+        verify_source_wheel(mi_repo, data, tmp)
+        check_work_root()
         root = Path(tmp)
         copied = root / "model_intelligence-0.1.0-py3-none-any.whl"
         copied.write_bytes(data)
@@ -197,12 +203,14 @@ def generate_cuts(python, wheel, mi_repo):
         environment = {"PATH": os.defpath, "HOME": tmp, "TMPDIR": tmp,
                        "UV_OFFLINE": "1", "UV_PYTHON_DOWNLOADS": "never", "UV_NO_CONFIG": "1"}
         def install(*command):
+            check_work_root()
             result = subprocess.run(command, cwd=tmp, env=environment, stdin=subprocess.DEVNULL,
                                     stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60, check=False)
             if result.returncode:
                 raise RuntimeError("offline MI installation failed")
 
         install(uv, "venv", "--offline", "--python", str(python), str(venv))
+        check_work_root()
         sites = list((venv / "lib").glob("python*/site-packages"))
         if len(sites) != 1 or sites[0].is_symlink():
             raise ValueError("unexpected venv site-packages")
@@ -215,8 +223,10 @@ def generate_cuts(python, wheel, mi_repo):
         installed_python = venv / "bin" / "python"
         install(uv, "pip", "install", "--offline", "--no-cache", "--no-deps", "--require-hashes",
                 "--python", str(installed_python), "-r", str(requirements))
+        check_work_root()
         site = verify_installation(venv, copied)
         child = Path(__file__).with_name("verified_mi_child.py").resolve()
+        check_work_root()
         result = subprocess.run(
             [str(installed_python), "-I", "-B", str(child), str(site), str(root)],
             cwd=tmp, env=environment,

@@ -84,7 +84,7 @@ class SourceCaptureTests(unittest.TestCase):
             else:
                 provenance.verify_source_wheel("/unused", wheel.getvalue())
         popen.assert_called_once_with(command, env={
-            "PATH": os.defpath, "HOME": "/tmp/kilo", "GIT_CONFIG_NOSYSTEM": "1",
+            "PATH": os.defpath, "HOME": tempfile.gettempdir(), "TMPDIR": tempfile.gettempdir(), "GIT_CONFIG_NOSYSTEM": "1",
             "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_NO_LAZY_FETCH": "1", "GIT_ALLOW_PROTOCOL": "",
             "GIT_OPTIONAL_LOCKS": "0"}, stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0)
@@ -155,6 +155,30 @@ class SourceCaptureTests(unittest.TestCase):
 
 
 class HostMIProvenanceTests(unittest.TestCase):
+    def test_producer_default_retains_legacy_temp_root(self):
+        with tempfile.TemporaryDirectory() as root:
+            wheel = Path(root) / 'fixture.whl'
+            wheel.write_bytes(b'fixture')
+            with mock.patch.object(provenance, 'WHEEL_SHA256', hashlib.sha256(b'fixture').hexdigest()), \
+                 mock.patch.object(provenance.tempfile, 'TemporaryDirectory', side_effect=RuntimeError('stop')) as allocate:
+                with self.assertRaisesRegex(RuntimeError, 'stop'):
+                    provenance.generate_cuts(sys.executable, wheel, root)
+            allocate.assert_called_once_with(prefix='foundry-verified-mi-', dir='/tmp/kilo')
+
+    def test_producer_verifies_source_in_private_work_root(self):
+        with tempfile.TemporaryDirectory() as root:
+            wheel = Path(root) / 'fixture.whl'
+            wheel.write_bytes(b'fixture')
+            with mock.patch.object(provenance, 'WHEEL_SHA256', hashlib.sha256(b'fixture').hexdigest()), \
+                 mock.patch.object(provenance, 'verify_source_wheel') as verify, \
+                 mock.patch.object(provenance.shutil, 'which', return_value=None):
+                with self.assertRaisesRegex(RuntimeError, 'trusted uv'):
+                    provenance.generate_cuts(sys.executable, wheel, root, root)
+            repo, data, temp = verify.call_args.args
+            self.assertEqual((Path(root), b'fixture'), (repo, data))
+            self.assertEqual(Path(root), Path(temp).parent)
+            self.assertFalse(Path(temp).exists())
+
     def test_rejects_changed_artifact_before_starting_child(self):
         with tempfile.TemporaryDirectory() as tmp:
             wheel = Path(tmp) / "mi.whl"
@@ -347,12 +371,13 @@ class HostMIProvenanceTests(unittest.TestCase):
     def test_full_entrypoint_reaches_first_docker_boundary_with_real_producer(self):
         base = "sha256:" + "a" * 64
         socket = "/run/docker.sock"
-        report_dir = tempfile.mkdtemp(prefix="foundry-mi-test-preflight-", dir="/tmp/kilo")
-        evidence_dir = tempfile.mkdtemp(prefix="foundry-mi-test-result-", dir="/tmp/kilo")
+        root = tempfile.mkdtemp(prefix="foundry-mi-test-root-")
+        report_dir = tempfile.mkdtemp(prefix="foundry-mi-test-preflight-", dir=root)
+        evidence_dir = tempfile.mkdtemp(prefix="foundry-mi-test-result-", dir=root)
         os.rmdir(report_dir)
         os.rmdir(evidence_dir)
         try:
-            report = runner.Evidence(report_dir, preflight_only=True)
+            report = runner.Evidence(report_dir, preflight_only=True, work_root=root)
             report.data.update(status="preflight_passed", socket=socket, base_digest=base,
                                engine_id="test-engine-123", preflight={"probe": {"status": "passed", "cleanup": "passed"}})
             report.save()
@@ -366,6 +391,7 @@ class HostMIProvenanceTests(unittest.TestCase):
                 sr_repo=str(fake.parent.parent), mi_repo=REPO, mi_python=sys.executable, mi_wheel=WHEEL,
                 worker_sha256=hashlib.sha256(helper.read_bytes()).hexdigest(), fake_appserver=fake,
                 fake_sha256=hashlib.sha256(fake.read_bytes()).hexdigest(), evidence_dir=evidence_dir,
+                work_root=root,
                 zai_python=None, zai_output_dir=None, authorize_zai_source_reads=False,
             )
             with mock.patch.object(runner, "_discover_engine", side_effect=RuntimeError("docker boundary reached")) as boundary:
@@ -375,8 +401,7 @@ class HostMIProvenanceTests(unittest.TestCase):
             report_data = json.loads((Path(evidence_dir) / "acceptance.json").read_text())
             self.assertEqual("failed", report_data["status"])
         finally:
-            shutil.rmtree(report_dir, ignore_errors=True)
-            shutil.rmtree(evidence_dir, ignore_errors=True)
+            shutil.rmtree(root, ignore_errors=True)
 
 
 if __name__ == "__main__":

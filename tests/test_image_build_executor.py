@@ -139,6 +139,8 @@ class DockerExecutorTests(unittest.TestCase):
             project._docker.side_effect = docker
             with e.DockerExecutor(socket_path="/private/docker.sock", engine_id="engine", authorization="approved",
                                   build_authorization="disposable-linux-image-build-approved") as ex:
+                self.assertEqual(str(project.root), project.env['TMPDIR'])
+                self.assertEqual(str(project.root), project.env['HOME'])
                 ex.preflight_base = base
                 sr = {"scarcity_router/__init__.py": hashlib.sha256(b"sr").hexdigest()}
                 mi = {"model_intelligence/__init__.py": hashlib.sha256(b"mi").hexdigest()}

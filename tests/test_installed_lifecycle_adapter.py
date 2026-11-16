@@ -168,10 +168,11 @@ class OfflineLifecycleTests(unittest.TestCase):
             self.assertEqual(2, project.cleanup.call_count)
 
     def test_complete_entrypoint_requires_external_boundaries(self):
-        args = SimpleNamespace(authorize_disposable_linux_engine=True, authorize_image_build=True,
-                               confirm_external_boundaries=False)
-        with self.assertRaisesRegex(ValueError, "external host isolation"):
-            entry.run(args)
+        with tempfile.TemporaryDirectory() as root:
+            args = SimpleNamespace(authorize_disposable_linux_engine=True, authorize_image_build=True,
+                                   confirm_external_boundaries=False, work_root=root)
+            with self.assertRaisesRegex(ValueError, "external host isolation"):
+                entry.run(args)
 
     def test_publication_preserves_inode_and_rejects_symlink(self):
         with tempfile.TemporaryDirectory() as tmp:

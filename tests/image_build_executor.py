@@ -279,10 +279,13 @@ class DockerExecutor:
         self.cleanup_failed = False
 
     def __enter__(self):
+        from installed_provisioning import check_work_root
+        check_work_root()
         self.temp = tempfile.TemporaryDirectory(prefix="foundry-image-build-")
+        check_work_root()
         root = Path(self.temp.name)
         self.project.root = root
-        self.project.env = {"PATH": os.defpath, "HOME": str(root),
+        self.project.env = {"PATH": os.defpath, "HOME": str(root), "TMPDIR": str(root),
                             "DOCKER_HOST": "unix://" + str(self.project.socket_path),
                             "DOCKER_CONFIG": str(root / "docker-config"),
                             "GIT_NO_REPLACE_OBJECTS": "1", "GIT_CONFIG_NOSYSTEM": "1",

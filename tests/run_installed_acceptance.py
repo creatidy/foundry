@@ -19,6 +19,7 @@ import tempfile
 import image_build_executor as build
 import image_provenance as provenance
 import host_mi_provenance
+import installed_provisioning as provisioning
 import mi_publication_fixture as fixture
 import zai_real_source_check as zai
 from installed_lifecycle_adapter import InstalledLifecycleAdapter
@@ -26,6 +27,81 @@ from installed_mi_lifecycle_scenario import (_bound_selection, run_lifecycle_acc
                                              run_preactivation_failure, run_variant_reload_acceptance)
 from installed_provisioning import CommandFailure, InstalledProject, ROOT, WORKER_DIAGNOSTIC_RE, validate_engine_socket
 from installed_worker_control import assert_input_boundary, run_stale_installed, start_live_worker
+from local_tls_init import no_acl
+
+DEFAULT_WORK_ROOT = '/tmp/kilo'
+
+
+def _open_work_root(root):
+    root = os.fspath(root)
+    if (not isinstance(root, str) or not root.startswith('/') or root == '/' or
+            os.path.normpath(root) != root or root.startswith('//')):
+        raise ValueError('absolute normalized work root required')
+    fd = os.open('/', os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        for part in root.split('/')[1:]:
+            child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+            os.close(fd)
+            fd = child
+            info = os.fstat(fd)
+            sticky_root = info.st_uid == 0 and info.st_mode & stat.S_ISVTX
+            if info.st_uid not in (0, os.geteuid()) or (info.st_mode & 0o022 and not sticky_root):
+                raise ValueError('unsafe directory ancestry')
+        info = os.fstat(fd)
+        if (info.st_uid != os.geteuid() or info.st_mode & 0o022 or
+                (root != DEFAULT_WORK_ROOT and stat.S_IMODE(info.st_mode) != 0o700)):
+            raise ValueError('work root must be operator-owned and private')
+        no_acl(fd)
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def _root_identity(fd):
+    info = os.fstat(fd)
+    with open(f'/proc/self/fdinfo/{fd}', encoding='ascii') as stream:
+        mounts = [line.split()[1] for line in stream if line.startswith('mnt_id:')]
+    if len(mounts) != 1 or not mounts[0].isdigit():
+        raise ValueError('work root mount identity unavailable')
+    return info.st_dev, info.st_ino, int(mounts[0])
+
+
+@contextmanager
+def _work_root_context(root):
+    """Detect root replacement; same-UID and root actors must keep paths stable.
+
+    Path-based subprocess and Docker bind operations are not atomic with these
+    checks, so an operator-controlled account and stable mount remain required.
+    """
+    if provisioning._WORK_ROOT_GUARD is not None:
+        raise ValueError('concurrent work root contexts are not supported')
+    root = os.fspath(root)
+    fd = _open_work_root(root)
+    previous_tempdir = tempfile.tempdir
+    previous_tmpdir = os.environ.get('TMPDIR')
+    try:
+        identity = _root_identity(fd)
+        def check(candidate=None):
+            current = _open_work_root(root)
+            try:
+                if _root_identity(fd) != identity or _root_identity(current) != identity or (
+                        candidate is not None and _root_identity(candidate) != identity):
+                    raise ValueError('work root identity changed')
+            finally:
+                os.close(current)
+        provisioning._WORK_ROOT_GUARD = check
+        tempfile.tempdir = root
+        os.environ['TMPDIR'] = root
+        yield
+    finally:
+        provisioning._WORK_ROOT_GUARD = None
+        tempfile.tempdir = previous_tempdir
+        if previous_tmpdir is None:
+            os.environ.pop('TMPDIR', None)
+        else:
+            os.environ['TMPDIR'] = previous_tmpdir
+        os.close(fd)
 
 
 RUNNER = b'''import json, sys
@@ -143,16 +219,19 @@ def _input_provenance(manifest, source, prepared, args):
 class Evidence:
     """Exclusive, private report outside the disposable engine's volumes."""
 
-    def __init__(self, directory, *, preflight_only=False):
+    def __init__(self, directory, *, preflight_only=False, work_root=DEFAULT_WORK_ROOT):
         path = Path(directory)
-        if not path.is_absolute() or path.parent != Path('/tmp/kilo') or path.name in ('', '.', '..'):
-            raise ValueError('evidence directory must be a new direct child of /tmp/kilo')
-        parent = os.open('/tmp/kilo', os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        if (os.path.normpath(os.fspath(directory)) != os.fspath(directory) or
+                not path.is_absolute() or path.parent != Path(work_root) or path.name in ('', '.', '..')):
+            raise ValueError('evidence directory must be a new direct child of the work root')
+        parent = _open_work_root(work_root)
         try:
+            provisioning.check_work_root(parent)
             info = os.fstat(parent)
             if info.st_uid != os.geteuid() or info.st_mode & 0o022:
                 raise ValueError('evidence parent must be operator-owned and not writable by others')
             os.mkdir(path.name, 0o700, dir_fd=parent)
+            provisioning.check_work_root(parent)
             directory_fd = os.open(path.name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent)
             try:
                 os.fchmod(directory_fd, 0o700)
@@ -178,9 +257,14 @@ class Evidence:
             self.data['migration_transport'] = 'advanced TLS for both images; retained srws://127.0.0.1:8790 worker identities, not cross-transport migration'
             self.data['ordinary_browser_access'] = 'not_established; ephemeral host ports use explicit internal Host authority'
             self.data['host_published_worker_client'] = 'not_established; synthetic worker runs inside router namespace'
-        self.save()
+        try:
+            self.save()
+        except BaseException:
+            os.close(self.fd)
+            raise
 
     def save(self):
+        provisioning.check_work_root()
         data = (json.dumps(self.data, sort_keys=True, separators=(',', ':')) + '\n').encode()
         os.lseek(self.fd, 0, os.SEEK_SET)
         os.ftruncate(self.fd, 0)
@@ -344,9 +428,11 @@ def _execution(adapter, helper, fake, args):
 
 
 def _prepare(args):
+    provisioning.check_work_root()
     helper = _checked_file(ROOT / "tests" / "worker_mi_acceptance.py", args.worker_sha256)
     fake = _checked_file(args.fake_appserver, args.fake_sha256)
-    cuts = host_mi_provenance.generate_cuts(args.mi_python, args.mi_wheel, args.mi_repo)
+    cuts = host_mi_provenance.generate_cuts(args.mi_python, args.mi_wheel, args.mi_repo,
+                                            getattr(args, 'work_root', DEFAULT_WORK_ROOT))
     _validate_cuts(cuts)
     return helper, fake, cuts
 
@@ -382,13 +468,15 @@ def _validate_cuts(cuts):
 
 
 def _discover_engine(args):
+    provisioning.check_work_root()
     validate_engine_socket(args.socket)
     path = Path(args.socket)
     project = InstalledProject(socket_path=args.socket, engine_id='discovery-placeholder',
                                image_id='sha256:' + '0' * 64, authorization='disposable-linux-engine-approved')
     with tempfile.TemporaryDirectory(prefix='foundry-engine-discovery-') as tmp:
+        provisioning.check_work_root()
         project.root = Path(tmp)
-        project.env = {'PATH': os.defpath, 'HOME': tmp, 'DOCKER_CONFIG': tmp + '/docker-config'}
+        project.env = {'PATH': os.defpath, 'HOME': tmp, 'TMPDIR': tmp, 'DOCKER_CONFIG': tmp + '/docker-config'}
         data = json.loads(project._run(['docker', '--host', 'unix://' + str(path), 'info', '--format', '{{json .}}'], timeout=20))
     identifier = data.get('ID') if isinstance(data, dict) else None
     if (not isinstance(identifier, str) or not re.fullmatch(r'[A-Za-z0-9:._-]{12,128}', identifier)
@@ -400,12 +488,15 @@ def _discover_engine(args):
     return identifier
 
 
-def _read_preflight(path, socket_path, base_digest):
+def _read_preflight(path, socket_path, base_digest, work_root=DEFAULT_WORK_ROOT):
+    if os.path.normpath(os.fspath(path)) != os.fspath(path):
+        raise ValueError('protected preflight report required under work root')
     path = Path(path)
-    if path.name != 'acceptance.json' or path.parent.parent != Path('/tmp/kilo'):
-        raise ValueError('protected preflight report required under /tmp/kilo')
-    parent = os.open('/tmp/kilo', os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    if path.name != 'acceptance.json' or path.parent.parent != Path(work_root):
+        raise ValueError('protected preflight report required under work root')
+    parent = _open_work_root(work_root)
     try:
+        provisioning.check_work_root(parent)
         parent_info = os.fstat(parent)
         if parent_info.st_uid != os.geteuid() or parent_info.st_mode & 0o022:
             raise ValueError('unprotected preflight parent')
@@ -468,6 +559,17 @@ def _executor(args, evidence, name):
 
 
 def run(args):
+    with _work_root_context(getattr(args, 'work_root', DEFAULT_WORK_ROOT)):
+        result = _run(args)
+        provisioning.check_work_root()
+        return result
+
+
+def _run(args):
+    if (getattr(args, 'work_root', DEFAULT_WORK_ROOT) != '/tmp/kilo' and
+            all((getattr(args, 'zai_python', None), getattr(args, 'zai_output_dir', None),
+                 getattr(args, 'authorize_zai_source_reads', False)))):
+        raise ValueError('real-source check is not supported with bounded work root')
     if getattr(args, 'preflight_only', False):
         if not getattr(args, 'authorize_engine_preflight', False):
             raise ValueError('explicit engine preflight authorization required')
@@ -475,7 +577,7 @@ def run(args):
             raise ValueError('exact base digest required')
         if any((args.zai_python, args.zai_output_dir, args.authorize_zai_source_reads)):
             raise ValueError('real-source options are not permitted in preflight-only mode')
-        evidence = Evidence(args.evidence_dir, preflight_only=True)
+        evidence = Evidence(args.evidence_dir, preflight_only=True, work_root=getattr(args, 'work_root', DEFAULT_WORK_ROOT))
         try:
             args.engine_id = _discover_engine(args)
             evidence.data.update(engine_id=args.engine_id, base_digest=args.base_digest, socket=args.socket)
@@ -528,7 +630,8 @@ def run(args):
         raise ValueError("external host isolation, storage and build network boundaries must be established")
     if not args.preflight_evidence:
         raise ValueError('reviewed preflight evidence required before full acceptance')
-    expected_engine = _read_preflight(args.preflight_evidence, args.socket, args.base_digest)
+    expected_engine = _read_preflight(args.preflight_evidence, args.socket, args.base_digest,
+                                      getattr(args, 'work_root', DEFAULT_WORK_ROOT))
     if args.engine_id is not None and args.engine_id != expected_engine:
         raise ValueError('expected engine differs from reviewed preflight')
     args.engine_id = expected_engine
@@ -686,7 +789,7 @@ def run(args):
     input_provenance = _input_provenance(manifest, source, prepared, args)
     if _file_manifest() != manifest:
         raise ValueError('provenance files changed during preparation')
-    evidence = Evidence(args.evidence_dir)
+    evidence = Evidence(args.evidence_dir, work_root=getattr(args, 'work_root', DEFAULT_WORK_ROOT))
     try:
         evidence.data['foundry_provenance'] = input_provenance
         evidence.data['product_dockerfile_sr_revision'] = product_revision
@@ -729,7 +832,8 @@ def main():
     parser.add_argument("--worker-sha256")
     parser.add_argument("--fake-appserver")
     parser.add_argument("--fake-sha256")
-    parser.add_argument("--evidence-dir", required=True, help="new private direct child of /tmp/kilo")
+    parser.add_argument("--work-root", default=DEFAULT_WORK_ROOT, help="existing test-owned 0700 work root (legacy /tmp/kilo may be 0755)")
+    parser.add_argument("--evidence-dir", required=True, help="new private direct child of the work root")
     parser.add_argument("--zai-python")
     parser.add_argument("--zai-output-dir")
     parser.add_argument("--authorize-zai-source-reads", action="store_true")

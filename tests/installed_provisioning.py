@@ -34,6 +34,7 @@ SR_TEST_REVISION = provenance.NEW_SR
 SR_OLD_REVISION = "f96d58e6d7d0fffdbe70476850d824efa5de2fb5"
 _ENGINE_VERIFICATION_FAILED = False
 _EXPECTED_INSPECTION = None
+_WORK_ROOT_GUARD = None
 _CGROUP_FILES = ("/proc/self/cgroup", "/proc/1/cgroup", "/sys/fs/cgroup/memory.max",
                  "/sys/fs/cgroup/memory.swap.max", "/sys/fs/cgroup/pids.max",
                  "/sys/fs/cgroup/cpu.max")
@@ -41,6 +42,11 @@ _WORKER_DIAGNOSTIC_FIELDS = (r"(?:assertion|timeout|value|os|runtime|other):[0-9
                              r"(?:permission_error|not_found_error|api_error|invalid_request_error|other):"
                              r"(?:unauthorized_target|pin_target_not_found|target_unavailable|adapter_unavailable|backend_failure|capability_unassessed|other)")
 WORKER_DIAGNOSTIC_RE = re.compile(r"FOUNDRY_WORKER_FAILURE:" + _WORKER_DIAGNOSTIC_FIELDS)
+
+
+def check_work_root(fd=None):
+    if _WORK_ROOT_GUARD is not None:
+        _WORK_ROOT_GUARD(fd)
 
 
 class CommandFailure(RuntimeError):
@@ -175,6 +181,7 @@ class InstalledProject:
             output_limit = 16 * 1024 * 1024 if binary else 1024 * 1024
         if type(output_limit) is not int or output_limit < 1 or output_limit > 128 * 1024 * 1024:
             raise ValueError("invalid output limit")
+        check_work_root()
         proc = subprocess.Popen(args, cwd=self.root, env=self.env, stdout=subprocess.PIPE,
                                 stderr=subprocess.PIPE, stdin=subprocess.PIPE if input_data is not None else subprocess.DEVNULL,
                                 start_new_session=True)
@@ -272,7 +279,9 @@ class InstalledProject:
             raise ValueError("project has already been started")
         if not isinstance(self.mi_cuts, dict) or "fresh" not in self.mi_cuts:
             raise ValueError("verified synthetic MI cuts required")
+        check_work_root()
         self.root = Path(tempfile.mkdtemp(prefix="foundry-accept-"))
+        check_work_root()
         os.chmod(self.root, 0o700)
         for name in ("compose.yaml", "scripts/local_tls_up.py", "scripts/local_tls_init.py",
                      "scripts/docker_socket_validation.py"):
@@ -280,7 +289,7 @@ class InstalledProject:
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(ROOT / name, target)
         (self.root / ".env").write_text("")
-        self.env = {"PATH": os.defpath, "HOME": str(self.root), "DOCKER_HOST": "unix://" + str(self.socket_path),
+        self.env = {"PATH": os.defpath, "HOME": str(self.root), "TMPDIR": str(self.root), "DOCKER_HOST": "unix://" + str(self.socket_path),
                     "DOCKER_CONFIG": str(self.root / "docker-config"),
                     "FOUNDRY_ROUTER_IMAGE": self.image_id, "FOUNDRY_MI_IMAGE_ID": self.image_id,
                     "FOUNDRY_ROUTER_HOST": "127.0.0.1", "FOUNDRY_ROUTER_PORT": "0", "FOUNDRY_WORKER_PORT": "0",
@@ -571,7 +580,9 @@ class InstalledProject:
         if len(stdin) > 8192:
             raise ValueError("worker diagnostic input too large")
         self.require_roles()
+        check_work_root()
         with tempfile.TemporaryDirectory(prefix="worker-bundle-", dir=self.root) as tmp:
+            check_work_root()
             directory = Path(tmp)
             for name, data in files.items():
                 path = directory / name

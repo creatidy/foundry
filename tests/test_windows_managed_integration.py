@@ -1,6 +1,7 @@
 """Managed proposal checks; activation requires independent review."""
 
 import json
+import hashlib
 import contextlib
 import io
 import os
@@ -18,6 +19,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 import windows_first_run as first_run
 import windows_managed_tls as managed
+from test_windows_first_run import HISTORICAL_COMPOSE
 
 
 def managed_test_image(value):
@@ -39,24 +41,39 @@ class ManagedIntegrationTests(unittest.TestCase):
         result = [json.dumps([{"Endpoints": {"docker": {"Host": first_run.SOCKET}}}]),
                   json.dumps({"OSType": "linux", "ID": "engine"}), json.dumps([{"Id": self.image}])]
         with patch.dict(first_run.os.environ, {}, clear=True), \
+             patch.object(Path, "read_bytes", return_value=HISTORICAL_COMPOSE), \
              patch.object(first_run.platform, "system", return_value="Linux"), \
              patch.object(first_run.platform, "release", return_value="microsoft-standard-WSL2"), \
              patch.object(first_run, "MANAGED_ACTIVATED", False), \
-             patch.object(first_run, "run", side_effect=result), \
+             patch.object(first_run, "run", side_effect=result) as run, \
              patch.object(first_run, "managed_flow") as flow:
             self.assertEqual(first_run.managed_main([self.project, self.image, "engine", "Ubuntu"]), 1)
             flow.assert_not_called()
+            self.assertEqual(run.call_count, 3)
+
+    def test_current_compose_rejected_before_managed_operations(self):
+        self.assertNotEqual(hashlib.sha256((ROOT / "compose.yaml").read_bytes()).hexdigest(), first_run.COMPOSE_SHA256)
+        with patch.dict(first_run.os.environ, {}, clear=True), \
+             patch.object(first_run.platform, "system", return_value="Linux"), \
+             patch.object(first_run.platform, "release", return_value="microsoft-standard-WSL2"), \
+             patch.object(first_run, "run", side_effect=AssertionError("Docker contacted")), \
+             patch.object(first_run, "managed_flow", side_effect=AssertionError("flow started")), \
+             patch.object(first_run.subprocess, "run", side_effect=AssertionError("process started")):
+            self.assertEqual(first_run.managed_main([self.project, self.image, "engine", "Ubuntu"]), 1)
 
     def test_wrong_engine_stops_before_image_or_startup(self):
         result = [json.dumps([{"Endpoints": {"docker": {"Host": first_run.SOCKET}}}]),
                   json.dumps({"OSType": "linux", "ID": "different-engine"})]
         with patch.dict(first_run.os.environ, {}, clear=True), \
+             patch.object(Path, "read_bytes", return_value=HISTORICAL_COMPOSE), \
              patch.object(first_run.platform, "system", return_value="Linux"), \
              patch.object(first_run.platform, "release", return_value="microsoft-standard-WSL2"), \
              patch.object(first_run, "run", side_effect=result) as run, \
              patch.object(first_run, "managed_flow") as flow:
             self.assertEqual(first_run.managed_main([self.project, self.image, "engine", "Ubuntu"]), 1)
             self.assertEqual(run.call_count, 2)
+            self.assertEqual([call.args for call in run.call_args_list], [
+                ("docker", "context", "inspect"), ("docker", "info", "--format", "{{json .}}")])
             flow.assert_not_called()
 
     def command(self, *args):

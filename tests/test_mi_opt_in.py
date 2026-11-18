@@ -52,7 +52,7 @@ class MIOptInTests(unittest.TestCase):
                        FOUNDRY_MI_IMAGE_ID=self.image_id)
         if image is None:
             image = {"Id": self.image_id, "Config": {"Healthcheck": {"Test": ["CMD", "probe"]}}}
-        stages, overrides = [], []
+        stages, overrides, override_paths = [], [], []
         validate_mi = local_tls_up.validate_mi
         def validate_input(directory, digest):
             stages.append("validate_mi")
@@ -73,8 +73,9 @@ class MIOptInTests(unittest.TestCase):
                 return subprocess.CompletedProcess(args, 0, stdout=json.dumps([image]).encode())
             if args[:2] == ["docker", "compose"] and "up" in args:
                 stages.append("up")
-                path = args[args.index("-f", args.index("-f") + 1) + 1]
-                overrides.append(json.loads(Path(path).read_text()))
+                path = Path(args[args.index("-f", args.index("-f") + 1) + 1])
+                override_paths.append(path)
+                overrides.append(json.loads(path.read_text()))
                 self.assertEqual(["up", "-d", "--no-build", "--pull", "never"] +
                                  (["--force-recreate", "--wait", "--wait-timeout", "60"] if enabled else []),
                                  args[args.index("up"):])
@@ -89,6 +90,8 @@ class MIOptInTests(unittest.TestCase):
              mock.patch.object(local_tls_up, "check_project", side_effect=check_project), \
              mock.patch.object(local_tls_up.subprocess, "run", side_effect=run):
             result = local_tls_up.main()
+        self.assertEqual(len(overrides), len(override_paths))
+        self.assertTrue(all(not path.exists() for path in override_paths))
         return result, stages, overrides
 
     def expected_override(self, enabled):
@@ -161,37 +164,33 @@ class MIOptInTests(unittest.TestCase):
                 self.assertEqual([self.expected_override(enabled)], overrides)
 
     def test_mi_wait_failure_and_timeout_refuse(self):
-        for wait in ("ok", "failure", "timeout"):
+        for wait in ("failure", "timeout"):
             with self.subTest(wait=wait):
                 result, stages, overrides = self.startup(wait=wait)
-                self.assertEqual(0 if wait == "ok" else 1, result)
+                self.assertEqual(1, result)
                 self.assertEqual(["validate_mi", "config", "inspect", "validate_mi", "project", "up"], stages)
                 self.assertEqual([self.expected_override(True)], overrides)
 
     def test_rejects_wrong_image_or_missing_healthcheck(self):
-        for image in ({"Id": self.image_id, "Config": {"Healthcheck": {"Test": ["CMD", "probe"]}}},
-                      {"Id": "sha256:" + "b" * 64, "Config": {"Healthcheck": {"Test": ["CMD", "probe"]}}},
+        for image in ({"Id": "sha256:" + "b" * 64, "Config": {"Healthcheck": {"Test": ["CMD", "probe"]}}},
                       {"Id": self.image_id, "Config": {}},
                       {"Id": self.image_id, "Config": {"Healthcheck": {"Test": []}}},
                       {"Id": self.image_id, "Config": {"Healthcheck": {"Test": ["NONE"]}}},
                       {"Id": self.image_id, "Config": {"Healthcheck": {"Test": "CMD probe"}}},
                       {"Id": self.image_id, "Config": {"Healthcheck": {"Test": ["CMD"]}}}):
-            valid = image == {"Id": self.image_id, "Config": {"Healthcheck": {"Test": ["CMD", "probe"]}}}
             with self.subTest(image=image):
                 result, stages, overrides = self.startup(image=image)
-                self.assertEqual(0 if valid else 1, result)
-                self.assertEqual(["validate_mi", "config", "inspect"] +
-                                 (["validate_mi", "project", "up"] if valid else []), stages)
-                self.assertEqual([self.expected_override(True)] if valid else [], overrides)
+                self.assertEqual(1, result)
+                self.assertEqual(["validate_mi", "config", "inspect"], stages)
+                self.assertEqual([], overrides)
 
     def test_entrypoint_rejection(self):
-        for entrypoint in (None, [], "", ["other"]):
+        for entrypoint in ([], "", ["other"]):
             with self.subTest(entrypoint=entrypoint):
                 result, stages, overrides = self.startup(entrypoint=entrypoint)
-                self.assertEqual(0 if entrypoint is None else 1, result)
-                self.assertEqual(["validate_mi", "config", "inspect"] +
-                                 (["validate_mi", "project", "up"] if entrypoint is None else []), stages)
-                self.assertEqual([self.expected_override(True)] if entrypoint is None else [], overrides)
+                self.assertEqual(1, result)
+                self.assertEqual(["validate_mi", "config", "inspect"], stages)
+                self.assertEqual([], overrides)
 
     def test_health_override_and_changed_mi_refused(self):
         result, stages, overrides = self.startup(health_override=True)

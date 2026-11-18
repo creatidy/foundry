@@ -64,6 +64,7 @@ class LocalHTTPStartupTests(unittest.TestCase):
             "Healthcheck": {"Test": ["CMD", "probe"]}}}]
         self.base = ["docker", "compose", "-f", "compose.yaml"]
         self.overrides = []
+        self.override_paths = []
         self.stages = []
         self.failure_stage = None
         self.failure = None
@@ -116,7 +117,9 @@ class LocalHTTPStartupTests(unittest.TestCase):
                 expected.append("--force-recreate")
             self.assertEqual(expected, args[len(self.base) + 2:])
             self.assertEqual(90, kwargs["timeout"])
-            self.overrides.append(json.loads(Path(args[len(self.base) + 1]).read_text()))
+            path = Path(args[len(self.base) + 1])
+            self.override_paths.append(path)
+            self.overrides.append(json.loads(path.read_text()))
             stage, output = "up", None
         self.stages.append(stage)
         if stage == self.failure_stage:
@@ -185,6 +188,7 @@ class LocalHTTPStartupTests(unittest.TestCase):
                 self.config["services"]["router"]["image"] = image
                 self.security_options = options
                 self.overrides.clear()
+                self.override_paths.clear()
                 self.stages.clear()
                 with mock.patch.object(local_tls_up, "validate_mi", side_effect=validate_input) as validate, \
                         mock.patch.object(local_tls_up, "check_project", side_effect=AssertionError("unexpected project check")):
@@ -202,6 +206,8 @@ class LocalHTTPStartupTests(unittest.TestCase):
                     "image": IMAGE_ID, "restart": "no", "group_add": [group],
                     "command": LOCAL_COMMAND + ["--mi-config=/run/foundry/mi/trust.json"],
                     "volumes": mounts}}}], self.overrides)
+                self.assertEqual(1, len(self.override_paths))
+                self.assertFalse(self.override_paths[0].exists())
                 self.assertEqual(LOCAL_COMMAND, self.config["services"]["router"]["command"])
 
     def test_mi_reference_failures_refuse_before_build(self):
@@ -227,14 +233,28 @@ class LocalHTTPStartupTests(unittest.TestCase):
         self.enable_mi()
         self.after_inspect = lambda: self.publication.write_bytes(b"changed after image inspection")
         validate_mi = local_tls_up.validate_mi
+        temporary_directory = tempfile.TemporaryDirectory
+        override_dirs = []
+        def create_directory(*args, **kwargs):
+            directory = temporary_directory(*args, **kwargs)
+            if kwargs.get("prefix") == "foundry-local-http-":
+                override_dirs.append(Path(directory.name))
+            return directory
         def validate_input(directory, digest):
             self.stages.append("validate_mi")
+            if self.stages.count("validate_mi") == 2:
+                self.assertEqual(1, len(override_dirs))
+                self.assertTrue((override_dirs[0] / "override.json").is_file())
             validate_mi(directory, digest)
-        with mock.patch.object(local_tls_up, "validate_mi", side_effect=validate_input) as validate:
+        with mock.patch.object(local_tls_up, "validate_mi", side_effect=validate_input) as validate, \
+                mock.patch.object(local_tls_up.tempfile, "TemporaryDirectory", side_effect=create_directory):
             self.assert_refused()
         self.assertEqual([mock.call(str(self.directory), self.digest)] * 2, validate.call_args_list)
         self.assertEqual(["environment", "config", "validate_mi", "build", "inspect", "info",
                           "validate_mi"], self.stages)
+        self.assertEqual(1, len(override_dirs))
+        self.assertFalse((override_dirs[0] / "override.json").exists())
+        self.assertFalse(override_dirs[0].exists())
 
     def test_mi_invalid_docker_security_options_refuse_before_mount(self):
         self.enable_mi()
@@ -247,6 +267,10 @@ class LocalHTTPStartupTests(unittest.TestCase):
 
     def test_mi_image_mismatch_refuses_without_startup(self):
         self.enable_mi()
+        validate_mi = local_tls_up.validate_mi
+        def validate_input(directory, digest):
+            self.stages.append("validate_mi")
+            validate_mi(directory, digest)
         for image, expected in ((DEFAULT_IMAGE, "sha256:" + "b" * 64),
                                 (DEFAULT_IMAGE, "not-an-image-id"),
                                 ("candidate", "sha256:" + "b" * 64)):
@@ -254,8 +278,10 @@ class LocalHTTPStartupTests(unittest.TestCase):
                 self.config["services"]["router"]["image"] = image
                 os.environ["FOUNDRY_MI_IMAGE_ID"] = expected
                 self.stages.clear()
-                self.assert_refused()
-                self.assertEqual(["environment", "config"] +
+                with mock.patch.object(local_tls_up, "validate_mi", side_effect=validate_input) as validate:
+                    self.assert_refused()
+                validate.assert_called_once_with(str(self.directory), self.digest)
+                self.assertEqual(["environment", "config", "validate_mi"] +
                                  (["build"] if image == DEFAULT_IMAGE else []) + ["inspect"], self.stages)
 
     def test_invalid_image_identity_refuses(self):
@@ -266,6 +292,7 @@ class LocalHTTPStartupTests(unittest.TestCase):
                 self.images = images
                 self.stages.clear()
                 self.assert_refused()
+                self.assertEqual(["environment", "config", "build", "inspect"], self.stages)
 
     def test_image_health_contract_required(self):
         self.enable_mi()
@@ -274,6 +301,7 @@ class LocalHTTPStartupTests(unittest.TestCase):
                 self.images[0]["Config"] = {} if health is None else {"Healthcheck": {"Test": health}}
                 self.stages.clear()
                 self.assert_refused()
+                self.assertEqual(["environment", "config", "build", "inspect"], self.stages)
 
     def test_compose_health_or_entrypoint_override_refuses(self):
         for enabled, override in ((enabled, override) for enabled in (False, True)
@@ -362,13 +390,19 @@ class LocalHTTPStartupTests(unittest.TestCase):
                     self.failure_stage, self.failure = stage, failure
                     self.stages.clear()
                     self.overrides.clear()
+                    self.override_paths.clear()
                     self.assertEqual(1, local_tls_up.local_http_main())
                     self.assertEqual(stages[:stages.index(stage) + 1], self.stages)
+                    if stage == "up":
+                        self.assertEqual(1, len(self.override_paths))
+                        self.assertFalse(self.override_paths[0].exists())
 
     def test_wait_failure_return_code_is_not_success(self):
         self.failure_stage, self.failure = "up", 7
         self.assertEqual(7, local_tls_up.local_http_main())
         self.assertEqual(["environment", "config", "build", "inspect", "up"], self.stages)
+        self.assertEqual(1, len(self.override_paths))
+        self.assertFalse(self.override_paths[0].exists())
 
 
 class StartupDispatchAndTLSTests(unittest.TestCase):

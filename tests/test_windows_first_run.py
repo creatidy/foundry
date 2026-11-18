@@ -17,6 +17,50 @@ spec = importlib.util.spec_from_file_location("windows_first_run", ROOT / "scrip
 first_run = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(first_run)
 
+# Exact Compose bytes from f944557, used only to exercise deprecated branches.
+HISTORICAL_COMPOSE = b'''# Foundry M0: one existing SR service only. NOT a complete integrated system.
+# M0 supports a previously provisioned certificate verifiable by platform roots.
+# ACME/private-CA bootstrap is NOT delivered; no plaintext bridge exception.
+# Zero-touch TLS and the Windows/WSL localhost experience are not yet delivered.
+name: foundry
+
+services:
+  router:
+    image: ${FOUNDRY_ROUTER_IMAGE:?Pin an inspected Scarcity Router image}
+    command:
+      - --host=0.0.0.0
+      - --port=8787
+      - --data-dir=/data
+      - --tls-certfile=/run/foundry/tls/server.crt
+      - --tls-keyfile=/run/foundry/tls/server.key
+      - --tls-reload-hostname=${FOUNDRY_ROUTER_HOST:?Set the certificate DNS hostname}
+    environment:
+      # Existing SR image healthcheck uses the normal verified TLS trust store.
+      # The hostname is mapped to loopback INSIDE this container only.
+      SR_HEALTHCHECK_URL: https://${FOUNDRY_ROUTER_HOST:?Set the certificate DNS hostname}:8787/healthz
+    extra_hosts:
+      - ${FOUNDRY_ROUTER_HOST:?Set the certificate DNS hostname}:127.0.0.1
+    ports:
+      - "127.0.0.1:${FOUNDRY_ROUTER_PORT:-8787}:8787"
+    volumes:
+      - router-data:/data
+      - type: bind
+        source: ${FOUNDRY_TLS_DIR:?Set the absolute directory with server.crt and server.key}
+        target: /run/foundry/tls
+        read_only: true
+    networks:
+      - backend
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+
+networks:
+  backend: {}
+
+volumes:
+  router-data: {}
+'''
+
 
 class FirstRunTests(unittest.TestCase):
     def setUp(self):
@@ -24,7 +68,9 @@ class FirstRunTests(unittest.TestCase):
                      "b" * 64, "desktop-engine", "-", "Ubuntu"]
 
     def test_invalid_tls_stops_before_docker(self):
-        with patch.object(first_run.platform, "system", return_value="Linux"), \
+        with patch.dict(first_run.os.environ, {}, clear=True), \
+             patch.object(Path, "read_bytes", return_value=HISTORICAL_COMPOSE), \
+             patch.object(first_run.platform, "system", return_value="Linux"), \
              patch.object(first_run.platform, "release", return_value="5.15.0-microsoft-standard-WSL2"), \
              patch.object(first_run, "validate", side_effect=ValueError("bad TLS")) as validate, \
              patch("subprocess.run", side_effect=AssertionError("unexpected external process")):
@@ -41,10 +87,13 @@ class FirstRunTests(unittest.TestCase):
                 validate.assert_not_called()
 
     def test_invalid_tls_fails_closed(self):
-        with patch.object(first_run.platform, "system", return_value="Linux"), \
+        with patch.dict(first_run.os.environ, {}, clear=True), \
+             patch.object(Path, "read_bytes", return_value=HISTORICAL_COMPOSE), \
+             patch.object(first_run.platform, "system", return_value="Linux"), \
              patch.object(first_run.platform, "release", return_value="microsoft-standard-WSL2"), \
-             patch.object(first_run, "validate", side_effect=ValueError("secret")):
+             patch.object(first_run, "validate", side_effect=ValueError("secret")) as validate:
             self.assertEqual(first_run.main(self.args), 1)
+        validate.assert_called_once_with(self.args[2])
 
     def test_windows_entrypoint_uses_only_fixed_pipe_and_no_shell(self):
         source = (ROOT / "scripts/windows-first-run.ps1").read_text()
@@ -65,12 +114,14 @@ class FirstRunTests(unittest.TestCase):
         args[2] = secret_path
         output = io.StringIO()
         with patch.dict(first_run.os.environ, {}, clear=True), \
+             patch.object(Path, "read_bytes", return_value=HISTORICAL_COMPOSE), \
              patch.object(first_run.platform, "system", return_value="Linux"), \
              patch.object(first_run.platform, "release", return_value="microsoft-standard-WSL2"), \
-             patch.object(first_run, "validate", side_effect=OSError("failure at " + secret_path)), \
+             patch.object(first_run, "validate", side_effect=OSError("failure at " + secret_path)) as validate, \
              contextlib.redirect_stderr(output):
             self.assertEqual(first_run.main(args), 1)
         self.assertNotIn(secret_path, output.getvalue())
+        validate.assert_called_once_with(secret_path)
 
     def test_remote_override_rejected_before_tls_or_docker(self):
         with patch.object(first_run.platform, "system", return_value="Linux"), \
@@ -85,7 +136,8 @@ class FirstRunTests(unittest.TestCase):
         result = subprocess.run(["git", "-c", "core.autocrlf=true", "check-attr", "eol", "--", "compose.yaml"],
                                 cwd=ROOT, check=True, capture_output=True, text=True)
         self.assertEqual(result.stdout.strip(), "compose.yaml: eol: lf")
-        self.assertEqual(hashlib.sha256((ROOT / "compose.yaml").read_bytes()).hexdigest(), first_run.COMPOSE_SHA256)
+        self.assertEqual(hashlib.sha256(HISTORICAL_COMPOSE).hexdigest(), first_run.COMPOSE_SHA256)
+        self.assertNotEqual(hashlib.sha256((ROOT / "compose.yaml").read_bytes()).hexdigest(), first_run.COMPOSE_SHA256)
 
     def test_compose_and_mi_environment_rejected_before_docker(self):
         for name in ("COMPOSE_FILE", "FOUNDRY_MI_DIR"):
@@ -98,12 +150,15 @@ class FirstRunTests(unittest.TestCase):
                 validate.assert_not_called()
 
     def test_changed_compose_rejected_before_docker(self):
+        self.assertNotEqual(hashlib.sha256((ROOT / "compose.yaml").read_bytes()).hexdigest(), first_run.COMPOSE_SHA256)
         with patch.dict(first_run.os.environ, {}, clear=True), \
              patch.object(first_run.platform, "system", return_value="Linux"), \
              patch.object(first_run.platform, "release", return_value="microsoft-standard-WSL2"), \
-             patch.object(first_run, "COMPOSE_SHA256", "0" * 64), \
-             patch.object(first_run, "run", side_effect=AssertionError("Docker contacted")):
+             patch.object(first_run, "validate") as validate, \
+             patch.object(first_run, "run", side_effect=AssertionError("Docker contacted")), \
+             patch.object(first_run.subprocess, "run", side_effect=AssertionError("process started")):
             self.assertEqual(first_run.main(self.args), 1)
+        validate.assert_not_called()
 
     def test_key_custody_blocks_fresh_and_adoption_before_mutation(self):
         self.args[3] = hashlib.sha256(b"der").hexdigest()
@@ -116,12 +171,14 @@ class FirstRunTests(unittest.TestCase):
             args = self.args.copy()
             args[5] = adoption
             with self.subTest(adoption=adoption), patch.dict(first_run.os.environ, {}, clear=True), \
+                 patch.object(Path, "read_bytes", return_value=HISTORICAL_COMPOSE), \
                  patch.object(first_run.platform, "system", return_value="Linux"), \
                  patch.object(first_run.platform, "release", return_value="microsoft-standard-WSL2"), \
                  patch.object(first_run, "validate"), patch.object(first_run.os, "chdir"), \
                  patch.object(Path, "read_text", return_value="certificate"), \
                  patch.object(first_run.ssl, "PEM_cert_to_DER_cert", return_value=b"der"), \
-                 patch.object(first_run, "run", side_effect=output), \
+                 patch.object(first_run, "run", side_effect=output) as docker, \
+                 patch.object(first_run, "require_safe_key_custody", wraps=first_run.require_safe_key_custody) as custody, \
                  patch.object(first_run, "check_project") as discover, \
                  patch.object(first_run, "verify_project") as verify, \
                  patch.object(first_run.subprocess, "run", side_effect=AssertionError("mutation attempted")), \
@@ -129,6 +186,8 @@ class FirstRunTests(unittest.TestCase):
                 self.assertEqual(first_run.main(args), 1)
                 discover.assert_not_called()
                 verify.assert_not_called()
+                custody.assert_called_once_with()
+                self.assertEqual(docker.call_count, 4)
 
     def test_legacy_onboarding_refuses_claim_without_prompt(self):
         self.args[3] = hashlib.sha256(b"der").hexdigest()
@@ -139,6 +198,7 @@ class FirstRunTests(unittest.TestCase):
                   json.dumps({"OSType": "linux", "ID": engine}),
                   json.dumps([{"Id": image, "Config": {}}]), json.dumps(config)]
         with patch.dict(first_run.os.environ, {}, clear=True), \
+                 patch.object(Path, "read_bytes", return_value=HISTORICAL_COMPOSE), \
                  patch.object(first_run.platform, "system", return_value="Linux"), \
                  patch.object(first_run.platform, "release", return_value="microsoft-standard-WSL2"), \
                  patch.object(first_run, "validate"), patch.object(first_run.os, "chdir"), \
@@ -149,16 +209,18 @@ class FirstRunTests(unittest.TestCase):
                  patch.object(first_run, "check_project", return_value=True), \
                   patch.object(first_run, "verify_project", return_value="a" * 64), \
                  patch.object(first_run, "request", side_effect=[(200, None, b'{"status":"ok"}'),
-                                                                  (303, "/admin/onboarding", b"")]), \
+                                                                   (303, "/admin/onboarding", b"")]) as request, \
                   patch("builtins.input", side_effect=AssertionError("unexpected prompt")), \
                  patch.object(first_run.subprocess, "run", side_effect=AssertionError("claim attempted")):
                 self.assertEqual(first_run.main(self.args), 1)
+        self.assertEqual(request.call_count, 2)
 
     def test_engine_mismatch_stops_before_image_or_startup(self):
         self.args[3] = hashlib.sha256(b"der").hexdigest()
         output = [json.dumps([{"Endpoints": {"docker": {"Host": first_run.SOCKET}}}]),
                   json.dumps({"OSType": "linux", "ID": "another-engine"})]
         with patch.dict(first_run.os.environ, {}, clear=True), \
+             patch.object(Path, "read_bytes", return_value=HISTORICAL_COMPOSE), \
              patch.object(first_run.platform, "system", return_value="Linux"), \
              patch.object(first_run.platform, "release", return_value="microsoft-standard-WSL2"), \
              patch.object(first_run, "validate"), patch.object(Path, "read_text", return_value="certificate"), \
@@ -167,6 +229,8 @@ class FirstRunTests(unittest.TestCase):
              patch.object(first_run.subprocess, "run", side_effect=AssertionError("startup attempted")):
             self.assertEqual(first_run.main(self.args), 1)
         self.assertEqual(docker.call_count, 2)
+        self.assertEqual([call.args for call in docker.call_args_list], [
+            ("docker", "context", "inspect"), ("docker", "info", "--format", "{{json .}}")])
 
     def test_existing_admin_resume_never_starts_or_issues_claim(self):
         self.args[3] = hashlib.sha256(b"der").hexdigest()
@@ -177,6 +241,7 @@ class FirstRunTests(unittest.TestCase):
                   json.dumps({"OSType": "linux", "ID": engine}),
                   json.dumps([{"Id": image, "Config": {}}]), json.dumps(config)]
         with patch.dict(first_run.os.environ, {}, clear=True), \
+             patch.object(Path, "read_bytes", return_value=HISTORICAL_COMPOSE), \
              patch.object(first_run.platform, "system", return_value="Linux"), \
              patch.object(first_run.platform, "release", return_value="microsoft-standard-WSL2"), \
              patch.object(first_run, "validate"), patch.object(first_run.os, "chdir"), \
@@ -187,9 +252,10 @@ class FirstRunTests(unittest.TestCase):
              patch.object(first_run, "check_project", return_value=True), \
              patch.object(first_run, "verify_project", return_value="a" * 64), \
              patch.object(first_run, "request", side_effect=[(200, None, b'{"status":"ok"}'),
-                                                              (303, "/admin/login", b"")]), \
+                                                               (303, "/admin/login", b"")]) as request, \
              patch.object(first_run.subprocess, "run", side_effect=AssertionError("mutation attempted")):
             self.assertEqual(first_run.main(self.args), 0)
+        self.assertEqual(request.call_count, 2)
 
     def test_extra_project_container_refused(self):
         config = {"volumes": {"router-data": {"name": "p_router-data"}},

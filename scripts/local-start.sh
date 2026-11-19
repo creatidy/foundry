@@ -1,8 +1,9 @@
 #!/bin/sh
 set -eu
 
-if [ "$#" -ne 1 ] || [ "${1#/}" = "$1" ] || [ ! -x "$1" ]; then
-    printf '%s\n' 'Usage: scripts/local-start.sh /absolute/path/to/sr-python' >&2
+if [ "$#" -lt 1 ] || [ "$#" -gt 2 ] || [ "${1#/}" = "$1" ] || [ ! -x "$1" ] ||
+    { [ "$#" -eq 2 ] && [ "$2" != --bootstrap ]; }; then
+    printf '%s\n' 'Usage: scripts/local-start.sh /absolute/path/to/sr-python [--bootstrap]' >&2
     exit 2
 fi
 
@@ -16,6 +17,18 @@ case ${XDG_DATA_HOME:-} in
         ;;
 esac
 data_dir=$data_home/scarcity-router/server
+if [ "${2:-}" = --bootstrap ]; then
+    if [ ! -t 0 ] || [ ! -t 1 ]; then
+        printf '%s\n' 'Run make bootstrap personally in a private terminal without redirection.' >&2
+        exit 2
+    fi
+    # The SR command can initialize a store; this shortcut is for an existing one.
+    if [ ! -f "$data_dir/server-state.sqlite3" ]; then
+        printf '%s\n' 'No SR state found. Wait for make start in the same environment to report listening.' >&2
+        exit 2
+    fi
+    exec "$1" -m scarcity_router.control_server --data-dir "$data_dir" --issue-bootstrap-claim
+fi
 mi_dir=${FOUNDRY_MI_DIR:-}
 mi_digest=${FOUNDRY_MI_SHA256:-}
 if [ -n "${FOUNDRY_MI_IMAGE_ID:-}" ]; then
@@ -35,4 +48,5 @@ printf 'Starting SR for http://127.0.0.1:8787/admin\nSR data directory: %s\n' "$
 printf '%s\n' 'SR reports when it is listening; press Ctrl-C to stop.'
 python=$1
 shift
-exec "$python" -m scarcity_router.control_server --host 127.0.0.1 --port 8787 --data-dir "$data_dir" "$@"
+exec "$python" -m scarcity_router.control_server --host 127.0.0.1 --port 8787 --data-dir "$data_dir" \
+    --worker-listen-host 127.0.0.1 --worker-listen-port 8790 "$@"

@@ -6,7 +6,7 @@
 
 Foundry is the public **deployment and integration product**. It does not own routing, public model facts, task orchestration, or operator decisions. Each source product must keep a usable standalone installation and its own contracts, state, release process, and authority.
 
-**Status: local Compose startup is implemented; full production and target-host acceptance remain UNPROVED.** The default builds the existing Scarcity Router composed server through `Dockerfile.mi`, publishes HTTP and the direct worker listener on host loopback, and requires no `.env`, certificates or manually supplied image hash. MI publication activation is opt-in. Foundry does not add an MI daemon/update job, Kernel runner or connected Console service.
+Start on one trusted machine with **`make up` for Docker**, or **`make install` then `make start` for a fresh Linux/WSL2 checkout**. Both serve the Scarcity Router admin UI and direct worker endpoint through loopback. No `.env`, certificates or manual image hash is required. MI publication activation is opt-in. Foundry does not add an MI daemon/update job, Kernel runner or connected Console service. See [installed acceptance](#installed-acceptance) for verified scope.
 
 Advanced and distributed deployments require explicitly selected verified TLS with operator-managed certificates; startup never silently falls back to HTTP. The experimental Windows certificate-import proposal in [PR #14](https://forgejo.creatidy.com/Creatidy/foundry/pulls/14) is superseded as default onboarding, not integrated. See the [deployment matrix and security conditions](docs/architecture.md#target-deployment-topology).
 
@@ -34,21 +34,22 @@ docker compose exec router python -m scarcity_router.control_server --data-dir /
 
 This is an **owner-only normal-use step, never an agent-executed or agent-captured command**. Paste the resulting one-time claim directly into SR's onboarding form, then set the administrator password there. Do not use a recorded/shared terminal, put the claim in a URL, argument, file or log, or disable required organizational monitoring. Claims expire after 15 minutes; issuing another invalidates the previous one until an administrator exists. Do not issue one on ordinary restarts. With a custom Compose project, select that same project for the command.
 
-Health is liveness, not successful onboarding, authentication, inference or worker acceptance. Configure authorized resources and distinct client/worker credentials through SR's own supported surfaces. Useful lifecycle commands are `make ps`, `make logs` and `make down`; logs can contain sensitive operational metadata. `make down` retains the named data volume. Repeat `make up` to start again; the default path rebuilds the pinned source image, so it can need network access even on a later invocation. A failed build/start or timeout does not remove resources or roll back state: inspect before retrying. Back up before any upgrade as described below.
+Health is liveness. Confirm the `/admin` page opens and follow [First execution](#first-execution) after signing in. Useful lifecycle commands are `make ps`, `make logs` and `make down`; logs can contain sensitive operational metadata. `make down` retains the named data volume. Repeat `make up` to start again; the default path rebuilds the pinned source image, so it can need network access even on a later invocation. A failed build/start or timeout does not remove resources or roll back state: inspect before retrying. Back up before any upgrade as described below.
 
 ## Linux / WSL2 startup
 
-From the Foundry checkout, start in the foreground with GNU Make, Python 3 and Git installed:
+From a checkout on the Linux filesystem (for WSL2, run these in your Linux distribution, not PowerShell), use GNU Make, Python 3, Git and [uv](https://docs.astral.sh/uv/getting-started/installation/). If `make runtime-check` already finds a compatible SR runtime, skip `make install`:
 
 ```sh
+make install
 make start
 ```
 
-Open exactly `http://127.0.0.1:8787/admin` after SR prints **server component listening**. A selected runtime and a "Starting SR" message are not readiness; failures remain visible and return nonzero. Ctrl-C stops the foreground server; repeat `make start` to restart. This does not install a service or promise automatic startup after reboot. The command invokes the full composed server, not the recommendation-only `scarcity-router-server`.
+Open exactly `http://127.0.0.1:8787/admin` after SR prints **server component listening**. A selected runtime and a "Starting SR" message are not readiness; failures remain visible and return nonzero. Workers on the same host can pair through `srw://127.0.0.1:8790`. Both ports must be free; stop an existing Foundry server before switching between native and Docker. Ctrl-C stops the foreground server; repeat `make start` to restart. This does not install a service or promise automatic startup after reboot. The command invokes the full composed server, not the recommendation-only `scarcity-router-server`.
 
 ### Runtime discovery
 
-`make runtime-check` performs the same discovery without starting a server or opening its store. Foundry checks only the sibling `../scarcity-router/.venv/bin/python` and, when `uv` is on PATH, `$(uv tool dir)/scarcity-router/bin/python`. It does not search your home, activate an environment, change PATH, download anything or replace installations. An incompatible candidate is reported and excluded; two compatible environments are ambiguous and refuse startup. To explicitly select a nonstandard checkout or disambiguate existing environments, use `FOUNDRY_SR_CHECKOUT=/absolute/inspected/scarcity-router make start`; this selects only that checkout's `.venv`, not an arbitrary Python argument.
+`make runtime-check` performs the same discovery without starting a server or opening its store. It prefers `.foundry-sr/.venv` if installed by Foundry; an invalid or partial local installation is reported, not silently bypassed. Without it, Foundry checks the sibling `../scarcity-router/.venv/bin/python` and, when `uv` is on PATH, `$(uv tool dir)/scarcity-router/bin/python`. An incompatible candidate is reported and excluded; two compatible environments are ambiguous and refuse startup. `FOUNDRY_SR_CHECKOUT=/absolute/inspected/scarcity-router make start` explicitly selects only that checkout's `.venv`, not an arbitrary Python argument. Discovery does not change PATH, install software or replace a runtime.
 
 Verification uses Python 3.12+, ordinary `scarcity_router.control_server` import resolution and installed `direct_url.json` checkout provenance, not the unchanged `0.1.0` version. The retained source must have canonical HTTPS origin `https://forgejo.creatidy.com/Creatidy/scarcity-router.git` and HEAD in the exact compatibility set in `scripts/local_runtime.py`: `925ec06681c7fa085edd5015f57663e85d735768` (minimum, SR #253 ownership fix), `c67900723cd6ec7430a36dd0357ee17061f811b6`, `8fc4f91ff1aa4c52f4738d436fc2ac12d0b8acb1`, `5bd4fa4d65028b46455f63726c2dda7b8e3ca341` or `dc74c0f015551f075bc45ee15bdb0cf0705c91b5`. Inclusion is a source compatibility decision, not live acceptance. Every imported package file and the effective default selector-policy asset must match that Git tree; non-editable installations must contain the packaged policy, and editable installations must retain the source example. Extra or modified code and missing/modified default assets are refused; existing user policy is not inspected or changed. Unrelated checkout docs/tests can be dirty. Non-editable `uv tool` copies are compared with the retained checkout, not assumed current from their local directory URL. Wheel-only, VCS-only metadata, uninspected revisions and other installation layouts are not yet auto-discovered.
 
@@ -56,22 +57,7 @@ This is an offline compatibility/provenance check under a trusted operator-contr
 
 ### Install SR if absent
 
-Reuse an already compatible environment first. SR is not on PyPI. If there is no SR checkout, the following prepares a new **absent** sibling path at the inspected immutable revision (do not run it over an existing checkout):
-
-```sh
-git clone --no-checkout https://forgejo.creatidy.com/Creatidy/scarcity-router.git ../scarcity-router
-git -C ../scarcity-router checkout --detach 5bd4fa4d65028b46455f63726c2dda7b8e3ca341
-```
-
-Inspect that checkout's README, `pyproject.toml` and installation/dependency contract before the one supported installation step:
-
-```sh
-uv tool install --python 3.12 ../scarcity-router
-make runtime-check
-make start
-```
-
-This explicit SR-supported local-checkout installation can download Python/build/runtime dependencies; they are not a fully locked release. No installation was performed by Foundry. Keep the checkout at the installed revision for subsequent verification. An existing `uv tool` installation is not silently overwritten: do not add `--force` or run SR's install-or-upgrade target merely to start Foundry. If the tool or checkout is older, modified or unverifiable, startup explains the refusal; inspect and deliberately plan its upgrade and data backup first, especially if other commands or a worker use the environment. No automatic migration, downgrade or rollback is provided. A separately inspected wheel is supported by SR packaging, but lacks sufficient provenance for this discovery increment; use the retained-checkout installation path above.
+`make install` uses Git and uv to install the inspected SR pin `5bd4fa4d65028b46455f63726c2dda7b8e3ca341` from a retained checkout into `.foundry-sr/.venv` under this Foundry checkout. It may download Python 3.12 and unlocked build/runtime dependencies. It does not start SR, open its data, install global commands or replace standalone SR. Running it again verifies the existing runtime without rebuilding. If setup was interrupted and the path is incomplete, inspect and move aside `.foundry-sr` before retrying; that directory contains the runtime, not the SR server or worker state. Do not use reinstall as a data recovery or upgrade procedure. For a separately maintained runtime, follow SR's [standalone installation](https://forgejo.creatidy.com/Creatidy/scarcity-router/src/commit/5bd4fa4d65028b46455f63726c2dda7b8e3ca341/README.md#quick-start) and keep its inspected source for discovery.
 
 ### State and onboarding
 
@@ -79,21 +65,25 @@ The underlying `scripts/local-start.sh` remains available for explicitly prepare
 
 The historical duplicate-start producer-fencing defect at SR revision `c16cc1db29f3828b3f9e8d05b19e645cfb0c32b8` was fixed in [SR #253 / PR #254](https://forgejo.creatidy.com/Creatidy/scarcity-router/pulls/254), integrated at the minimum revision above. SR now acquires exclusive server ownership before opening the store or constructing the producer. A concurrent server using the same data directory is refused without fencing the running producer's snapshot/replay operations; ownership is released on shutdown or process death. Stop any pre-fix server before upgrading: it does not participate in this ownership protocol. This protection belongs to SR, not a Foundry lock, and does not block the separate administrator claim command below. A refused duplicate never adopts the existing listener. Other startup failures can still initialize or modify state; do not assume every failed start leaves durable state unchanged.
 
-For a fresh installation only, leave the server running and open a second trusted private terminal. Use the **SR interpreter** printed by `make start` and replace the data-directory placeholder with the exact path printed at startup:
+For a fresh installation only, wait for `make start` to report listening and open a second trusted private terminal in the same checkout, with the same user, runtime selection and `HOME`/`XDG_DATA_HOME`. The owner personally runs:
 
 ```sh
-/absolute/path/to/sr-python -m scarcity_router.control_server --data-dir '/exact/path/printed/at/startup' --issue-bootstrap-claim
+make bootstrap
 ```
 
-Paste the resulting one-time claim into SR's onboarding form and set the administrator password there. Do not run the claim command through an agent, a recorded terminal, or a shared channel; do not put the claim in a URL, argument, file or log. The claim expires after 15 minutes; issuing another invalidates the previous one until an administrator exists. Do not issue a claim on normal restarts.
+Paste the resulting one-time claim into SR's onboarding form and set the administrator password there. `make bootstrap` selects the same runtime and store path as `make start`; it requires terminal input/output and an existing store, but does not prove you selected the same running server. Do not run it through an agent, a recorded terminal, or a shared channel; do not put the claim in a URL, argument, file or log. The claim expires after 15 minutes; issuing another invalidates the previous one until an administrator exists. Do not issue a claim on normal restarts.
 
-The owner confirmed local startup, Windows browser UI access, first-admin onboarding/login and administrator persistence across restart on ROG Windows 11 / WSL2 Ubuntu with the prior launcher. Existing Linux Chromium/Playwright exercised administration, providers, resources, permissions, sessions and security protections; two SR-owned defects and a separate inference-evidence gap were handed to SR and are not re-tested or fixed here. That evidence is not clean-machine installation, negative external reachability or authenticated inference acceptance for this new command. Those and supported upgrade/recovery remain M0 requirements. Launcher PR #19 was not a complete installer; discovery removes the interpreter-path step, not the remaining installation gates.
+The owner confirmed Windows browser UI access, first-admin onboarding/login and identity persistence on ROG Windows 11 / WSL2 Ubuntu with the prior launcher. This is not current clean-machine or network-boundary evidence.
+
+### First execution
+
+In the SR admin UI, add a provider endpoint you are authorized to use, add an enabled resource with the actual model and capabilities, and issue a separate client key with permission to use it. For a worker-backed resource, issue the pairing code in **Workers**, pair SR's worker with `srw://127.0.0.1:8790`, and run the worker with the matching adapter/resource allowed. The worker command is `.foundry-sr/.venv/bin/scarcity-router-worker` for `make install`, or `scarcity-router-worker` from your standalone SR installation on the host for Docker. See SR's [worker steps](https://forgejo.creatidy.com/Creatidy/scarcity-router/src/commit/5bd4fa4d65028b46455f63726c2dda7b8e3ca341/README.md#worker-bridges-localhost-only-resources); no worker service is installed by Foundry. In a Chat Completions client use base URL `http://127.0.0.1:8787/v1`, a model ID returned by `GET /v1/models`, and the client key as the bearer credential. An administrator session or worker credential is not a client key. No provider or model is enabled by default. A connection test is not inference.
 
 ### Optional native MI
 
 Native `make start` also accepts `FOUNDRY_MI_DIR` and `FOUNDRY_MI_SHA256` together. Use the protected directory/file ownership and digest rules in [Opt-In MI](#opt-in-mi), but set `trust.json`'s `publication` to the exact absolute host path `FOUNDRY_MI_DIR/publication.json`, not `/run/foundry/mi/publication.json`. The launcher validates those inputs before starting SR and passes the host `trust.json` via `--mi-config`. `FOUNDRY_MI_IMAGE_ID` is Compose-only and is refused by the native launcher.
 
-The selected SR interpreter must already have its optional MI dependency; an absent installation can explicitly use `uv tool install --python 3.12 '../scarcity-router[mi]'` instead of the base install above. Never overwrite an existing installation to enable the extra without planning its upgrade. Startup checks availability, not an independently authenticated MI package revision or source applicability. It does not install dependencies, create a cut, infer model bindings or fetch updates. Keep native and container trust documents separate because their publication paths differ. SR performs full activation validation; failure does not imply unchanged durable state. Omitting both variables leaves native MI off.
+The selected SR interpreter must already have its optional MI dependency. `make install` installs base SR only; to use native MI, prepare an inspected standalone SR checkout environment with the `mi` extra and select it with `FOUNDRY_SR_CHECKOUT`. Never overwrite an existing installation to enable the extra without planning its upgrade. Startup checks availability, not an independently authenticated MI package revision or source applicability. It does not install dependencies, create a cut, infer model bindings or fetch updates. Keep native and container trust documents separate because their publication paths differ. SR performs full activation validation; failure does not imply unchanged durable state. Omitting both variables leaves native MI off.
 
 ## Repositories and ownership
 
@@ -220,4 +210,4 @@ See [architecture](docs/architecture.md), [milestones](docs/milestones.md), and 
 
 ## Installed acceptance
 
-The tests-owned PR #22 acceptance plan is documented in [issue #1 host acceptance](docs/issue-1-host-acceptance.md). Historical R61 evidence for SR `f96d58e6d7d0fffdbe70476850d824efa5de2fb5` to `8fc4f91ff1aa4c52f4738d436fc2ac12d0b8acb1` is separate from the new direct-published `5bd4fa4d65028b46455f63726c2dda7b8e3ca341` HTTP/worker topology, which has not yet received target-host acceptance. That history does not establish acceptance of the new production image, topology or upgrade path. The plan's explicit host, isolation and authorization gates remain required; this link does not authorize execution.
+The [R61 production receipt](https://forgejo.creatidy.com/Creatidy/foundry/issues/1#issuecomment-22387) covers ordinary `make up`, loopback publication/restart, and authenticated synthetic SR–MI execution over the direct worker publication with MI opted in. [Issue #1](https://forgejo.creatidy.com/Creatidy/foundry/issues/1#issuecomment-22585) integrated that implementation. It is not real-provider, Docker Desktop, browser or production upgrade evidence. The separate [six-phase R61 receipt](https://forgejo.creatidy.com/Creatidy/foundry/issues/1#issuecomment-22350) used instrumented test images. [Issue #5](https://forgejo.creatidy.com/Creatidy/foundry/issues/5) tracks remaining platform acceptance; [#27](https://forgejo.creatidy.com/Creatidy/foundry/issues/27) owns production upgrade/backup/restore/rollback. See [host acceptance controls](docs/issue-1-host-acceptance.md) and `AGENTS.md` before any host-sensitive execution.

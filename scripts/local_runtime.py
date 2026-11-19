@@ -1,4 +1,4 @@
-"""Select an auditable existing SR environment, then exec the native launcher."""
+"""Install or select a verified SR environment for the native launcher."""
 
 import argparse
 import importlib.util
@@ -14,11 +14,19 @@ from urllib.parse import unquote, urlsplit
 
 ROOT = Path(__file__).resolve().parents[1]
 MINIMUM = "925ec06681c7fa085edd5015f57663e85d735768"
+INSTALL_REVISION = "5bd4fa4d65028b46455f63726c2dda7b8e3ca341"
 ACCEPTED = {MINIMUM, "c67900723cd6ec7430a36dd0357ee17061f811b6",
-            "8fc4f91ff1aa4c52f4738d436fc2ac12d0b8acb1",
-            "5bd4fa4d65028b46455f63726c2dda7b8e3ca341",
+             "8fc4f91ff1aa4c52f4738d436fc2ac12d0b8acb1",
+             INSTALL_REVISION,
             "dc74c0f015551f075bc45ee15bdb0cf0705c91b5"}
 CANONICAL = "https://forgejo.creatidy.com/Creatidy/scarcity-router.git"
+# Repository-local context (git rev-parse --local-env-vars) can override git -C.
+GIT_LOCAL_ENV = frozenset("""
+GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_COMMON_DIR GIT_CONFIG GIT_CONFIG_COUNT
+GIT_CONFIG_PARAMETERS GIT_DIR GIT_GRAFT_FILE GIT_IMPLICIT_WORK_TREE GIT_INDEX_FILE
+GIT_NAMESPACE GIT_NO_REPLACE_OBJECTS GIT_OBJECT_DIRECTORY GIT_PREFIX
+GIT_QUARANTINE_PATH GIT_REPLACE_REF_BASE GIT_SHALLOW_FILE GIT_WORK_TREE
+""".split())
 PROBE = """
 import importlib.metadata, importlib.util, json, sys
 if sys.version_info < (3, 12):
@@ -30,9 +38,13 @@ print(json.dumps({'module': s.origin, 'prefix': sys.prefix,
 """
 
 
-def run(args, *, cwd=None):
+def git_environment():
+    return {key: value for key, value in os.environ.items() if key not in GIT_LOCAL_ENV}
+
+
+def run(args, *, env=None):
     return subprocess.run(
-        args, cwd=cwd or ROOT, check=True, text=True, capture_output=True, timeout=10,
+        args, cwd=ROOT, env=env, check=True, text=True, capture_output=True, timeout=10,
     ).stdout.strip()
 
 
@@ -48,7 +60,7 @@ def verify(python):
         raise ValueError("source checkout must be absolute")
 
     def git(*args):
-        return run(["git", "--no-replace-objects", "-C", str(checkout), *args])
+        return run(["git", "--no-replace-objects", "-C", str(checkout), *args], env=git_environment())
 
     if git("remote", "get-url", "origin") != CANONICAL:
         raise ValueError("source origin is not the canonical SR HTTPS repository")
@@ -95,10 +107,64 @@ def verify(python):
     return Path(evidence["prefix"]).resolve(), checkout, revision
 
 
-def discover():
+def check_import_environment():
     if os.environ.get("PYTHONPATH") or os.environ.get("PYTHONHOME"):
         raise ValueError("unset PYTHONPATH and PYTHONHOME; ordinary SR imports are required")
+
+
+def verified_install(checkout):
+    python = checkout / ".venv/bin/python"
+    try:
+        prefix, source, revision = verify(python)
+        if prefix != (checkout / ".venv").resolve() or source != checkout or revision != INSTALL_REVISION:
+            raise ValueError("Foundry-installed runtime does not match its pinned checkout")
+    except (ValueError, KeyError, TypeError, OSError, subprocess.SubprocessError) as exc:
+        raise ValueError(f"local SR installation not verified; inspect and move aside {checkout} before retrying") from exc
+    return python, source, revision
+
+
+def install():
+    """Prepare a new checkout-local environment; never replace another runtime."""
+    check_import_environment()
+    if os.environ.get("FOUNDRY_SR_CHECKOUT"):
+        raise ValueError("unset FOUNDRY_SR_CHECKOUT to install a Foundry-local runtime")
+    checkout = ROOT / ".foundry-sr"
+    if os.path.lexists(checkout):
+        return verified_install(checkout)
+    git, uv = (shutil.which(name) for name in ("git", "uv"))
+    if not git or not uv:
+        raise ValueError("make install requires Git and uv on PATH")
+    # Reserve the location without adopting an existing empty directory or link.
+    checkout.mkdir(mode=0o700)
+    python = checkout / ".venv/bin/python"
+    git_env = {**git_environment(), "GIT_ATTR_NOSYSTEM": "1"}
+    try:
+        for command in (
+            [git, "clone", "--origin=origin", "--template=", "--no-checkout", CANONICAL, str(checkout)],
+            [git, "--no-replace-objects", "-C", str(checkout), "--git-dir=.git", "--work-tree=.",
+             "-c", "core.autocrlf=false", "-c", "core.attributesFile=/dev/null", "-c", "core.hooksPath=/dev/null",
+             "checkout", "--detach", INSTALL_REVISION],
+        ):
+            subprocess.run(command, cwd=ROOT, env=git_env, check=True, timeout=300)
+        if run([git, "--no-replace-objects", "-C", str(checkout), "rev-parse", "HEAD"], env=git_env) != INSTALL_REVISION:
+            raise ValueError("SR checkout did not resolve to the install pin")
+        subprocess.run([uv, "--no-config", "venv", "--python", "3.12", str(python.parent.parent)],
+                       cwd=ROOT, env=git_env, check=True, timeout=300)
+        subprocess.run(
+            [uv, "--no-config", "pip", "install", "--no-python-downloads", "--python", str(python), str(checkout)],
+            cwd=ROOT, env=git_env, check=True, timeout=300,
+        )
+    except (ValueError, OSError, subprocess.SubprocessError) as exc:
+        raise ValueError(f"local SR installation failed; inspect and move aside {checkout} before retrying") from exc
+    return verified_install(checkout)
+
+
+def discover():
+    check_import_environment()
     override = os.environ.get("FOUNDRY_SR_CHECKOUT")
+    installed = ROOT / ".foundry-sr"
+    if not override and os.path.lexists(installed):
+        return verified_install(installed)
     checkout = Path(override) if override else ROOT.parent / "scarcity-router"
     if not checkout.is_absolute():
         raise ValueError("FOUNDRY_SR_CHECKOUT must be an absolute checkout path")
@@ -127,9 +193,8 @@ def discover():
         )
     if not compatible:
         raise ValueError(
-            "no verifiable compatible SR runtime. See README 'Install SR if absent'. "
-            "Use uv tool install --python 3.12 /absolute/inspected/scarcity-router "
-            "only if installation is needed; existing installations are never replaced automatically."
+            "no verifiable compatible SR runtime. Run make install for a separate Foundry-local "
+            "runtime; existing installations are never replaced automatically."
         )
     return next(iter(compatible.values()))
 
@@ -137,6 +202,8 @@ def discover():
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     modes = parser.add_mutually_exclusive_group()
+    modes.add_argument("--install", action="store_true", help="install the pinned checkout-local SR runtime")
+    modes.add_argument("--bootstrap", action="store_true", help="issue a first administrator claim in a private terminal")
     modes.add_argument("--check", action="store_true", help="verify discovery without starting SR")
     modes.add_argument("--native-mi-check", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
@@ -161,14 +228,16 @@ def main():
             return 2
         return 0
     try:
-        python, checkout, revision = discover()
+        python, checkout, revision = install() if args.install else discover()
     except (ValueError, OSError, subprocess.SubprocessError) as exc:
         print(f"Foundry: {exc}", file=sys.stderr)
         return 2
-    print(f"SR interpreter: {python}\nSR source: {checkout}\nSR revision: {revision}", flush=True)
-    if not args.check:
+    if not args.bootstrap:
+        print(f"SR interpreter: {python}\nSR source: {checkout}\nSR revision: {revision}", flush=True)
+    if not (args.check or args.install):
+        launcher = str(ROOT / "scripts/local-start.sh")
         os.chdir(ROOT)
-        os.execv(str(ROOT / "scripts/local-start.sh"), [str(ROOT / "scripts/local-start.sh"), str(python)])
+        os.execv(launcher, [launcher, str(python)] + (["--bootstrap"] if args.bootstrap else []))
     return 0
 
 

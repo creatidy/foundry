@@ -4,6 +4,7 @@ from pathlib import Path
 import hashlib
 import json
 import os
+import pty
 import shlex
 import subprocess
 import sys
@@ -144,8 +145,43 @@ class LocalStartTests(unittest.TestCase):
         self.assertIn("ARG:scarcity_router.control_server\n", result.stdout)
         self.assertIn("ARG:127.0.0.1\nARG:--port\nARG:8787\n", result.stdout)
         self.assertIn("ARG:--data-dir\nARG:/tmp/data with spaces/scarcity-router/server\n", result.stdout)
+        self.assertIn("ARG:--worker-listen-host\nARG:127.0.0.1\nARG:--worker-listen-port\nARG:8790\n", result.stdout)
         self.assertNotIn("ARG:--issue-bootstrap-claim", result.stdout)
         self.assertNotIn("ARG:--mi-config", result.stdout)
+
+    def test_bootstrap_requires_terminal_and_existing_store_then_delegates(self):
+        with tempfile.TemporaryDirectory() as temp:
+            base = Path(temp)
+            store = base / "scarcity-router/server/server-state.sqlite3"
+            fake = base / "fake-python"
+            args_file = base / "args"
+            fake.write_text('#!/bin/sh\nprintf "%s\\n" "$@" > "$HOME/args"\n')
+            fake.chmod(0o700)
+            env = {"HOME": temp, "XDG_DATA_HOME": temp}
+            command = ["/bin/sh", str(SCRIPT), str(fake), "--bootstrap"]
+            store.parent.mkdir(parents=True)
+            store.touch()
+            result = subprocess.run(command, env=env, capture_output=True, check=False)
+            self.assertEqual(result.returncode, 2)
+            self.assertIn(b"private terminal", result.stderr)
+            self.assertFalse(args_file.exists())
+            store.unlink()
+            master, slave = pty.openpty()
+            try:
+                result = subprocess.run(command, env=env, stdin=slave, stdout=slave,
+                                        stderr=subprocess.PIPE, timeout=5, check=False)
+                self.assertEqual(result.returncode, 2)
+                self.assertIn(b"No SR state found", result.stderr)
+                self.assertFalse(args_file.exists())
+                store.touch()
+                subprocess.run(command, env=env, stdin=slave, stdout=slave, timeout=5, check=True)
+            finally:
+                os.close(slave)
+                os.close(master)
+            self.assertEqual(args_file.read_text().splitlines(), [
+                "-m", "scarcity_router.control_server", "--data-dir", str(store.parent),
+                "--issue-bootstrap-claim",
+            ])
 
     def test_relative_xdg_uses_home_and_bad_interpreters_fail(self):
         with tempfile.TemporaryDirectory() as temp:

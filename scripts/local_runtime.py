@@ -20,6 +20,13 @@ ACCEPTED = {MINIMUM, "c67900723cd6ec7430a36dd0357ee17061f811b6",
              INSTALL_REVISION,
             "dc74c0f015551f075bc45ee15bdb0cf0705c91b5"}
 CANONICAL = "https://forgejo.creatidy.com/Creatidy/scarcity-router.git"
+# Repository-local context (git rev-parse --local-env-vars) can override git -C.
+GIT_LOCAL_ENV = frozenset("""
+GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_COMMON_DIR GIT_CONFIG GIT_CONFIG_COUNT
+GIT_CONFIG_PARAMETERS GIT_DIR GIT_GRAFT_FILE GIT_IMPLICIT_WORK_TREE GIT_INDEX_FILE
+GIT_NAMESPACE GIT_NO_REPLACE_OBJECTS GIT_OBJECT_DIRECTORY GIT_PREFIX
+GIT_QUARANTINE_PATH GIT_REPLACE_REF_BASE GIT_SHALLOW_FILE GIT_WORK_TREE
+""".split())
 PROBE = """
 import importlib.metadata, importlib.util, json, sys
 if sys.version_info < (3, 12):
@@ -31,9 +38,13 @@ print(json.dumps({'module': s.origin, 'prefix': sys.prefix,
 """
 
 
-def run(args, *, cwd=None):
+def git_environment():
+    return {key: value for key, value in os.environ.items() if key not in GIT_LOCAL_ENV}
+
+
+def run(args, *, env=None):
     return subprocess.run(
-        args, cwd=cwd or ROOT, check=True, text=True, capture_output=True, timeout=10,
+        args, cwd=ROOT, env=env, check=True, text=True, capture_output=True, timeout=10,
     ).stdout.strip()
 
 
@@ -49,7 +60,7 @@ def verify(python):
         raise ValueError("source checkout must be absolute")
 
     def git(*args):
-        return run(["git", "--no-replace-objects", "-C", str(checkout), *args])
+        return run(["git", "--no-replace-objects", "-C", str(checkout), *args], env=git_environment())
 
     if git("remote", "get-url", "origin") != CANONICAL:
         raise ValueError("source origin is not the canonical SR HTTPS repository")
@@ -126,19 +137,20 @@ def install():
     # Reserve the location without adopting an existing empty directory or link.
     checkout.mkdir(mode=0o700)
     python = checkout / ".venv/bin/python"
+    git_env = git_environment()
     try:
         for command in (
             [git, "clone", "--no-checkout", CANONICAL, str(checkout)],
             [git, "--no-replace-objects", "-C", str(checkout), "checkout", "--detach", INSTALL_REVISION],
         ):
-            subprocess.run(command, cwd=ROOT, check=True, timeout=300)
-        if run([git, "--no-replace-objects", "-C", str(checkout), "rev-parse", "HEAD"]) != INSTALL_REVISION:
+            subprocess.run(command, cwd=ROOT, env=git_env, check=True, timeout=300)
+        if run([git, "--no-replace-objects", "-C", str(checkout), "rev-parse", "HEAD"], env=git_env) != INSTALL_REVISION:
             raise ValueError("SR checkout did not resolve to the install pin")
         subprocess.run([uv, "--no-config", "venv", "--python", "3.12", str(python.parent.parent)],
-                       cwd=ROOT, check=True, timeout=300)
+                       cwd=ROOT, env=git_env, check=True, timeout=300)
         subprocess.run(
             [uv, "--no-config", "pip", "install", "--no-python-downloads", "--python", str(python), str(checkout)],
-            cwd=ROOT, check=True, timeout=300,
+            cwd=ROOT, env=git_env, check=True, timeout=300,
         )
     except (ValueError, OSError, subprocess.SubprocessError) as exc:
         raise ValueError(f"local SR installation failed; inspect and move aside {checkout} before retrying") from exc

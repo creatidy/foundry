@@ -178,27 +178,36 @@ class LocalRuntimeTests(unittest.TestCase):
         python = checkout / ".venv/bin/python"
         pin = runtime.INSTALL_REVISION
         standalone = self.python.lstat()
-        with (patch.object(runtime.shutil, "which", side_effect=lambda name: "/tools/" + name),
+        clean_env = dict(os.environ)
+        with (patch.dict(os.environ, {"GIT_DIR": str(self.checkout / ".git"),
+                                      "GIT_WORK_TREE": str(self.checkout), "GIT_INDEX_FILE": "/other-index"}),
+              patch.object(runtime.shutil, "which", side_effect=lambda name: "/tools/" + name),
               patch.object(runtime.subprocess, "run") as execute,
-              patch.object(runtime, "run", return_value=pin),
+              patch.object(runtime, "run", return_value=pin) as read_git,
               patch.object(runtime, "verify", return_value=(python.parent.parent, checkout, pin)) as verify):
             self.assertEqual(runtime.install(), (python, checkout, pin))
             self.assertEqual(runtime.discover(), (python, checkout, pin))
             self.assertEqual(runtime.install(), (python, checkout, pin))
         self.assertEqual(verify.call_args_list, [call(python)] * 3)
+        read_git.assert_called_once_with(["/tools/git", "--no-replace-objects", "-C", str(checkout),
+                                          "rev-parse", "HEAD"], env=clean_env)
         self.assertEqual(execute.call_args_list, [
             call(["/tools/git", "clone", "--no-checkout", runtime.CANONICAL, str(checkout)],
-                 cwd=self.root, check=True, timeout=300),
+                 cwd=self.root, env=clean_env, check=True, timeout=300),
             call(["/tools/git", "--no-replace-objects", "-C", str(checkout), "checkout", "--detach", pin],
-                 cwd=self.root, check=True, timeout=300),
+                 cwd=self.root, env=clean_env, check=True, timeout=300),
             call(["/tools/uv", "--no-config", "venv", "--python", "3.12", str(python.parent.parent)],
-                 cwd=self.root, check=True, timeout=300),
+                 cwd=self.root, env=clean_env, check=True, timeout=300),
             call(["/tools/uv", "--no-config", "pip", "install", "--no-python-downloads", "--python", str(python), str(checkout)],
-                 cwd=self.root, check=True, timeout=300),
+                 cwd=self.root, env=clean_env, check=True, timeout=300),
         ])
         self.assertEqual(checkout.stat().st_mode & 0o777, 0o700)
         self.assertEqual(self.python.lstat().st_ino, standalone.st_ino)
         self.assertFalse((self.base / "data").exists())
+
+    def test_provenance_git_uses_the_retained_checkout_despite_inherited_context(self):
+        with patch.dict(os.environ, {"GIT_DIR": "/does-not-exist", "GIT_WORK_TREE": "/wrong-checkout"}):
+            self.assertEqual(runtime.discover(), (self.python, self.checkout, self.revision))
 
     def test_mismatched_checkout_stops_before_uv_and_is_not_reused(self):
         checkout = self.root / ".foundry-sr"

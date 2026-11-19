@@ -5,7 +5,9 @@ name: foundry
 
 services:
   router:
-    image: ${FOUNDRY_ROUTER_IMAGE:-foundry-sr-mi:5bd4fa4-local}
+    image: ${FOUNDRY_ROUTER_IMAGE:-foundry-sr-mi:f23ac35-local}
+    # SR's composed server handles SIGINT for graceful shutdown.
+    stop_signal: SIGINT
     build:
       context: .
       dockerfile: Dockerfile.mi

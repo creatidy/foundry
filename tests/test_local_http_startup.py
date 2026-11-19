@@ -22,7 +22,7 @@ import tls_check
 LOCAL_COMMAND = ["--host=0.0.0.0", "--port=8787", "--data-dir=/data",
                  "--local-container-http", "--worker-listen-host=0.0.0.0",
                  "--worker-listen-port=8790"]
-DEFAULT_IMAGE = "foundry-sr-mi:5bd4fa4-local"
+DEFAULT_IMAGE = "foundry-sr-mi:f23ac35-local"
 IMAGE_ID = "sha256:" + "a" * 64
 INFO_COMMAND = ["docker", "info", "--format", "{{json .SecurityOptions}}"]
 TLS_KEYS = ("TLS_DEST", "FOUNDRY_TLS_DIR", "FOUNDRY_ROUTER_HOST")
@@ -447,6 +447,9 @@ class StartupDispatchAndTLSTests(unittest.TestCase):
                    for name in line.split()[1:]}
         self.assertTrue(set(TLS_KEYS).isdisjoint(exports))
         compose = (ROOT / "compose.yaml").read_text()
+        self.assertIn("    image: ${FOUNDRY_ROUTER_IMAGE:-" + DEFAULT_IMAGE + "}\n", compose)
+        self.assertIn("    stop_signal: SIGINT\n", compose)
+        self.assertNotIn("stop_grace_period:", compose)
         command = compose.split("    command:\n", 1)[1].split("    environment:\n", 1)[0]
         self.assertEqual(LOCAL_COMMAND, [line.strip()[2:] for line in command.splitlines()])
         self.assertIn("SR_HEALTHCHECK_URL: http://127.0.0.1:8787/healthz", compose)

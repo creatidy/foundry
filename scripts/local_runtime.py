@@ -14,11 +14,11 @@ from urllib.parse import unquote, urlsplit
 
 ROOT = Path(__file__).resolve().parents[1]
 MINIMUM = "925ec06681c7fa085edd5015f57663e85d735768"
-INSTALL_REVISION = "5bd4fa4d65028b46455f63726c2dda7b8e3ca341"
+INSTALL_REVISION = "f23ac3569066e359bc0f7045631436a1eab64a6d"
 ACCEPTED = {MINIMUM, "c67900723cd6ec7430a36dd0357ee17061f811b6",
              "8fc4f91ff1aa4c52f4738d436fc2ac12d0b8acb1",
-             INSTALL_REVISION,
-            "dc74c0f015551f075bc45ee15bdb0cf0705c91b5"}
+             "5bd4fa4d65028b46455f63726c2dda7b8e3ca341",
+             "dc74c0f015551f075bc45ee15bdb0cf0705c91b5", INSTALL_REVISION}
 CANONICAL = "https://forgejo.creatidy.com/Creatidy/scarcity-router.git"
 # Repository-local context (git rev-parse --local-env-vars) can override git -C.
 GIT_LOCAL_ENV = frozenset("""

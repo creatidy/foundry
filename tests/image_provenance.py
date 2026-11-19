@@ -10,14 +10,16 @@ import re
 
 OLD_SR = "f96d58e6d7d0fffdbe70476850d824efa5de2fb5"
 NEW_SR = "5bd4fa4d65028b46455f63726c2dda7b8e3ca341"
-LOCAL_COMPOSE_SR = NEW_SR
+# Keep the historical acceptance pair fixed; recognize the current product recipe separately.
+LOCAL_COMPOSE_SR = "f23ac3569066e359bc0f7045631436a1eab64a6d"
 TEST_SR_REVISIONS = (OLD_SR, NEW_SR)
 MI = "d65891668b7e79f7b666c021f02a1b4bf8c4ca9c"
 MI_URL = "https://forgejo.creatidy.com/Creatidy/model-intelligence.git"
 DOCKERFILE_SHA256 = {
     OLD_SR: "274e359a8b4c499f53c64119a1b4b9aff7b7b64848a51b91fb9bcd082fa7860f",
     "8fc4f91ff1aa4c52f4738d436fc2ac12d0b8acb1": "0eb66c6cb0fc53b25f610dcdf20f84419412d9c3f63c9e0b0bb8654806fdfd76",
-    LOCAL_COMPOSE_SR: "cfa434d3ea7a805a2b4a7cc35dd9f845ed8eb5f5852c4ba91d5fa7a9629a0340",
+    NEW_SR: "cfa434d3ea7a805a2b4a7cc35dd9f845ed8eb5f5852c4ba91d5fa7a9629a0340",
+    LOCAL_COMPOSE_SR: "79a1b0dd2b6601df6cb9ad3f5bf2bcf8bf28aaf422592d4f25962ec9deb91bb6",
 }
 MAX_FILES = 10000
 MAX_SECONDS = 900

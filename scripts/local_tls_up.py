@@ -371,7 +371,7 @@ def local_http_main():
         expected = os.environ.get("FOUNDRY_MI_IMAGE_ID", "")
         if mi_dir or digest or expected:
             validate_mi(mi_dir, digest)
-        if router["image"] == "foundry-sr-mi:5bd4fa4-local":
+        if router["image"] == "foundry-sr-mi:f23ac35-local":
             verify_test_engine()
             subprocess.run(base + ["build", "router"], check=True, timeout=900)
         verify_test_engine()

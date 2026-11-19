@@ -22,6 +22,10 @@ spec.loader.exec_module(runtime)
 
 
 class AcceptedRevisionsTests(unittest.TestCase):
+    def test_fresh_install_uses_integrated_shutdown_fix(self):
+        self.assertEqual("f23ac3569066e359bc0f7045631436a1eab64a6d", runtime.INSTALL_REVISION)
+        self.assertIn(runtime.INSTALL_REVISION, runtime.ACCEPTED)
+
     def test_merged_local_compose_revision_is_accepted(self):
         self.assertIn("5bd4fa4d65028b46455f63726c2dda7b8e3ca341", runtime.ACCEPTED)
         self.assertIn("dc74c0f015551f075bc45ee15bdb0cf0705c91b5", runtime.ACCEPTED)

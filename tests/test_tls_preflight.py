@@ -14,6 +14,9 @@ import uuid
 
 
 ROOT = Path(__file__).resolve().parents[1]
+FIXTURE_FILES = ("Makefile", "compose.yaml", "scripts/tls_preflight.py",
+                 "scripts/local_tls_up.py", "scripts/local_tls_init.py",
+                 "scripts/docker_socket_validation.py")
 
 
 class TLSPreflightIntegrationTests(unittest.TestCase):
@@ -21,7 +24,7 @@ class TLSPreflightIntegrationTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory(prefix="foundry-tls-test-")
         self.addCleanup(self.temp.cleanup)
         self.project = Path(self.temp.name)
-        for name in ("Makefile", "compose.yaml", "scripts/tls_preflight.py"):
+        for name in FIXTURE_FILES:
             destination = self.project / name
             destination.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(ROOT / name, destination)
@@ -74,7 +77,7 @@ class TLSPreflightIntegrationTests(unittest.TestCase):
         self.assertNotIn(self.secret, result.stdout + result.stderr)
 
     def assert_make_fails(self, extra_env=None):
-        result = self.run_command("make", "up", extra_env=extra_env)
+        result = self.run_command("make", "preflight", extra_env=extra_env)
         self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("TLS preflight failed", result.stdout + result.stderr)
         self.assert_no_secret(result)

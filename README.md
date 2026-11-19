@@ -217,3 +217,7 @@ See [architecture](docs/architecture.md), [milestones](docs/milestones.md), and 
 - Pin component versions and retained evidence independently; do not ship mutable `latest` as accepted release provenance.
 - Standalone remains fully functional. Integration unlocks cross-component workflows only when exercised end-to-end.
 - Avoid extra controllers, certificate authorities, reverse proxies, message brokers, Docker socket access and new credential stores absent a verified requirement.
+
+## Installed acceptance
+
+The tests-owned PR #22 acceptance plan is documented in [issue #1 host acceptance](docs/issue-1-host-acceptance.md). Historical R61 evidence for SR `f96d58e6d7d0fffdbe70476850d824efa5de2fb5` to `8fc4f91ff1aa4c52f4738d436fc2ac12d0b8acb1` is separate from the new direct-published `5bd4fa4d65028b46455f63726c2dda7b8e3ca341` HTTP/worker topology, which has not yet received target-host acceptance. That history does not establish acceptance of the new production image, topology or upgrade path. The plan's explicit host, isolation and authorization gates remain required; this link does not authorize execution.

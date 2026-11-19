@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -12,6 +13,22 @@ import uuid
 
 
 ROOT = Path(__file__).resolve().parents[1]
+RUNTIME_FILES = ("Makefile", "compose.yaml", "scripts/local_tls_init.py", "scripts/local_tls_up.py",
+                 "scripts/docker_socket_validation.py")
+
+
+class RuntimeFixtureTests(unittest.TestCase):
+    def test_copied_startup_script_imports_without_docker(self):
+        with tempfile.TemporaryDirectory(prefix="foundry-runtime-files-") as tmp:
+            root = Path(tmp)
+            for name in RUNTIME_FILES:
+                destination = root / name
+                destination.parent.mkdir(exist_ok=True, parents=True)
+                shutil.copyfile(ROOT / name, destination)
+            result = subprocess.run([sys.executable, "-I", "-c",
+                                     "import sys; sys.path.insert(0, sys.argv[1]); import local_tls_up",
+                                     str(root / "scripts")], capture_output=True, text=True, timeout=10)
+            self.assertEqual(0, result.returncode, result.stderr)
 
 
 @unittest.skipUnless(os.environ.get("FOUNDRY_TEST_SR_IMAGE"), "set FOUNDRY_TEST_SR_IMAGE for runtime tests")
@@ -20,7 +37,7 @@ class LocalTLSRuntimeTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory(prefix="foundry-runtime-")
         self.addCleanup(self.temp.cleanup)
         self.project = Path(self.temp.name)
-        for name in ("Makefile", "compose.yaml", "scripts/local_tls_init.py", "scripts/local_tls_up.py"):
+        for name in RUNTIME_FILES:
             dest = self.project / name
             dest.parent.mkdir(exist_ok=True, parents=True)
             shutil.copyfile(ROOT / name, dest)
@@ -28,7 +45,7 @@ class LocalTLSRuntimeTests(unittest.TestCase):
         self.dest = self.project / "tls"
         self.env = {k: v for k, v in os.environ.items() if not k.startswith(("FOUNDRY_", "COMPOSE_"))}
         self.env.update(FOUNDRY_ROUTER_IMAGE=os.environ["FOUNDRY_TEST_SR_IMAGE"],
-                        FOUNDRY_ROUTER_HOST="127.0.0.1", FOUNDRY_ROUTER_PORT="0",
+                        FOUNDRY_ROUTER_HOST="127.0.0.1", FOUNDRY_ROUTER_PORT="0", FOUNDRY_WORKER_PORT="0",
                         FOUNDRY_TLS_DIR=str(self.dest), TLS_DEST=str(self.dest),
                         COMPOSE_PROJECT_NAME="foundry-runtime-" + uuid.uuid4().hex[:12])
         self.env["LOCAL_TLS_PROJECT"] = self.env["COMPOSE_PROJECT_NAME"]

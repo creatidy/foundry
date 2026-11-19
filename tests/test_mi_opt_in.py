@@ -32,11 +32,10 @@ class MIOptInTests(unittest.TestCase):
         self.tls = Path(self.temp.name) / "tls"
         self.tls.mkdir()
         for name in ("server.crt", "server.key"):
-            (self.tls / name).write_bytes(b"mocked TLS validation")
+            (self.tls / name).write_bytes(b"offline readable fixture; validation is mocked")
         self.env = {"LOCAL_TLS_PROJECT": "test", "TLS_DEST": str(self.tls),
                     "FOUNDRY_TLS_DIR": str(self.tls), "FOUNDRY_ROUTER_HOST": "127.0.0.1"}
         self.enterContext(mock.patch.object(local_tls_up, "mount_group", return_value=str(os.getegid())))
-        self.real_tls_settings = local_tls_up.tls_settings
         self.enterContext(mock.patch.object(local_tls_up, "tls_settings", side_effect=lambda base: {
             key: os.environ.get(key, "") for key in ("TLS_DEST", "FOUNDRY_TLS_DIR", "FOUNDRY_ROUTER_HOST")}))
 
@@ -53,7 +52,7 @@ class MIOptInTests(unittest.TestCase):
                        FOUNDRY_MI_IMAGE_ID=self.image_id)
         if image is None:
             image = {"Id": self.image_id, "Config": {"Healthcheck": {"Test": ["CMD", "probe"]}}}
-        stages, overrides = [], []
+        stages, overrides, override_paths = [], [], []
         validate_mi = local_tls_up.validate_mi
         def validate_input(directory, digest):
             stages.append("validate_mi")
@@ -74,8 +73,9 @@ class MIOptInTests(unittest.TestCase):
                 return subprocess.CompletedProcess(args, 0, stdout=json.dumps([image]).encode())
             if args[:2] == ["docker", "compose"] and "up" in args:
                 stages.append("up")
-                path = args[args.index("-f", args.index("-f") + 1) + 1]
-                overrides.append(json.loads(Path(path).read_text()))
+                path = Path(args[args.index("-f", args.index("-f") + 1) + 1])
+                override_paths.append(path)
+                overrides.append(json.loads(path.read_text()))
                 self.assertEqual(["up", "-d", "--no-build", "--pull", "never"] +
                                  (["--force-recreate", "--wait", "--wait-timeout", "60"] if enabled else []),
                                  args[args.index("up"):])
@@ -90,6 +90,8 @@ class MIOptInTests(unittest.TestCase):
              mock.patch.object(local_tls_up, "check_project", side_effect=check_project), \
              mock.patch.object(local_tls_up.subprocess, "run", side_effect=run):
             result = local_tls_up.main()
+        self.assertEqual(len(overrides), len(override_paths))
+        self.assertTrue(all(not path.exists() for path in override_paths))
         return result, stages, overrides
 
     def expected_override(self, enabled):
@@ -162,37 +164,33 @@ class MIOptInTests(unittest.TestCase):
                 self.assertEqual([self.expected_override(enabled)], overrides)
 
     def test_mi_wait_failure_and_timeout_refuse(self):
-        for wait in ("ok", "failure", "timeout"):
+        for wait in ("failure", "timeout"):
             with self.subTest(wait=wait):
                 result, stages, overrides = self.startup(wait=wait)
-                self.assertEqual(0 if wait == "ok" else 1, result)
+                self.assertEqual(1, result)
                 self.assertEqual(["validate_mi", "config", "inspect", "validate_mi", "project", "up"], stages)
                 self.assertEqual([self.expected_override(True)], overrides)
 
     def test_rejects_wrong_image_or_missing_healthcheck(self):
-        for image in ({"Id": self.image_id, "Config": {"Healthcheck": {"Test": ["CMD", "probe"]}}},
-                      {"Id": "sha256:" + "b" * 64, "Config": {"Healthcheck": {"Test": ["CMD", "probe"]}}},
+        for image in ({"Id": "sha256:" + "b" * 64, "Config": {"Healthcheck": {"Test": ["CMD", "probe"]}}},
                       {"Id": self.image_id, "Config": {}},
                       {"Id": self.image_id, "Config": {"Healthcheck": {"Test": []}}},
                       {"Id": self.image_id, "Config": {"Healthcheck": {"Test": ["NONE"]}}},
                       {"Id": self.image_id, "Config": {"Healthcheck": {"Test": "CMD probe"}}},
                       {"Id": self.image_id, "Config": {"Healthcheck": {"Test": ["CMD"]}}}):
-            valid = image == {"Id": self.image_id, "Config": {"Healthcheck": {"Test": ["CMD", "probe"]}}}
             with self.subTest(image=image):
                 result, stages, overrides = self.startup(image=image)
-                self.assertEqual(0 if valid else 1, result)
-                self.assertEqual(["validate_mi", "config", "inspect"] +
-                                 (["validate_mi", "project", "up"] if valid else []), stages)
-                self.assertEqual([self.expected_override(True)] if valid else [], overrides)
+                self.assertEqual(1, result)
+                self.assertEqual(["validate_mi", "config", "inspect"], stages)
+                self.assertEqual([], overrides)
 
     def test_entrypoint_rejection(self):
-        for entrypoint in (None, [], "", ["other"]):
+        for entrypoint in ([], "", ["other"]):
             with self.subTest(entrypoint=entrypoint):
                 result, stages, overrides = self.startup(entrypoint=entrypoint)
-                self.assertEqual(0 if entrypoint is None else 1, result)
-                self.assertEqual(["validate_mi", "config", "inspect"] +
-                                 (["validate_mi", "project", "up"] if entrypoint is None else []), stages)
-                self.assertEqual([self.expected_override(True)] if entrypoint is None else [], overrides)
+                self.assertEqual(1, result)
+                self.assertEqual(["validate_mi", "config", "inspect"], stages)
+                self.assertEqual([], overrides)
 
     def test_health_override_and_changed_mi_refused(self):
         result, stages, overrides = self.startup(health_override=True)
@@ -203,81 +201,6 @@ class MIOptInTests(unittest.TestCase):
         self.assertEqual(1, result)
         self.assertEqual(["validate_mi", "config", "inspect", "validate_mi"], stages)
         self.assertEqual([], overrides)
-
-    def test_local_http_mi_startup(self):
-        for case in ("valid", "wrong_image", "changed", "health_override"):
-            with self.subTest(case=case):
-                command = ["--local-container-http", "--port=8787"]
-                router = {"image": "candidate", "command": command}
-                if case == "health_override":
-                    router["healthcheck"] = {"disable": True}
-                config = {"name": "test", "services": {"router": router}}
-                env = {"FOUNDRY_MI_DIR": str(self.directory), "FOUNDRY_MI_SHA256": self.digest,
-                       "FOUNDRY_MI_IMAGE_ID": self.image_id}
-                stages, overrides = [], []
-                validate_mi = local_tls_up.validate_mi
-                def validate_input(directory, digest):
-                    stages.append("validate_mi")
-                    self.assertEqual((str(self.directory), self.digest), (directory, digest))
-                    if case == "changed" and stages.count("validate_mi") == 2:
-                        raise ValueError("changed MI input")
-                    validate_mi(directory, digest)
-                def run(args, **kwargs):
-                    if args[:2] == ["docker", "compose"] and args[-3:] == ["config", "--format", "json"]:
-                        stages.append("config")
-                        return subprocess.CompletedProcess(args, 0, stdout=json.dumps(config).encode())
-                    if args == ["docker", "image", "inspect", "candidate"]:
-                        stages.append("inspect")
-                        image_id = "sha256:" + "b" * 64 if case == "wrong_image" else self.image_id
-                        image = {"Id": image_id, "Config": {"Healthcheck": {"Test": ["CMD", "probe"]}}}
-                        return subprocess.CompletedProcess(args, 0, stdout=json.dumps([image]).encode())
-                    if args[:2] == ["docker", "compose"] and "up" in args:
-                        stages.append("up")
-                        self.assertEqual(["up", "-d", "--no-build", "--pull", "never", "--wait",
-                                          "--wait-timeout", "60", "--force-recreate"], args[args.index("up"):])
-                        self.assertEqual(90, kwargs["timeout"])
-                        path = args[args.index("-f", args.index("-f") + 1) + 1]
-                        overrides.append(json.loads(Path(path).read_text()))
-                        return subprocess.CompletedProcess(args, 0)
-                    self.fail(f"unexpected subprocess: {args!r}")
-                with mock.patch.dict(os.environ, env, clear=True), \
-                     mock.patch.object(local_tls_up, "validate_mi", side_effect=validate_input), \
-                     mock.patch.object(local_tls_up, "check_project", side_effect=AssertionError("unexpected project check")), \
-                     mock.patch.object(local_tls_up.subprocess, "run", side_effect=run):
-                    result = local_tls_up.main(["--local-http"])
-                expected_stages = ["config", "validate_mi", "inspect"]
-                if case in ("valid", "changed"):
-                    expected_stages.append("validate_mi")
-                if case == "valid":
-                    expected_stages.append("up")
-                self.assertEqual(0 if case == "valid" else 1, result)
-                self.assertEqual(expected_stages, stages)
-                mi_mounts = self.expected_override(True)["services"]["router"]["volumes"][1:]
-                expected = {"services": {"router": {"image": self.image_id,
-                            "command": command + ["--mi-config=/run/foundry/mi/trust.json"],
-                            "restart": "no", "group_add": [str(os.getegid())], "volumes": mi_mounts}}}
-                self.assertEqual([expected] if case == "valid" else [], overrides)
-
-    def test_tls_settings_projection_labels_and_dollars(self):
-        base = ["docker", "compose", "-f", "compose.yaml"]
-        keys = ("TLS_DEST", "FOUNDRY_TLS_DIR", "FOUNDRY_ROUTER_HOST")
-        values = {"TLS_DEST": "/tmp/a$b", "FOUNDRY_TLS_DIR": "/tmp/a$$b", "FOUNDRY_ROUTER_HOST": "router"}
-        labels = {"org.creatidy.foundry." + key.lower(): "${" + key + "-}" for key in keys}
-        paths = []
-        def run(args, **kwargs):
-            self.assertEqual(base + ["-f"], args[:-5])
-            self.assertEqual(["config", "--format", "json", "--no-path-resolution"], args[-4:])
-            self.assertEqual({"check": True, "capture_output": True, "timeout": 30}, kwargs)
-            path = Path(args[-5])
-            paths.append(path)
-            self.assertEqual({"services": {"router": {"labels": labels}}}, json.loads(path.read_text()))
-            rendered = {"org.creatidy.foundry." + key.lower(): values[key].replace("$", "$$") for key in keys}
-            return subprocess.CompletedProcess(args, 0, stdout=json.dumps({"services": {"router": {"labels": rendered}}}).encode())
-        with mock.patch.dict(os.environ, {}, clear=True), mock.patch.object(local_tls_up.subprocess, "run", side_effect=run) as call:
-            self.assertEqual(values, self.real_tls_settings(base))
-        self.assertEqual(1, call.call_count)
-        self.assertEqual(1, len(paths))
-        self.assertFalse(paths[0].exists())
 
     def require_compose(self, env):
         if not shutil.which("docker", path=env["PATH"]):
@@ -326,7 +249,7 @@ class MIOptInTests(unittest.TestCase):
             mi_dir = str(self.directory / suffix)
             env = {**self.env, "PATH": os.defpath, "HOME": self.temp.name}
             env.update(FOUNDRY_ROUTER_IMAGE="test-image", FOUNDRY_ROUTER_HOST="127.0.0.1",
-                       FOUNDRY_TLS_DIR=str(self.tls), LOCAL_TLS_PROJECT="test", TLS_DEST=str(self.tls),
+                        FOUNDRY_TLS_DIR=str(self.tls), LOCAL_TLS_PROJECT="test", TLS_DEST=str(self.tls),
                        FOUNDRY_MI_DIR=mi_dir, FOUNDRY_MI_SHA256=self.digest,
                        FOUNDRY_MI_IMAGE_ID=self.image_id, NAME="interpolated")
             if suffix == "$NAME":

@@ -140,8 +140,9 @@ def install():
     git_env = git_environment()
     try:
         for command in (
-            [git, "clone", "--no-checkout", CANONICAL, str(checkout)],
-            [git, "--no-replace-objects", "-C", str(checkout), "checkout", "--detach", INSTALL_REVISION],
+            [git, "clone", "--origin=origin", "--template=", "--no-checkout", CANONICAL, str(checkout)],
+            [git, "--no-replace-objects", "-C", str(checkout), "--git-dir=.git", "--work-tree=.",
+             "checkout", "--detach", INSTALL_REVISION],
         ):
             subprocess.run(command, cwd=ROOT, env=git_env, check=True, timeout=300)
         if run([git, "--no-replace-objects", "-C", str(checkout), "rev-parse", "HEAD"], env=git_env) != INSTALL_REVISION:

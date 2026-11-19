@@ -192,9 +192,10 @@ class LocalRuntimeTests(unittest.TestCase):
         read_git.assert_called_once_with(["/tools/git", "--no-replace-objects", "-C", str(checkout),
                                           "rev-parse", "HEAD"], env=clean_env)
         self.assertEqual(execute.call_args_list, [
-            call(["/tools/git", "clone", "--no-checkout", runtime.CANONICAL, str(checkout)],
+            call(["/tools/git", "clone", "--origin=origin", "--template=", "--no-checkout", runtime.CANONICAL, str(checkout)],
                  cwd=self.root, env=clean_env, check=True, timeout=300),
-            call(["/tools/git", "--no-replace-objects", "-C", str(checkout), "checkout", "--detach", pin],
+            call(["/tools/git", "--no-replace-objects", "-C", str(checkout), "--git-dir=.git", "--work-tree=.",
+                  "checkout", "--detach", pin],
                  cwd=self.root, env=clean_env, check=True, timeout=300),
             call(["/tools/uv", "--no-config", "venv", "--python", "3.12", str(python.parent.parent)],
                  cwd=self.root, env=clean_env, check=True, timeout=300),

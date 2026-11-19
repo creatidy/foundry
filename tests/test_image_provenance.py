@@ -33,6 +33,7 @@ class ImageProvenanceTests(unittest.TestCase):
         self.assertEqual("5bd4fa4d65028b46455f63726c2dda7b8e3ca341", p.NEW_SR)
         self.assertEqual((p.OLD_SR, p.NEW_SR), p.TEST_SR_REVISIONS)
         actual = p.product_revision(self.source)
+        self.assertEqual(p.LOCAL_COMPOSE_SR, actual)
         sources = {revision: self.source.replace(actual.encode(), revision.encode())
                    for revision in p.DOCKERFILE_SHA256}
         definitions = {}

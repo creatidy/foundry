@@ -45,7 +45,7 @@ Advanced or distributed deployments retain verified HTTPS/TLS, operator-managed 
 
 ## Current implementation
 
-`make start` discovers a provenance-checked existing native SR environment and delegates to the foreground launcher; absent environments need the documented inspected-checkout installation. Native HTTP binds `127.0.0.1`; `localhost` is not interchangeable for Host validation. Native MI uses protected host-local publication paths and the selected interpreter's optional MI dependency, not container paths or an image ID. Native and Compose state locations and accepted runtime versions are distinct.
+`make install` explicitly prepares a pinned, checkout-local SR environment without opening product state or replacing standalone SR. `make start` verifies that environment (or discovers an already compatible one) and delegates to the foreground launcher. Native HTTP and the direct worker listener bind `127.0.0.1`; `localhost` is not interchangeable for HTTP Host validation. The owner-only `make bootstrap` delegates claim issuance to SR using the same runtime and state selection. Native MI uses protected host-local publication paths and the selected interpreter's optional MI dependency, not container paths or an image ID. Native and Compose state locations and accepted runtime versions are distinct.
 
 The experimental Windows certificate-import direction in [Foundry PR #14](https://forgejo.creatidy.com/Creatidy/foundry/pulls/14) is superseded as default UX. Legacy Windows TLS helpers retain old-layout guards and are not a current installation path. Do not update a hash, encode commands or weaken policy to bypass a refusal. Windows-native tests require separate exact batch approval.
 

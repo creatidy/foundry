@@ -2,6 +2,7 @@
 .env.*
 !.env.example
 .tls/
+/.foundry-sr/
 certs/
 secrets/
 *.key

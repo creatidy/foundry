@@ -11,7 +11,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import call, patch
 import venv
 
 
@@ -165,8 +165,56 @@ class LocalRuntimeTests(unittest.TestCase):
 
     def test_absence_has_explicit_install_guidance(self):
         self.python.unlink()
-        with self.assertRaisesRegex(ValueError, "uv tool install --python 3.12"):
+        with self.assertRaisesRegex(ValueError, "make install"):
             runtime.discover()
+
+    def test_install_requires_tools_before_reserving_path(self):
+        with self.assertRaisesRegex(ValueError, "requires Git and uv"):
+            runtime.install()
+        self.assertFalse((self.root / ".foundry-sr").exists())
+
+    def test_install_exact_pin_and_private_path_no_state_or_standalone_changes(self):
+        checkout = self.root / ".foundry-sr"
+        python = checkout / ".venv/bin/python"
+        pin = runtime.INSTALL_REVISION
+        standalone = self.python.lstat()
+        with (patch.object(runtime.shutil, "which", side_effect=lambda name: "/tools/" + name),
+              patch.object(runtime.subprocess, "run") as execute,
+              patch.object(runtime, "run", return_value=pin),
+              patch.object(runtime, "verify", return_value=(python.parent.parent, checkout, pin)) as verify):
+            self.assertEqual(runtime.install(), (python, checkout, pin))
+            self.assertEqual(runtime.discover(), (python, checkout, pin))
+            self.assertEqual(runtime.install(), (python, checkout, pin))
+        self.assertEqual(verify.call_args_list, [call(python)] * 3)
+        self.assertEqual(execute.call_args_list, [
+            call(["/tools/git", "clone", "--no-checkout", runtime.CANONICAL, str(checkout)],
+                 cwd=self.root, check=True, timeout=300),
+            call(["/tools/git", "--no-replace-objects", "-C", str(checkout), "checkout", "--detach", pin],
+                 cwd=self.root, check=True, timeout=300),
+            call(["/tools/uv", "--no-config", "venv", "--python", "3.12", str(python.parent.parent)],
+                 cwd=self.root, check=True, timeout=300),
+            call(["/tools/uv", "--no-config", "pip", "install", "--no-python-downloads", "--python", str(python), str(checkout)],
+                 cwd=self.root, check=True, timeout=300),
+        ])
+        self.assertEqual(checkout.stat().st_mode & 0o777, 0o700)
+        self.assertEqual(self.python.lstat().st_ino, standalone.st_ino)
+        self.assertFalse((self.base / "data").exists())
+
+    def test_mismatched_checkout_stops_before_uv_and_is_not_reused(self):
+        checkout = self.root / ".foundry-sr"
+        with (patch.object(runtime.shutil, "which", side_effect=lambda name: "/tools/" + name),
+              patch.object(runtime.subprocess, "run") as execute,
+              patch.object(runtime, "run", return_value="wrong-pin")):
+            with self.assertRaisesRegex(ValueError, "installation failed"):
+                runtime.install()
+            self.assertEqual(execute.call_count, 2)
+        self.assertTrue(checkout.is_dir())
+        with self.assertRaisesRegex(ValueError, "installation not verified"):
+            runtime.discover()
+        with patch.dict(os.environ, {"FOUNDRY_SR_CHECKOUT": str(self.checkout)}):
+            self.assertEqual(runtime.discover()[0], self.python)
+            with self.assertRaisesRegex(ValueError, "unset FOUNDRY_SR_CHECKOUT"):
+                runtime.install()
 
     def test_probe_failure_timeout_and_old_python_are_rejected(self):
         for contents in ("#!/bin/sh\nexit 1\n", "#!/bin/sh\nprintf 'not json'\n"):
@@ -196,6 +244,10 @@ class LocalRuntimeTests(unittest.TestCase):
                     self.assertEqual(runtime.main(), 0)
                 execute.assert_called_once_with(str(launcher), [str(launcher), str(self.python)])
                 chdir.assert_called_once_with(self.root)
+        with patch.object(sys, "argv", ["local_runtime.py", "--bootstrap"]):
+            with patch.object(runtime.os, "execv") as execute, patch.object(runtime.os, "chdir"):
+                runtime.main()
+                execute.assert_called_once_with(str(launcher), [str(launcher), str(self.python), "--bootstrap"])
 
 
 if __name__ == "__main__":

@@ -1,13 +1,20 @@
 # One canonical Compose; .env is optional for the ordinary local defaults.
 COMPOSE := docker compose $(if $(wildcard .env),--env-file .env) -f compose.yaml
+.DEFAULT_GOAL := start
 
-.PHONY: start runtime-check config preflight tls-check build up tls-up down ps logs local-tls-init local-tls-up
+.PHONY: install start bootstrap runtime-check config preflight tls-check build up tls-up down ps logs local-tls-init local-tls-up
 
 export LOCAL_TLS_PROJECT LOCAL_TLS_ADOPT_PROJECT FOUNDRY_MI_DIR FOUNDRY_MI_SHA256 FOUNDRY_MI_IMAGE_ID
 export FOUNDRY_SR_CHECKOUT
 
+install:
+	@python3 scripts/local_runtime.py --install
+
 start:
 	@python3 scripts/local_runtime.py
+
+bootstrap:
+	@python3 scripts/local_runtime.py --bootstrap
 
 runtime-check:
 	@python3 scripts/local_runtime.py --check

@@ -195,6 +195,7 @@ class LocalRuntimeTests(unittest.TestCase):
             call(["/tools/git", "clone", "--origin=origin", "--template=", "--no-checkout", runtime.CANONICAL, str(checkout)],
                  cwd=self.root, env=clean_env, check=True, timeout=300),
             call(["/tools/git", "--no-replace-objects", "-C", str(checkout), "--git-dir=.git", "--work-tree=.",
+                  "-c", "core.autocrlf=false", "-c", "core.hooksPath=/dev/null",
                   "checkout", "--detach", pin],
                  cwd=self.root, env=clean_env, check=True, timeout=300),
             call(["/tools/uv", "--no-config", "venv", "--python", "3.12", str(python.parent.parent)],

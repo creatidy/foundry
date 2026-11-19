@@ -142,6 +142,7 @@ def install():
         for command in (
             [git, "clone", "--origin=origin", "--template=", "--no-checkout", CANONICAL, str(checkout)],
             [git, "--no-replace-objects", "-C", str(checkout), "--git-dir=.git", "--work-tree=.",
+             "-c", "core.autocrlf=false", "-c", "core.hooksPath=/dev/null",
              "checkout", "--detach", INSTALL_REVISION],
         ):
             subprocess.run(command, cwd=ROOT, env=git_env, check=True, timeout=300)

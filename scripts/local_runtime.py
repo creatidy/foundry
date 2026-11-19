@@ -137,12 +137,12 @@ def install():
     # Reserve the location without adopting an existing empty directory or link.
     checkout.mkdir(mode=0o700)
     python = checkout / ".venv/bin/python"
-    git_env = git_environment()
+    git_env = {**git_environment(), "GIT_ATTR_NOSYSTEM": "1"}
     try:
         for command in (
             [git, "clone", "--origin=origin", "--template=", "--no-checkout", CANONICAL, str(checkout)],
             [git, "--no-replace-objects", "-C", str(checkout), "--git-dir=.git", "--work-tree=.",
-             "-c", "core.autocrlf=false", "-c", "core.hooksPath=/dev/null",
+             "-c", "core.autocrlf=false", "-c", "core.attributesFile=/dev/null", "-c", "core.hooksPath=/dev/null",
              "checkout", "--detach", INSTALL_REVISION],
         ):
             subprocess.run(command, cwd=ROOT, env=git_env, check=True, timeout=300)

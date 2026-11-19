@@ -178,7 +178,7 @@ class LocalRuntimeTests(unittest.TestCase):
         python = checkout / ".venv/bin/python"
         pin = runtime.INSTALL_REVISION
         standalone = self.python.lstat()
-        clean_env = dict(os.environ)
+        clean_env = {**os.environ, "GIT_ATTR_NOSYSTEM": "1"}
         with (patch.dict(os.environ, {"GIT_DIR": str(self.checkout / ".git"),
                                       "GIT_WORK_TREE": str(self.checkout), "GIT_INDEX_FILE": "/other-index"}),
               patch.object(runtime.shutil, "which", side_effect=lambda name: "/tools/" + name),
@@ -195,7 +195,7 @@ class LocalRuntimeTests(unittest.TestCase):
             call(["/tools/git", "clone", "--origin=origin", "--template=", "--no-checkout", runtime.CANONICAL, str(checkout)],
                  cwd=self.root, env=clean_env, check=True, timeout=300),
             call(["/tools/git", "--no-replace-objects", "-C", str(checkout), "--git-dir=.git", "--work-tree=.",
-                  "-c", "core.autocrlf=false", "-c", "core.hooksPath=/dev/null",
+                  "-c", "core.autocrlf=false", "-c", "core.attributesFile=/dev/null", "-c", "core.hooksPath=/dev/null",
                   "checkout", "--detach", pin],
                  cwd=self.root, env=clean_env, check=True, timeout=300),
             call(["/tools/uv", "--no-config", "venv", "--python", "3.12", str(python.parent.parent)],
